@@ -167,6 +167,18 @@ private def binderEditAt (source : String) (fileMap : FileMap) (binder ident : S
       pure (previousRange.stop, identRange.stop)
     pure { start, stop, line := (fileMap.toPosition identRange.start).line }
 
+private def positionalBinderRemovalEdit (source : String) (fileMap : FileMap)
+    (ident : Syntax) : Except String Edit := do
+  let some range := ident.getRange? | throw "positional binder has no source range"
+  let stop := Id.run do
+    let mut p := range.stop
+    while !p.atEnd source do
+      let next := p.next source
+      let char := String.Pos.Raw.extract source p next
+      if char == " " || char == "\t" then p := next else break
+    return p
+  pure { start := range.start, stop, line := (fileMap.toPosition range.start).line }
+
 private partial def explicitBinderIndexAt (pos : String.Pos.Raw) (stx : Syntax)
     (count : Nat := 0) : Option Nat × Nat := Id.run do
   let mut count := count
@@ -232,7 +244,8 @@ private def insertionForSite (fileMap : FileMap) (site : ReferenceSite)
   pure { start := range.start, stop := range.start, line := site.range.start.line + 1, replacement := term ++ " " }
 
 private def unusedVariableEdits (source : String) (fileMap : FileMap) (commands : Array Syntax)
-    (ilean : Ilean) (moduleName binderName : String) (warningPos : Position) : Except String (Array Edit) := do
+    (ilean : Ilean) (moduleName binderName : String) (warningPos : Position)
+    (tryRemoval := false) : Except String (Array Edit) := do
   let pos := fileMap.ofPosition warningPos
   let some (ident, parents) := commands.findSome? (syntaxAt pos)
     | throw "unused warning has no original syntax node"
@@ -244,12 +257,14 @@ private def unusedVariableEdits (source : String) (fileMap : FileMap) (commands 
     parent.isOfKind ``Lean.Parser.Term.instBinder
   let some binder := binder? | do
     let some range := ident.getRange? | throw "unused positional binder has no source range"
+    if tryRemoval then return #[← positionalBinderRemovalEdit source fileMap ident]
     return #[{ start := range.start, stop := range.stop, line := warningPos.line, replacement := "_" }]
   let isTopLevelParameter :=
     parents.any (·.isOfKind ``Lean.Parser.Command.declSig) &&
       !parents.any (·.isOfKind ``Lean.Parser.Term.forall)
   unless isTopLevelParameter do
     let some range := ident.getRange? | throw "nested binder identifier has no source range"
+    if tryRemoval then return #[← binderEditAt source fileMap binder ident]
     return #[{ start := range.start, stop := range.stop, line := warningPos.line, replacement := "_" }]
   let binderRemoval ← binderEditAt source fileMap binder ident
   unless binder.isOfKind ``Lean.Parser.Term.explicitBinder do return #[binderRemoval]
@@ -358,7 +373,8 @@ private partial def messageHintEdits (data : MessageData) (fileMap : FileMap) : 
       pure edits
   | _ => pure #[]
 
-private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool) : IO UInt32 := do
+private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
+    (tryRemoval := false) : IO UInt32 := do
   let moduleName ← match moduleNameOfPath selector.path with
     | .ok name => pure name
     | .error message => IO.eprintln message; return 2
@@ -397,7 +413,7 @@ private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool
         if !hintEdits.isEmpty then
           edits := edits ++ hintEdits
         else if let some binderName := unusedBinderName? rendered then
-          match unusedVariableEdits source inputCtx.fileMap commands ilean moduleName binderName msg.pos with
+          match unusedVariableEdits source inputCtx.fileMap commands ilean moduleName binderName msg.pos tryRemoval with
           | .ok binderEdits => edits := edits ++ binderEdits
           | .error error => IO.eprintln s!"{selector.path}:{msg.pos.line}:{msg.pos.column}: {error}"
   unless selectedWarning do
@@ -433,6 +449,33 @@ private partial def refactorSuggestedWarningsUntilStable
   if before == after then return 0
   refactorSuggestedWarningsUntilStable selector (fuel - 1)
 
+private def repositoryBuild : IO IO.Process.Output :=
+  IO.Process.output { cmd := "lake", args := #["build"] }
+
+private def transactionalWarningRefactor (selector : WarningSelector) : IO UInt32 := do
+  let original ← IO.FS.readFile selector.path
+  let status ← refactorSuggestedWarnings selector true (tryRemoval := true)
+  if status != 0 then return status
+  let candidate ← IO.FS.readFile selector.path
+  if candidate == original then return 0
+  IO.println "verifying complete repository after removing the binder..."
+  let removalBuild ← repositoryBuild
+  if removalBuild.exitCode == 0 then
+    IO.println "whole-repository build passed; retained binder removal"
+    return 0
+  IO.FS.writeFile selector.path original
+  IO.println "whole-repository build failed; restored removal candidate and applying anonymous `_` fallback"
+  let fallbackStatus ← refactorSuggestedWarnings selector true
+  if fallbackStatus != 0 then return fallbackStatus
+  let fallbackBuild ← repositoryBuild
+  if fallbackBuild.exitCode != 0 then
+    IO.FS.writeFile selector.path original
+    IO.eprintln fallbackBuild.stderr
+    IO.eprintln "anonymous fallback also failed; restored original source"
+    return 1
+  IO.println "whole-repository build passed with anonymous `_`; removal is not type-correct in the repository"
+  return 0
+
 private def showContext (fileMap : FileMap) (site : ReferenceSite)
     (commands : Array Syntax) : IO Unit := do
   let pos := fileMap.lspPosToUtf8Pos site.range.start
@@ -452,7 +495,9 @@ def main (args : List String) : IO UInt32 := do
       let parsed ← match parseWarningSelector selector with
         | .ok parsed => pure parsed
         | .error message => IO.eprintln message; return 2
-      return ← refactorSuggestedWarnings parsed (args.getLast? == some "--apply")
+      if args.getLast? == some "--apply" then
+        return ← transactionalWarningRefactor parsed
+      return ← refactorSuggestedWarnings parsed false
   | ["unused", "--glob", pattern] | ["unused", "--glob", pattern, "--apply"] =>
       let apply := args.getLast? == some "--apply"
       let files ← leanFilesUnder "."
