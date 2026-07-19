@@ -39,11 +39,35 @@ structure HintWidgetProps where
   suggestion : String
   deriving FromJson
 
-private def usageSites (ilean : Ilean) (declModule declName : String) : Array ReferenceSite :=
-  match ilean.references.get? (.const declModule declName) with
+private def usageSitesIn (references : Lsp.ModuleRefs) (declModule declName : String) : Array ReferenceSite :=
+  match references.get? (.const declModule declName) with
   | none => #[]
   | some info => info.usages.map fun loc =>
       { range := loc.range, parent? := loc.parentDecl? }
+
+private def usageSitesNamed (references : Lsp.ModuleRefs) (declName : String) : Array ReferenceSite := Id.run do
+  let mut sites := #[]
+  for (ident, info) in references do
+    if let .const _ name := ident then
+      if name == declName then
+        sites := sites ++ info.usages.map fun loc =>
+          { range := loc.range, parent? := loc.parentDecl? }
+  return sites
+
+private partial def syntaxSitesNamed (fileMap : FileMap) (declName : String) (stx : Syntax) : Array ReferenceSite := Id.run do
+  let mut sites := #[]
+  let shortName := (declName.splitOn ".").getLastD declName
+  if stx.isIdent && (stx.getId.toString == declName || stx.getId.toString == shortName) then
+    if let some range := stx.getRange? then
+      sites := sites.push {
+        range := ⟨fileMap.utf8PosToLspPos range.start, fileMap.utf8PosToLspPos range.stop⟩
+        parent? := none
+      }
+  for child in stx.getArgs do sites := sites ++ syntaxSitesNamed fileMap declName child
+  return sites
+
+private def usageSites (ilean : Ilean) (declModule declName : String) : Array ReferenceSite :=
+  usageSitesIn ilean.references declModule declName
 
 private def definitionSite? (ilean : Ilean) (declModule declName : String) : Option ReferenceSite := do
   let info ← ilean.references.get? (.const declModule declName)
@@ -75,7 +99,7 @@ private def enclosingApp (fileMap : FileMap) (site : ReferenceSite)
 private def appArgs (app : Syntax) : Option (Array Syntax) := do
   guard (app.isOfKind ``Lean.Parser.Term.app)
   let argsNode ← app.getArgs[1]?
-  some argsNode.getArgs
+  some <| argsNode.getArgs.filter fun arg => !arg.isOfKind ``Lean.Parser.Term.namedArgument
 
 private partial def binderCandidates (binderName : String) (stx : Syntax)
     (parents : List Syntax := []) : Array Syntax := Id.run do
@@ -120,8 +144,7 @@ private def declarationBinderEdit (source : String) (fileMap : FileMap) (site : 
 
 private def binderEditAt (source : String) (fileMap : FileMap) (binder ident : Syntax) : Except String Edit := do
   let some identRange := ident.getRange? | throw "warned binder identifier has no source range"
-  let identifiers := binder.getArgs.foldl (init := #[]) fun acc child =>
-    if child.isIdent then acc.push child else acc
+  let identifiers := binderIdentifiers binder
   if identifiers.size <= 1 then
     let some binderRange := binder.getRange? | throw "warned binder has no source range"
     let start := Id.run do
@@ -197,6 +220,16 @@ private def editForSite (fileMap : FileMap) (site : ReferenceSite)
       pure nextRange.start
     else pure targetRange.stop
   pure { start, stop, line := site.range.start.line + 1 }
+
+private def insertionForSite (fileMap : FileMap) (site : ReferenceSite)
+    (commands : Array Syntax) (beforeIndex : Nat) (term : String) : Except String Edit := do
+  let some app := enclosingApp fileMap site commands
+    | throw s!"line {site.range.start.line + 1}: resolved reference is not inside an application"
+  let some args := appArgs app | throw "unsupported application syntax"
+  let some target := args[beforeIndex]?
+    | throw s!"line {site.range.start.line + 1}: application has only {args.size} positional argument(s)"
+  let some range := target.getRange? | throw "target argument has no source range"
+  pure { start := range.start, stop := range.start, line := site.range.start.line + 1, replacement := term ++ " " }
 
 private def unusedVariableEdits (source : String) (fileMap : FileMap) (commands : Array Syntax)
     (ilean : Ilean) (moduleName binderName : String) (warningPos : Position) : Except String (Array Edit) := do
@@ -411,7 +444,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -433,17 +466,21 @@ def main (args : List String) : IO UInt32 := do
         if code != 0 then status := code
       return status
   | _ => pure ()
-  let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, apply) ← match args with
+  let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, insertText?, apply) ← match args with
     | ["inspect", sourcePath, moduleName, declModule, declName] =>
-        pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, false)
+        pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, none, false)
     | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, false)
+        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, false)
     | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--apply"] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, true)
+        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, true)
+    | ["insert-call-arg", sourcePath, moduleName, declModule, declName, index, term] =>
+        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term, false)
+    | ["insert-call-arg", sourcePath, moduleName, declModule, declName, index, term, "--apply"] =>
+        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term, true)
     | ["remove-parameter", sourcePath, moduleName, declName, binderName, index] =>
-        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, false)
+        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, false)
     | ["remove-parameter", sourcePath, moduleName, declName, binderName, index, "--apply"] =>
-        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, true)
+        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, true)
     | _ => IO.eprintln usage; return 2
   let source ← IO.FS.readFile sourcePath
   let inputCtx := Parser.mkInputContext source sourcePath
@@ -459,13 +496,23 @@ def main (args : List String) : IO UInt32 := do
     return 1
   let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
   unless !frontend.commandState.messages.hasErrors do
-    for msg in frontend.commandState.messages.toList do IO.eprintln (← msg.toString)
-    return 1
+    if mode != "remove" && mode != "insert" then
+      for msg in frontend.commandState.messages.toList do IO.eprintln (← msg.toString)
+      return 1
   let commands := frontend.commands
   let ileanPath := System.FilePath.mk ".lake/build/lib/lean" /
     System.FilePath.mk (moduleName.replace "." "/" ++ ".ilean")
   let ilean ← Ilean.load ileanPath
-  let sites := usageSites ilean declModule declName
+  let mut sites := usageSites ilean declModule declName
+  if sites.isEmpty && (mode == "remove" || mode == "insert") then
+    let refs := Server.findModuleRefs inputCtx.fileMap
+      frontend.commandState.infoState.trees.toArray (localVars := false)
+    let (liveReferences, _) ← refs.toLspModuleRefs
+    sites := usageSitesIn liveReferences declModule declName
+    if sites.isEmpty then sites := usageSitesNamed liveReferences declName
+    if sites.isEmpty && env.contains (parseName declName) then
+      for command in frontend.commands do
+        sites := sites ++ syntaxSitesNamed inputCtx.fileMap declName command
   IO.println s!"{declName}: {sites.size} resolved use(s) in {moduleName}; parsed {commands.size} command(s)"
   if mode == "inspect" then
     for site in sites do showContext inputCtx.fileMap site commands
@@ -474,7 +521,10 @@ def main (args : List String) : IO UInt32 := do
     if oneBased == 0 then IO.eprintln "argument index is 1-based"; return 2
     let mut edits := #[]
     for site in sites do
-      match editForSite inputCtx.fileMap site commands (oneBased - 1) with
+      let result := if mode == "insert" then
+        insertionForSite inputCtx.fileMap site commands (oneBased - 1) (insertText?.getD "")
+      else editForSite inputCtx.fileMap site commands (oneBased - 1)
+      match result with
       | .error message => IO.eprintln message; return 1
       | .ok edit => edits := edits.push edit
     if mode == "parameter" then
