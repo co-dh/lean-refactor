@@ -374,7 +374,7 @@ private partial def messageHintEdits (data : MessageData) (fileMap : FileMap) : 
   | _ => pure #[]
 
 private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
-    (tryRemoval := false) : IO UInt32 := do
+    (tryRemoval := false) (includeVariables := true) : IO UInt32 := do
   let moduleName ← match moduleNameOfPath selector.path with
     | .ok name => pure name
     | .error message => IO.eprintln message; return 2
@@ -396,7 +396,7 @@ private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool
     return 1
   let ileanPath := System.FilePath.mk ".lake/build/lib/lean" /
     System.FilePath.mk (moduleName.replace "." "/" ++ ".ilean")
-  let ilean ← Ilean.load ileanPath
+  let ilean? ← if includeVariables then some <$> Ilean.load ileanPath else pure none
   let commands := frontend.commands
   let mut edits := #[]
   let mut selectedWarning := selector.line?.isNone
@@ -412,7 +412,8 @@ private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool
         let hintEdits ← messageHintEdits msg.data inputCtx.fileMap
         if !hintEdits.isEmpty then
           edits := edits ++ hintEdits
-        else if let some binderName := unusedBinderName? rendered then
+        else if includeVariables then if let some binderName := unusedBinderName? rendered then
+          let some ilean := ilean? | IO.eprintln "missing semantic reference data"; return 1
           match unusedVariableEdits source inputCtx.fileMap commands ilean moduleName binderName msg.pos tryRemoval with
           | .ok binderEdits => edits := edits ++ binderEdits
           | .error error => IO.eprintln s!"{selector.path}:{msg.pos.line}:{msg.pos.column}: {error}"
@@ -487,7 +488,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -509,6 +510,24 @@ def main (args : List String) : IO UInt32 := do
         let code ← if apply then refactorSuggestedWarningsUntilStable { path }
           else refactorSuggestedWarnings { path } false
         if code != 0 then status := code
+      return status
+  | ["unused-simp-file", path] | ["unused-simp-file", path, "--apply"] =>
+      return ← refactorSuggestedWarnings { path } (args.getLast? == some "--apply")
+        (includeVariables := false)
+  | ["unused-simp", "--glob", pattern] | ["unused-simp", "--glob", pattern, "--apply"] =>
+      let apply := args.getLast? == some "--apply"
+      let files ← leanFilesUnder "."
+      let selected := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
+        |>.filter (globMatches pattern)
+      if selected.isEmpty then IO.eprintln s!"glob matched no Lean files: {pattern}"; return 1
+      let mut status := 0
+      for path in selected do
+        let childArgs := #["exe", "lean-refactor", "unused-simp-file", path] ++
+          (if apply then #["--apply"] else #[])
+        let output ← IO.Process.output { cmd := "lake", args := childArgs }
+        unless output.stdout.isEmpty do IO.print output.stdout
+        unless output.stderr.isEmpty do IO.eprint output.stderr
+        if output.exitCode != 0 then status := output.exitCode
       return status
   | _ => pure ()
   let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, insertText?, apply) ← match args with
