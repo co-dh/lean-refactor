@@ -26,7 +26,18 @@ structure Edit where
   start : String.Pos.Raw
   stop : String.Pos.Raw
   line : Nat
+  replacement : String := ""
   deriving Repr
+
+structure WarningSelector where
+  path : String
+  line? : Option Nat := none
+  column? : Option Nat := none
+
+structure HintWidgetProps where
+  range : Lsp.Range
+  suggestion : String
+  deriving FromJson
 
 private def usageSites (ilean : Ilean) (declModule declName : String) : Array ReferenceSite :=
   match ilean.references.get? (.const declModule declName) with
@@ -79,6 +90,9 @@ private partial def binderCandidates (binderName : String) (stx : Syntax)
     found := found ++ binderCandidates binderName child (stx :: parents)
   found
 
+private def binderIdentifiers (binder : Syntax) : Array Syntax :=
+  binder.getArgs[1]?.map (·.getArgs.filter (·.isIdent)) |>.getD #[]
+
 private def declarationBinderEdit (source : String) (fileMap : FileMap) (site : ReferenceSite)
     (commands : Array Syntax) (binderName : String) : Except String Edit := do
   let pos := fileMap.lspPosToUtf8Pos site.range.start
@@ -90,8 +104,7 @@ private def declarationBinderEdit (source : String) (fileMap : FileMap) (site : 
   if candidates.size != 1 then
     throw s!"expected exactly one binder named `{binderName}` in the declaration, found {candidates.size}"
   let binder := candidates[0]!
-  let identifiers := binder.getArgs.foldl (init := #[]) fun acc child =>
-    if child.isIdent then acc.push child else acc
+  let identifiers := binderIdentifiers binder
   if identifiers.size > 1 then
     throw s!"refusing grouped binder `{binderName}`; split it into a single-name binder first"
   let some range := binder.getRange?
@@ -104,6 +117,57 @@ private def declarationBinderEdit (source : String) (fileMap : FileMap) (site : 
       if char == " " || char == "\t" then p := previous else break
     return p
   pure { start, stop := range.stop, line := (fileMap.toPosition range.start).line }
+
+private def binderEditAt (source : String) (fileMap : FileMap) (binder ident : Syntax) : Except String Edit := do
+  let some identRange := ident.getRange? | throw "warned binder identifier has no source range"
+  let identifiers := binder.getArgs.foldl (init := #[]) fun acc child =>
+    if child.isIdent then acc.push child else acc
+  if identifiers.size <= 1 then
+    let some binderRange := binder.getRange? | throw "warned binder has no source range"
+    let start := Id.run do
+      let mut p := binderRange.start
+      while p.byteIdx > 0 do
+        let previous := p.unoffsetBy ⟨1⟩
+        let char := String.Pos.Raw.extract source previous p
+        if char == " " || char == "\t" then p := previous else break
+      return p
+    pure { start, stop := binderRange.stop, line := (fileMap.toPosition identRange.start).line }
+  else
+    let some index := identifiers.findIdx? fun candidate => candidate.getRange? == some identRange
+      | throw "warned identifier is absent from its binder"
+    let (start, stop) ← if let some next := identifiers[index + 1]? then
+      let some nextRange := next.getRange? | throw "next binder identifier has no source range"
+      pure (identRange.start, nextRange.start)
+    else
+      let some previous := identifiers[index - 1]? | throw "internal grouped-binder error"
+      let some previousRange := previous.getRange? | throw "previous binder identifier has no source range"
+      pure (previousRange.stop, identRange.stop)
+    pure { start, stop, line := (fileMap.toPosition identRange.start).line }
+
+private partial def explicitBinderIndexAt (pos : String.Pos.Raw) (stx : Syntax)
+    (count : Nat := 0) : Option Nat × Nat := Id.run do
+  let mut count := count
+  if stx.isOfKind ``Lean.Parser.Term.explicitBinder then
+    for child in binderIdentifiers stx do
+      if child.isIdent then
+        if let some range := child.getRange? then
+          if range.start <= pos && pos < range.stop then return (some count, count)
+        count := count + 1
+    return (none, count)
+  for child in stx.getArgs do
+    let (found?, nextCount) := explicitBinderIndexAt pos child count
+    if found?.isSome then return (found?, nextCount)
+    count := nextCount
+  return (none, count)
+
+private def declarationAtPosition? (ilean : Ilean) (pos : Lsp.Position) : Option String := Id.run do
+  let mut best : Option (String × Nat) := none
+  for (name, info) in ilean.decls do
+    let range := info.range
+    if range.start <= pos && pos <= range.end then
+      let span := range.end.line - range.start.line
+      if best.all fun previous => span <= previous.2 then best := some (name, span)
+  return best.map (·.1)
 
 private def editForSite (fileMap : FileMap) (site : ReferenceSite)
     (commands : Array Syntax) (argIndex : Nat) : Except String Edit := do
@@ -134,10 +198,207 @@ private def editForSite (fileMap : FileMap) (site : ReferenceSite)
     else pure targetRange.stop
   pure { start, stop, line := site.range.start.line + 1 }
 
+private def unusedVariableEdits (source : String) (fileMap : FileMap) (commands : Array Syntax)
+    (ilean : Ilean) (moduleName binderName : String) (warningPos : Position) : Except String (Array Edit) := do
+  let pos := fileMap.ofPosition warningPos
+  let some (ident, parents) := commands.findSome? (syntaxAt pos)
+    | throw "unused warning has no original syntax node"
+  unless ident.isIdent && ident.getId.toString == binderName do
+    throw s!"unused warning does not point at binder `{binderName}`"
+  let binder? := parents.find? fun parent =>
+    parent.isOfKind ``Lean.Parser.Term.explicitBinder ||
+    parent.isOfKind ``Lean.Parser.Term.implicitBinder ||
+    parent.isOfKind ``Lean.Parser.Term.instBinder
+  let some binder := binder? | do
+    let some range := ident.getRange? | throw "unused positional binder has no source range"
+    return #[{ start := range.start, stop := range.stop, line := warningPos.line, replacement := "_" }]
+  let isTopLevelParameter :=
+    parents.any (·.isOfKind ``Lean.Parser.Command.declSig) &&
+      !parents.any (·.isOfKind ``Lean.Parser.Term.forall)
+  unless isTopLevelParameter do
+    let some range := ident.getRange? | throw "nested binder identifier has no source range"
+    return #[{ start := range.start, stop := range.stop, line := warningPos.line, replacement := "_" }]
+  let binderRemoval ← binderEditAt source fileMap binder ident
+  unless binder.isOfKind ``Lean.Parser.Term.explicitBinder do return #[binderRemoval]
+  let some declaration := parents.find? (·.isOfKind ``Lean.Parser.Command.declaration)
+    | throw "explicit unused binder is not inside a declaration"
+  let (some argumentIndex, _) := explicitBinderIndexAt pos declaration
+    | do
+      let some range := ident.getRange? | throw "nested binder identifier has no source range"
+      return #[{ start := range.start, stop := range.stop, line := warningPos.line, replacement := "_" }]
+  let some declName := declarationAtPosition? ilean (fileMap.leanPosToLspPos warningPos)
+    | throw "cannot resolve the enclosing declaration name"
+  let mut edits := #[binderRemoval]
+  for site in usageSites ilean moduleName declName do
+    edits := edits.push (← editForSite fileMap site commands argumentIndex)
+  pure edits
+
+private def unusedBinderName? (message : String) : Option String := do
+  guard (message.contains "unused variable `")
+  (message.splitOn "`")[1]?
+
 private def applyEdits (source : String) (edits : Array Edit) : String :=
   let edits := edits.qsort fun a b => b.start.byteIdx < a.start.byteIdx
   edits.foldl (init := source) fun text edit =>
-    String.Pos.Raw.extract text 0 edit.start ++ String.Pos.Raw.extract text edit.stop text.rawEndPos
+    String.Pos.Raw.extract text 0 edit.start ++ edit.replacement ++
+      String.Pos.Raw.extract text edit.stop text.rawEndPos
+
+private def independentEdits (edits : Array Edit) : Array Edit × Nat := Id.run do
+  let ordered := edits.qsort fun a b =>
+    a.start.byteIdx < b.start.byteIdx ||
+      (a.start.byteIdx == b.start.byteIdx && a.stop.byteIdx < b.stop.byteIdx)
+  let mut accepted := #[]
+  let mut deferred := 0
+  for edit in ordered do
+    if accepted.any fun prior => edit.start < prior.stop && prior.start < edit.stop then
+      deferred := deferred + 1
+    else
+      accepted := accepted.push edit
+  return (accepted, deferred)
+
+private def globMatches (pattern value : String) : Bool :=
+  go pattern.toList value.toList
+where
+  go : List Char → List Char → Bool
+    | [], [] => true
+    | [], _ => false
+    | '*' :: ps, cs => go ps cs || match cs with | [] => false | _ :: cs => go ('*' :: ps) cs
+    | '?' :: ps, _ :: cs => go ps cs
+    | '?' :: _, [] => false
+    | p :: ps, c :: cs => p == c && go ps cs
+    | _ :: _, [] => false
+
+private partial def leanFilesUnder (dir : System.FilePath) : IO (Array String) := do
+  let mut files := #[]
+  for entry in ← dir.readDir do
+    if ← entry.path.isDir then
+      files := files ++ (← leanFilesUnder entry.path)
+    else if entry.path.extension == some "lean" then
+      files := files.push entry.path.toString
+  pure files
+
+private def moduleNameOfPath (path : String) : Except String String := do
+  unless path.endsWith ".lean" do throw s!"not a Lean source file: {path}"
+  let relative := if path.startsWith "./" then path.drop 2 else path
+  if relative.startsWith "/" then throw "source selector must be relative to the repository root"
+  pure <| (relative.dropEnd 5).replace "/" "."
+
+private def parseWarningSelector (selector : String) : Except String WarningSelector := do
+  let parts := selector.splitOn ":"
+  match parts.reverse with
+  | column :: line :: restRev =>
+      if let some lineNum := line.toNat? then
+        let some columnNum := column.toNat?
+          | throw s!"invalid warning column in selector: {selector}"
+        if lineNum == 0 || columnNum == 0 then throw "warning positions are 1-based"
+        pure { path := (String.intercalate ":" restRev.reverse), line? := some lineNum, column? := some columnNum }
+      else pure { path := selector }
+  | _ => pure { path := selector }
+
+private def tryThisEdits (frontend : Elab.Frontend.State) (fileMap : FileMap) : Array Edit :=
+  frontend.commandState.infoState.trees.toArray.foldl (init := #[]) fun edits tree =>
+    tree.foldInfo (init := edits) fun _ info edits => Id.run do
+      let .ofCustomInfo { value, .. } := info | return edits
+      let some hint := value.get? Meta.Tactic.TryThis.TryThisInfo | return edits
+      let start := fileMap.lspPosToUtf8Pos hint.edit.range.start
+      let stop := fileMap.lspPosToUtf8Pos hint.edit.range.end
+      return edits.push { start := start, stop := stop, line := hint.edit.range.start.line + 1, replacement := hint.edit.newText }
+
+private partial def messageHintEdits (data : MessageData) (fileMap : FileMap) : IO (Array Edit) := do
+  match data with
+  | .ofWidget widget fallback =>
+      let (props, _) := widget.props {}
+      let fromWidget := match fromJson? props with
+        | .ok (hint : HintWidgetProps) =>
+            let start := fileMap.lspPosToUtf8Pos hint.range.start
+            let stop := fileMap.lspPosToUtf8Pos hint.range.end
+            #[{ start := start, stop := stop, line := hint.range.start.line + 1, replacement := hint.suggestion }]
+        | .error _ => #[]
+      pure (fromWidget ++ (← messageHintEdits fallback fileMap))
+  | .withContext _ data | .withNamingContext _ data | .nest _ data | .group data |
+      .tagged _ data => messageHintEdits data fileMap
+  | .compose left right =>
+      pure ((← messageHintEdits left fileMap) ++ (← messageHintEdits right fileMap))
+  | .trace _ data children =>
+      let mut edits ← messageHintEdits data fileMap
+      for child in children do edits := edits ++ (← messageHintEdits child fileMap)
+      pure edits
+  | _ => pure #[]
+
+private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool) : IO UInt32 := do
+  let moduleName ← match moduleNameOfPath selector.path with
+    | .ok name => pure name
+    | .error message => IO.eprintln message; return 2
+  let source ← IO.FS.readFile selector.path
+  let inputCtx := Parser.mkInputContext source selector.path
+  let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
+  unless !headerMessages.hasErrors do
+    for msg in headerMessages.toList do IO.eprintln (← msg.toString)
+    return 1
+  initSearchPath (← findSysroot)
+  let (env, headerMessages) ← Elab.processHeader header {} headerMessages inputCtx
+    (mainModule := parseName moduleName)
+  unless !headerMessages.hasErrors do
+    for msg in headerMessages.toList do IO.eprintln (← msg.toString)
+    return 1
+  let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
+  unless !frontend.commandState.messages.hasErrors do
+    for msg in frontend.commandState.messages.toList do IO.eprintln (← msg.toString)
+    return 1
+  let ileanPath := System.FilePath.mk ".lake/build/lib/lean" /
+    System.FilePath.mk (moduleName.replace "." "/" ++ ".ilean")
+  let ilean ← Ilean.load ileanPath
+  let commands := frontend.commands
+  let mut edits := #[]
+  let mut selectedWarning := selector.line?.isNone
+  for msg in frontend.commandState.messages.toList do
+    let rendered := toString (← msg.data.format)
+    if msg.severity == .warning && rendered.contains "unused" then
+      let matchesPosition := match selector.line?, selector.column? with
+        | some line, some column => msg.pos.line == line && msg.pos.column == column
+        | some line, none => msg.pos.line == line
+        | none, _ => true
+      if matchesPosition then
+        selectedWarning := true
+        let hintEdits ← messageHintEdits msg.data inputCtx.fileMap
+        if !hintEdits.isEmpty then
+          edits := edits ++ hintEdits
+        else if let some binderName := unusedBinderName? rendered then
+          match unusedVariableEdits source inputCtx.fileMap commands ilean moduleName binderName msg.pos with
+          | .ok binderEdits => edits := edits ++ binderEdits
+          | .error error => IO.eprintln s!"{selector.path}:{msg.pos.line}:{msg.pos.column}: {error}"
+  unless selectedWarning do
+    IO.eprintln s!"no unused warning at {selector.path}:{selector.line?.getD 0}:{selector.column?.getD 0}"
+    return 1
+  let availableEdits := tryThisEdits frontend inputCtx.fileMap
+  if edits.isEmpty then
+    edits := availableEdits.filter fun edit => selector.line?.all fun line => line == edit.line
+  let (selectedEdits, deferred) := independentEdits edits
+  for edit in selectedEdits do
+    let old := String.Pos.Raw.extract source edit.start edit.stop
+    IO.println s!"{selector.path}:{edit.line}: replace {repr old} with {repr edit.replacement}"
+  if selectedEdits.isEmpty then
+    IO.println (s!"{selector.path}: selected warning(s) have no matching Lean code-action edit " ++
+      s!"({availableEdits.size} code action(s) found)")
+  else
+    if deferred > 0 then
+      IO.println s!"deferred {deferred} overlapping edit(s) until the next elaboration pass"
+    if apply then
+      IO.FS.writeFile selector.path (applyEdits source selectedEdits)
+      IO.println s!"applied {selectedEdits.size} edit(s) to {selector.path}"
+  pure 0
+
+private partial def refactorSuggestedWarningsUntilStable
+    (selector : WarningSelector) (fuel : Nat := 100) : IO UInt32 := do
+  if fuel == 0 then
+    IO.eprintln s!"refusing: warning refactoring did not stabilize for {selector.path}"
+    return 1
+  let before ← IO.FS.readFile selector.path
+  let status ← refactorSuggestedWarnings selector true
+  if status != 0 then return status
+  let after ← IO.FS.readFile selector.path
+  if before == after then return 0
+  refactorSuggestedWarningsUntilStable selector (fuel - 1)
 
 private def showContext (fileMap : FileMap) (site : ReferenceSite)
     (commands : Array Syntax) : IO Unit := do
@@ -150,9 +411,28 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
+  match args with
+  | ["unused", selector] | ["unused", selector, "--apply"] =>
+      let parsed ← match parseWarningSelector selector with
+        | .ok parsed => pure parsed
+        | .error message => IO.eprintln message; return 2
+      return ← refactorSuggestedWarnings parsed (args.getLast? == some "--apply")
+  | ["unused", "--glob", pattern] | ["unused", "--glob", pattern, "--apply"] =>
+      let apply := args.getLast? == some "--apply"
+      let files ← leanFilesUnder "."
+      let selected := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
+        |>.filter (globMatches pattern)
+      if selected.isEmpty then IO.eprintln s!"glob matched no Lean files: {pattern}"; return 1
+      let mut status := 0
+      for path in selected do
+        let code ← if apply then refactorSuggestedWarningsUntilStable { path }
+          else refactorSuggestedWarnings { path } false
+        if code != 0 then status := code
+      return status
+  | _ => pure ()
   let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, apply) ← match args with
     | ["inspect", sourcePath, moduleName, declModule, declName] =>
         pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, false)
