@@ -34,6 +34,11 @@ private def usageSites (ilean : Ilean) (declModule declName : String) : Array Re
   | some info => info.usages.map fun loc =>
       { range := loc.range, parent? := loc.parentDecl? }
 
+private def definitionSite? (ilean : Ilean) (declModule declName : String) : Option ReferenceSite := do
+  let info ← ilean.references.get? (.const declModule declName)
+  let loc ← info.definition?
+  some { range := loc.range, parent? := loc.parentDecl? }
+
 private partial def syntaxAt
     (pos : String.Pos.Raw) (stx : Syntax) (parents : List Syntax := []) : Option (Syntax × List Syntax) :=
   let here := match stx.getPos?, stx.getTailPos? with
@@ -60,6 +65,45 @@ private def appArgs (app : Syntax) : Option (Array Syntax) := do
   guard (app.isOfKind ``Lean.Parser.Term.app)
   let argsNode ← app.getArgs[1]?
   some argsNode.getArgs
+
+private partial def binderCandidates (binderName : String) (stx : Syntax)
+    (parents : List Syntax := []) : Array Syntax := Id.run do
+  let mut found := #[]
+  if stx.isIdent && stx.getId.toString == binderName then
+    if let some binder := parents.find? (fun p =>
+        p.isOfKind ``Lean.Parser.Term.explicitBinder ||
+        p.isOfKind ``Lean.Parser.Term.implicitBinder ||
+        p.isOfKind ``Lean.Parser.Term.instBinder) then
+      found := found.push binder
+  for child in stx.getArgs do
+    found := found ++ binderCandidates binderName child (stx :: parents)
+  found
+
+private def declarationBinderEdit (source : String) (fileMap : FileMap) (site : ReferenceSite)
+    (commands : Array Syntax) (binderName : String) : Except String Edit := do
+  let pos := fileMap.lspPosToUtf8Pos site.range.start
+  let some (_, parents) := commands.findSome? (syntaxAt pos)
+    | throw "declaration has no original syntax node"
+  let some declaration := parents.find? (fun p => p.isOfKind ``Lean.Parser.Command.declaration)
+    | throw "resolved definition is not inside a declaration command"
+  let candidates := binderCandidates binderName declaration
+  if candidates.size != 1 then
+    throw s!"expected exactly one binder named `{binderName}` in the declaration, found {candidates.size}"
+  let binder := candidates[0]!
+  let identifiers := binder.getArgs.foldl (init := #[]) fun acc child =>
+    if child.isIdent then acc.push child else acc
+  if identifiers.size > 1 then
+    throw s!"refusing grouped binder `{binderName}`; split it into a single-name binder first"
+  let some range := binder.getRange?
+    | throw s!"binder `{binderName}` has no original source range"
+  let start := Id.run do
+    let mut p := range.start
+    while p.byteIdx > 0 do
+      let previous := p.unoffsetBy ⟨1⟩
+      let char := String.Pos.Raw.extract source previous p
+      if char == " " || char == "\t" then p := previous else break
+    return p
+  pure { start, stop := range.stop, line := (fileMap.toPosition range.start).line }
 
 private def editForSite (fileMap : FileMap) (site : ReferenceSite)
     (commands : Array Syntax) (argIndex : Nat) : Except String Edit := do
@@ -106,16 +150,20 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
-  let (mode, sourcePath, moduleName, declModule, declName, argIndex?, apply) ← match args with
+  let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, apply) ← match args with
     | ["inspect", sourcePath, moduleName, declModule, declName] =>
-        pure ("inspect", sourcePath, moduleName, declModule, declName, none, false)
+        pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, false)
     | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, index.toNat?, false)
+        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, false)
     | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--apply"] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, index.toNat?, true)
+        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, true)
+    | ["remove-parameter", sourcePath, moduleName, declName, binderName, index] =>
+        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, false)
+    | ["remove-parameter", sourcePath, moduleName, declName, binderName, index, "--apply"] =>
+        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, true)
     | _ => IO.eprintln usage; return 2
   let source ← IO.FS.readFile sourcePath
   let inputCtx := Parser.mkInputContext source sourcePath
@@ -147,6 +195,21 @@ def main (args : List String) : IO UInt32 := do
     let mut edits := #[]
     for site in sites do
       match editForSite inputCtx.fileMap site commands (oneBased - 1) with
+      | .error message => IO.eprintln message; return 1
+      | .ok edit => edits := edits.push edit
+    if mode == "parameter" then
+      let some binderName := binderName? | IO.eprintln "missing binder name"; return 2
+      let warningNeedle := s!"unused variable `{binderName}`"
+      let mut hasUnusedWarning := false
+      for msg in frontend.commandState.messages.toList do
+        if (toString (← msg.data.format)).contains warningNeedle then hasUnusedWarning := true
+      unless hasUnusedWarning do
+        IO.eprintln s!"refusing: Lean did not report `{binderName}` as unused"
+        return 1
+      let some definitionSite := definitionSite? ilean declModule declName
+        | IO.eprintln "declaration definition is absent from this module's semantic references"
+          return 1
+      match declarationBinderEdit source inputCtx.fileMap definitionSite commands binderName with
       | .error message => IO.eprintln message; return 1
       | .ok edit => edits := edits.push edit
     for edit in edits do
