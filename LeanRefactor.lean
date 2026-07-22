@@ -244,13 +244,21 @@ private def insertionForSite (fileMap : FileMap) (site : ReferenceSite)
   pure { start := range.start, stop := range.start, line := site.range.start.line + 1, replacement := term ++ " " }
 
 private def unusedVariableEdits (source : String) (fileMap : FileMap) (commands : Array Syntax)
-    (ilean : Ilean) (moduleName binderName : String) (warningPos : Position)
+    (ilean? : Option Ilean) (moduleName binderName : String) (warningPos : Position)
     (tryRemoval := false) : Except String (Array Edit) := do
   let pos := fileMap.ofPosition warningPos
   let some (ident, parents) := commands.findSome? (syntaxAt pos)
     | throw "unused warning has no original syntax node"
   unless ident.isIdent && ident.getId.toString == binderName do
     throw s!"unused warning does not point at binder `{binderName}`"
+  -- Safe default: prefix the flagged identifier with `_`.  A name beginning with `_` is exempt from
+  -- the unused-variable linter, so this one edit silences the warning for every binder kind — a
+  -- top-level parameter, a nested `fun`/`let` binder, or a tactic/pattern binder — while keeping the
+  -- original name for documentation.  The linter fires only when the binder has zero references, so
+  -- renaming it is always type-correct, and it rewrites no call site, so no `.ilean` data is needed.
+  if !tryRemoval then
+    let some range := ident.getRange? | throw "unused binder identifier has no source range"
+    return #[{ start := range.start, stop := range.start, line := warningPos.line, replacement := "_" }]
   let binder? := parents.find? fun parent =>
     parent.isOfKind ``Lean.Parser.Term.explicitBinder ||
     parent.isOfKind ``Lean.Parser.Term.implicitBinder ||
@@ -274,6 +282,8 @@ private def unusedVariableEdits (source : String) (fileMap : FileMap) (commands 
     | do
       let some range := ident.getRange? | throw "nested binder identifier has no source range"
       return #[{ start := range.start, stop := range.stop, line := warningPos.line, replacement := "_" }]
+  let some ilean := ilean?
+    | throw "binder removal needs semantic reference data (.ilean); rebuild the module first"
   let some declName := declarationAtPosition? ilean (fileMap.leanPosToLspPos warningPos)
     | throw "cannot resolve the enclosing declaration name"
   let mut edits := #[binderRemoval]
@@ -319,6 +329,8 @@ where
 private partial def leanFilesUnder (dir : System.FilePath) : IO (Array String) := do
   let mut files := #[]
   for entry in ← dir.readDir do
+    if entry.fileName.startsWith "." then
+      continue  -- skip .lake, .git, .claude, … : build artefacts and VCS never hold source we edit
     if ← entry.path.isDir then
       files := files ++ (← leanFilesUnder entry.path)
     else if entry.path.extension == some "lean" then
@@ -373,6 +385,31 @@ private partial def messageHintEdits (data : MessageData) (fileMap : FileMap) : 
       pure edits
   | _ => pure #[]
 
+/-- Re-elaborate `source` (against the already-imported `env`) and report whether it is error-free.
+    Used to reject an edit that would break the build — chiefly an unused-variable *false positive*
+    (a binder the linter flags yet a `letI`/`haveI` body actually uses) or a parameter referenced by
+    name at a call site.  This is a single in-process elaboration, far cheaper than a `lake build`. -/
+private def elaboratesCleanly (env : Environment) (path source : String) : IO Bool := do
+  let ctx := Parser.mkInputContext source path
+  let (_, parserState, headerMessages) ← Parser.parseHeader ctx
+  if headerMessages.hasErrors then return false
+  let frontend ← Elab.IO.processCommands ctx parserState (Elab.Command.mkState env {} {})
+  pure !frontend.commandState.messages.hasErrors
+
+/-- Keep the largest prefix-safe subset of `edits` whose combined application still elaborates.
+    Fast path: if applying them all elaborates cleanly, keep them all (one extra elaboration).  Only
+    when that fails do we add edits one at a time, re-checking, so a single breaking edit (a linter
+    false positive, a name-referenced parameter) is dropped without discarding the file's safe fixes. -/
+private def verifiedEdits (env : Environment) (path source : String) (edits : Array Edit) :
+    IO (Array Edit) := do
+  if edits.isEmpty then return edits
+  if ← elaboratesCleanly env path (applyEdits source edits) then return edits
+  let mut kept := #[]
+  for edit in edits do
+    let candidate := kept.push edit
+    if ← elaboratesCleanly env path (applyEdits source candidate) then kept := candidate
+  pure kept
+
 private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
     (tryRemoval := false) (includeVariables := true) : IO UInt32 := do
   let moduleName ← match moduleNameOfPath selector.path with
@@ -396,9 +433,14 @@ private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool
     return 1
   let ileanPath := System.FilePath.mk ".lake/build/lib/lean" /
     System.FilePath.mk (moduleName.replace "." "/" ++ ".ilean")
-  let ilean? ← if includeVariables then some <$> Ilean.load ileanPath else pure none
+  -- Reference data is consulted only when we actually delete a binder (the removal path); the default
+  -- underscore fix needs none.  Load it best-effort so a missing `.ilean` never aborts a glob run.
+  let ilean? ← if includeVariables && tryRemoval then do
+      try pure (some (← Ilean.load ileanPath)) catch _ => pure none
+    else pure none
   let commands := frontend.commands
   let mut edits := #[]
+  let mut simpLines : Array Nat := #[]
   let mut selectedWarning := selector.line?.isNone
   for msg in frontend.commandState.messages.toList do
     let rendered := toString (← msg.data.format)
@@ -412,17 +454,20 @@ private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool
         let hintEdits ← messageHintEdits msg.data inputCtx.fileMap
         if !hintEdits.isEmpty then
           edits := edits ++ hintEdits
-        else if includeVariables then if let some binderName := unusedBinderName? rendered then
-          let some ilean := ilean? | IO.eprintln "missing semantic reference data"; return 1
-          match unusedVariableEdits source inputCtx.fileMap commands ilean moduleName binderName msg.pos tryRemoval with
-          | .ok binderEdits => edits := edits ++ binderEdits
-          | .error error => IO.eprintln s!"{selector.path}:{msg.pos.line}:{msg.pos.column}: {error}"
+        else match (if includeVariables then unusedBinderName? rendered else none) with
+          | some binderName =>
+            match unusedVariableEdits source inputCtx.fileMap commands ilean? moduleName binderName msg.pos tryRemoval with
+            | .ok binderEdits => edits := edits ++ binderEdits
+            | .error error => IO.eprintln s!"{selector.path}:{msg.pos.line}:{msg.pos.column}: {error}"
+          | none =>
+            -- e.g. "This simp argument is unused": the fix is a Lean code action stored in the info
+            -- tree, gathered from `tryThisEdits` below for exactly the lines we flagged here.
+            simpLines := simpLines.push msg.pos.line
   unless selectedWarning do
     IO.eprintln s!"no unused warning at {selector.path}:{selector.line?.getD 0}:{selector.column?.getD 0}"
     return 1
   let availableEdits := tryThisEdits frontend inputCtx.fileMap
-  if edits.isEmpty then
-    edits := availableEdits.filter fun edit => selector.line?.all fun line => line == edit.line
+  edits := edits ++ availableEdits.filter fun edit => simpLines.contains edit.line
   let (selectedEdits, deferred) := independentEdits edits
   for edit in selectedEdits do
     let old := String.Pos.Raw.extract source edit.start edit.stop
@@ -434,8 +479,18 @@ private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool
     if deferred > 0 then
       IO.println s!"deferred {deferred} overlapping edit(s) until the next elaboration pass"
     if apply then
-      IO.FS.writeFile selector.path (applyEdits source selectedEdits)
-      IO.println s!"applied {selectedEdits.size} edit(s) to {selector.path}"
+      let verified ← verifiedEdits env selector.path source selectedEdits
+      if verified.isEmpty then
+        IO.eprintln (s!"{selector.path}: every candidate edit introduces an elaboration error " ++
+          "(linter false positive or a name-referenced parameter); leaving the file unchanged")
+      else
+        IO.FS.writeFile selector.path (applyEdits source verified)
+        let skipped := selectedEdits.size - verified.size
+        if skipped == 0 then
+          IO.println s!"applied {verified.size} edit(s) to {selector.path}"
+        else
+          IO.println (s!"applied {verified.size} of {selectedEdits.size} edit(s) to {selector.path}; " ++
+            s!"skipped {skipped} that would not elaborate")
   pure 0
 
 private partial def refactorSuggestedWarningsUntilStable
