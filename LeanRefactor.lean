@@ -687,6 +687,178 @@ private def declarationSite (source : String) (commands : Array Syntax) (declNam
     state := scopeStep state cmd
   return .error s!"no declaration named `{declName}` in this file"
 
+/-- Locate the parsed command that introduces `declName`. -/
+private def declarationSyntax (commands : Array Syntax) (declName : String) :
+    Except String Syntax := Id.run do
+  let wanted := parseName declName
+  let mut state := (Name.anonymous, ([] : List Name))
+  for cmd in commands do
+    if cmd.isOfKind ``Lean.Parser.Command.declaration then
+      if let some short := declIdName? cmd then
+        if state.1 ++ short == wanted then return .ok cmd
+    state := scopeStep state cmd
+  return .error s!"no declaration named `{declName}` in this file"
+
+private partial def firstSyntaxOfKind? (kind : SyntaxNodeKind) (stx : Syntax) : Option Syntax :=
+  if stx.isOfKind kind then some stx
+  else stx.getArgs.findSome? (firstSyntaxOfKind? kind)
+
+private partial def syntaxHasIdent (name : String) (stx : Syntax) : Bool :=
+  (stx.isIdent && stx.getId.toString == name) ||
+    stx.getArgs.any (syntaxHasIdent name)
+
+/-- Replace only the parsed term after `:=` in a declaration.  The operation previews by default and
+    restores the source after either an elaboration failure or a capped repository-build failure. -/
+private def replaceDeclarationBody (path declName replacement : String) (apply : Bool) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, fileMap, commands, _) ← elaborateFile path
+  let declaration ← match declarationSyntax commands declName with
+    | .ok stx => pure stx
+    | .error message => IO.eprintln s!"{path}: {message}"; return 1
+  let some declVal := firstSyntaxOfKind? ``Lean.Parser.Command.declValSimple declaration
+    | IO.eprintln s!"{path}: `{declName}` has no simple `:=` body"
+      return 1
+  let some body := declVal.getArgs[1]?
+    | IO.eprintln s!"{path}: `{declName}` has a malformed simple body"
+      return 1
+  let some range := body.getRange?
+    | IO.eprintln s!"{path}: `{declName}` body has no source range"
+      return 1
+  let line := (fileMap.toPosition range.start).line + 1
+  let edit : Edit := {
+    start := range.start
+    stop := range.stop
+    line := (fileMap.toPosition range.start).line + 1
+    replacement := replacement
+  }
+  let updated := applyEdits source #[edit]
+  IO.println s!"replace body of `{declName}` in {path} (line {line})"
+  unless apply do
+    IO.println "preview only; pass --apply to write"
+    return 0
+  IO.FS.writeFile path updated
+  let check ← IO.Process.output {
+    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+  unless check.exitCode == 0 do
+    IO.FS.writeFile path source
+    unless check.stdout.isEmpty do IO.eprintln check.stdout
+    unless check.stderr.isEmpty do IO.eprintln check.stderr
+    IO.eprintln s!"{path}: replacement body does not elaborate; restored"
+    return 1
+  IO.println "verifying the capped repository build after replacing the body..."
+  let build ← repositoryBuild
+  if build.exitCode == 0 then
+    IO.println s!"whole-repository build passed; replaced body of `{declName}`"
+    return 0
+  IO.FS.writeFile path source
+  unless build.stdout.isEmpty do IO.eprintln build.stdout
+  unless build.stderr.isEmpty do IO.eprintln build.stderr
+  IO.eprintln s!"whole-repository build failed after replacing `{declName}`; restored"
+  return 1
+
+/-- Move a declaration within its file to immediately before another declaration in the same
+    namespace.  Both boundaries come from parsed command syntax; preview and rollback follow the
+    same transaction contract as the other structural operations. -/
+private def relocateDeclarationBefore (path declName anchorName : String) (apply : Bool) :
+    IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, _, commands, _) ← elaborateFile path
+  let ((start, stop), ns) ← match declarationSite source commands declName with
+    | .ok site => pure site
+    | .error message => IO.eprintln s!"{path}: {message}"; return 1
+  let ((anchorStart, _), anchorNs) ← match declarationSite source commands anchorName with
+    | .ok site => pure site
+    | .error message => IO.eprintln s!"{path}: {message}"; return 1
+  unless ns == anchorNs do
+    IO.eprintln s!"{path}: `{declName}` is in `{ns}`, but `{anchorName}` is in `{anchorNs}`"
+    return 1
+  unless stop ≤ anchorStart || anchorStart < start do
+    IO.eprintln s!"{path}: `{declName}` already contains or precedes `{anchorName}`"
+    return 1
+  let text := String.Pos.Raw.extract source start stop
+  let updated := applyEdits source #[
+    { start := start, stop := stop, line := 0 },
+    { start := anchorStart, stop := anchorStart, line := 0, replacement := text }
+  ]
+  IO.println s!"relocate `{declName}` before `{anchorName}` in {path}"
+  unless apply do
+    IO.println "preview only; pass --apply to write"
+    return 0
+  IO.FS.writeFile path updated
+  let check ← IO.Process.output {
+    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+  unless check.exitCode == 0 do
+    IO.FS.writeFile path source
+    unless check.stdout.isEmpty do IO.eprintln check.stdout
+    unless check.stderr.isEmpty do IO.eprintln check.stderr
+    IO.eprintln s!"{path}: relocated source does not elaborate; restored"
+    return 1
+  IO.println "verifying the capped repository build after relocating the declaration..."
+  let build ← repositoryBuild
+  if build.exitCode == 0 then
+    IO.println s!"whole-repository build passed; relocated `{declName}`"
+    return 0
+  IO.FS.writeFile path source
+  unless build.stdout.isEmpty do IO.eprintln build.stdout
+  unless build.stderr.isEmpty do IO.eprintln build.stderr
+  IO.eprintln s!"whole-repository build failed after relocating `{declName}`; restored"
+  return 1
+
+/-- Locate a named `section` command and the namespace in force immediately before it. -/
+private def sectionSite (source : String) (commands : Array Syntax) (sectionName : String) :
+    Except String ((String.Pos.Raw × String.Pos.Raw) × Name) := Id.run do
+  let mut state := (Name.anonymous, ([] : List Name))
+  for cmd in commands do
+    if cmd.isOfKind ``Lean.Parser.Command.section then
+      if syntaxHasIdent sectionName cmd then
+        let some range := cmd.getRange?
+          | return .error s!"section `{sectionName}` has no source range"
+        return .ok (wholeLines source range, state.1)
+    state := scopeStep state cmd
+  return .error s!"no section named `{sectionName}` in this file"
+
+private def relocateDeclarationBeforeSection (path declName sectionName : String) (apply : Bool) :
+    IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, _, commands, _) ← elaborateFile path
+  let ((start, stop), ns) ← match declarationSite source commands declName with
+    | .ok site => pure site
+    | .error message => IO.eprintln s!"{path}: {message}"; return 1
+  let ((anchorStart, _), anchorNs) ← match sectionSite source commands sectionName with
+    | .ok site => pure site
+    | .error message => IO.eprintln s!"{path}: {message}"; return 1
+  unless ns == anchorNs do
+    IO.eprintln s!"{path}: `{declName}` is in `{ns}`, but section `{sectionName}` starts in `{anchorNs}`"
+    return 1
+  let text := String.Pos.Raw.extract source start stop
+  let updated := applyEdits source #[
+    { start := start, stop := stop, line := 0 },
+    { start := anchorStart, stop := anchorStart, line := 0, replacement := text }
+  ]
+  IO.println s!"relocate `{declName}` before section `{sectionName}` in {path}"
+  unless apply do
+    IO.println "preview only; pass --apply to write"
+    return 0
+  IO.FS.writeFile path updated
+  let check ← IO.Process.output {
+    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+  unless check.exitCode == 0 do
+    IO.FS.writeFile path source
+    unless check.stdout.isEmpty do IO.eprintln check.stdout
+    unless check.stderr.isEmpty do IO.eprintln check.stderr
+    IO.eprintln s!"{path}: relocated source does not elaborate; restored"
+    return 1
+  IO.println "verifying the capped repository build after relocating the declaration..."
+  let build ← repositoryBuild
+  if build.exitCode == 0 then
+    IO.println s!"whole-repository build passed; relocated `{declName}`"
+    return 0
+  IO.FS.writeFile path source
+  unless build.stdout.isEmpty do IO.eprintln build.stdout
+  unless build.stderr.isEmpty do IO.eprintln build.stderr
+  IO.eprintln s!"whole-repository build failed after relocating `{declName}`; restored"
+  return 1
+
 private def sourceDeclarations (fileMap : FileMap) (env : Environment) (commands : Array Syntax) :
     Array (Name × ConstantInfo × Nat) := Id.run do
   let mut declarations := #[]
@@ -1139,7 +1311,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1155,10 +1327,22 @@ def main (args : List String) : IO UInt32 := do
       return ← moveDeclaration sourcePath declName targetPath false
   | ["move", sourcePath, declName, targetPath, "--apply"] =>
       return ← moveDeclaration sourcePath declName targetPath true
+  | ["relocate-before", sourcePath, declName, anchorName] =>
+      return ← relocateDeclarationBefore sourcePath declName anchorName false
+  | ["relocate-before", sourcePath, declName, anchorName, "--apply"] =>
+      return ← relocateDeclarationBefore sourcePath declName anchorName true
+  | ["relocate-before-section", sourcePath, declName, sectionName] =>
+      return ← relocateDeclarationBeforeSection sourcePath declName sectionName false
+  | ["relocate-before-section", sourcePath, declName, sectionName, "--apply"] =>
+      return ← relocateDeclarationBeforeSection sourcePath declName sectionName true
   | ["collapse", sourcePath, declName, replacement] =>
       return ← collapseDeclaration sourcePath declName replacement false
   | ["collapse", sourcePath, declName, replacement, "--apply"] =>
       return ← collapseDeclaration sourcePath declName replacement true
+  | ["replace-body", sourcePath, declName, replacement] =>
+      return ← replaceDeclarationBody sourcePath declName replacement false
+  | ["replace-body", sourcePath, declName, replacement, "--apply"] =>
+      return ← replaceDeclarationBody sourcePath declName replacement true
   | ["rename-file", path, declName, replacement] | ["rename-file", path, declName, replacement, "--apply"] =>
       let moduleName ← match moduleNameOfPath path with
         | .ok n => pure n
