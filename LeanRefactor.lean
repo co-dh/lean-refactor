@@ -430,10 +430,39 @@ That is the one edit the subcommands above cannot express, and the one the skill
 to do by hand, so it is mechanised here: cut the declaration with its docstring, splice it into the
 target inside the same namespace, and refuse the edit unless BOTH files still elaborate. -/
 
+/-- Distinct files whose `Environment` this process has built.  Re-elaborating the SAME file is
+    routine — `verifiedEdits` does it once per candidate edit — so only distinct paths are counted. -/
+initialize elaboratedFiles : IO.Ref (Array String) ← IO.mkRef #[]
+
+/-- `move` legitimately elaborates two files (the source and the target).  Nothing legitimately
+    elaborates more, so this cap bounds a process to a constant number of environments. -/
+private def maxElaboratedFiles : Nat := 2
+
+/-- Record that `path`'s environment is about to be built; refuse once the cap is reached.
+
+    An `Environment` is retained for as long as anything derived from it lives, so a loop that
+    elaborates file after file IN-PROCESS accumulates one per file: `rename --glob 'Freyd/*.lean'`
+    reached 18.3 GB resident of 30 GB and was OOM-killed by the kernel twenty minutes in, taking a
+    running agent down with it.  `forkPerFile` is the cure, but a convention cannot enforce itself —
+    the next in-process loop would reintroduce the leak silently and fail the same slow way.  So the
+    bound is CHECKED, here, at the one operation that costs the memory, and a violation fails on the
+    third file with the fix named in the message. -/
+private def claimElaboration (path : String) : IO Unit := do
+  let claimed ← elaboratedFiles.get
+  if claimed.contains path then return
+  if claimed.size ≥ maxElaboratedFiles then
+    throw <| IO.userError <|
+      s!"lean-refactor: refusing to build a {claimed.size + 1}th file environment in one process " ++
+      s!"({path}; already elaborated {claimed}).  Each one is retained, so looping over files " ++
+      "in-process accumulates them and runs the machine out of memory.  Drive the loop with " ++
+      "`forkPerFile` instead — one child process per file."
+  elaboratedFiles.set (claimed.push path)
+
 /-- Source text, file map and command syntax of `path`.  Lean's parser is extensible, so a file
     using custom notation cannot be parsed without the environment its imports build — hence a full
     elaboration rather than a bare parse. -/
 private def elaborateFile (path : String) : IO (String × FileMap × Array Syntax × Environment) := do
+  claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   let source ← IO.FS.readFile path
   let ctx := Parser.mkInputContext source path
@@ -447,6 +476,7 @@ private def elaborateFile (path : String) : IO (String × FileMap × Array Synta
 
 /-- Re-elaborate a whole file (imports included) from candidate `source` text. -/
 private def fileElaboratesCleanly (path source : String) : IO Bool := do
+  claimElaboration path
   let ctx := Parser.mkInputContext source path
   let (header, parserState, messages) ← Parser.parseHeader ctx
   if messages.hasErrors then return false
@@ -590,6 +620,7 @@ private def isIdentifierUse (line name : String) : Bool := Id.run do
     definition, and the two are different edits. -/
 private def renameReferences (path moduleName declName replacement : String) (apply : Bool) :
     IO UInt32 := do
+  claimElaboration path
   initSearchPath (← findSysroot)
   let source ← IO.FS.readFile path
   let inputCtx := Parser.mkInputContext source path
@@ -707,6 +738,7 @@ private def renameTokenGlob (pattern oldToken newToken : String) (apply : Bool) 
 
 private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
     (tryRemoval := false) (includeVariables := true) : IO UInt32 := do
+  claimElaboration selector.path
   let moduleName ← match moduleNameOfPath selector.path with
     | .ok name => pure name
     | .error message => IO.eprintln message; return 2
@@ -906,6 +938,7 @@ def main (args : List String) : IO UInt32 := do
     | ["remove-parameter", sourcePath, moduleName, declName, binderName, index, "--apply"] =>
         pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, true)
     | _ => IO.eprintln usage; return 2
+  claimElaboration sourcePath
   let source ← IO.FS.readFile sourcePath
   let inputCtx := Parser.mkInputContext source sourcePath
   let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
