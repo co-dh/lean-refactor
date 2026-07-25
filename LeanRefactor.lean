@@ -558,7 +558,8 @@ private def insertionPoint? (commands : Array Syntax) (ns : Name) : Option Strin
     else if state.1 == ns && cmd.isOfKind ``Lean.Parser.Command.end then
       -- An otherwise empty namespace still has a legal insertion point: immediately before its
       -- matching `end`.  Using the start (not tail) keeps the declaration inside the namespace.
-      if let some start := cmd.getPos? then best := some start
+      if let some start := cmd.getPos?.orElse fun _ => cmd.getRange?.map (·.start) then
+        best := some start
     state := scopeStep state cmd
   return best
 
@@ -572,6 +573,9 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
   let (target, _, targetCommands, _) ← elaborateFile targetPath
   let some anchor := insertionPoint? targetCommands ns
     | IO.eprintln s!"{targetPath}: never opens namespace `{ns}`, so `{declName}` has nowhere to land"
+      IO.eprintln "parsed top-level command syntax:"
+      for cmd in targetCommands do
+        IO.eprintln s!"  {cmd.getKind}: {repr cmd}"
       return 1
   let newSource := applyEdits source #[{ start, stop, line := 0 }]
   let newTarget := applyEdits target #[{ start := anchor, stop := anchor, line := 0,
