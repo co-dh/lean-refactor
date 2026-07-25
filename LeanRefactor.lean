@@ -1053,8 +1053,12 @@ private def collapseDeclaration (path declName replacement : String) (apply : Bo
   unless apply do IO.println "preview only; pass --apply to write"; return 0
   let updated := applyEdits source selectedEdits
   IO.FS.writeFile path updated
-  unless ← fileElaboratesCleanly path updated do
+  let check ← IO.Process.output {
+    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+  unless check.exitCode == 0 do
     IO.FS.writeFile path source
+    unless check.stdout.isEmpty do IO.eprintln check.stdout
+    unless check.stderr.isEmpty do IO.eprintln check.stderr
     IO.eprintln s!"{path}: collapsed source does not elaborate; restored"
     return 1
   IO.println "verifying the capped repository build after the collapse..."
