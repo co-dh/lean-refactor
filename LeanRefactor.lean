@@ -308,7 +308,11 @@ private def independentEdits (edits : Array Edit) : Array Edit × Nat := Id.run 
   let mut accepted := #[]
   let mut deferred := 0
   for edit in ordered do
-    if accepted.any fun prior => edit.start < prior.stop && prior.start < edit.stop then
+    if accepted.any fun prior =>
+        edit.start == prior.start && edit.stop == prior.stop &&
+          edit.replacement == prior.replacement then
+      continue
+    else if accepted.any fun prior => edit.start < prior.stop && prior.start < edit.stop then
       deferred := deferred + 1
     else
       accepted := accepted.push edit
