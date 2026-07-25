@@ -420,7 +420,7 @@ private def verifiedEdits (env : Environment) (path source : String) (edits : Ar
   pure kept
 
 private def repositoryBuild : IO IO.Process.Output :=
-  IO.Process.output { cmd := "lake", args := #["build"] }
+  IO.Process.output { cmd := "./scripts/cap", args := #["lake", "build", "Freyd"] }
 
 /-! ## Moving a declaration between files
 
@@ -597,6 +597,79 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
   restore
   IO.eprintln build.stdout
   IO.eprintln s!"whole-repository build failed after moving `{declName}`; both files restored"
+  return 1
+
+/-! ## Collapsing a duplicate declaration
+
+`collapse` replaces every syntax-resolved use of a declaration in its own file, removes the
+declaration (including its docstring), and retains the transaction only when the file and capped
+repository build pass.  Walking identifier syntax in addition to `.ilean` references is essential:
+tactic arguments such as `unfold foo` are resolved by Lean but absent from the reference data. -/
+
+private partial def syntaxContainsIdent (wanted : String) (stx : Syntax) : Bool :=
+  (stx.isIdent && stx.getId.toString == wanted) ||
+    stx.getArgs.any (syntaxContainsIdent wanted)
+
+private partial def identifierEditsNamed (source : String) (fileMap : FileMap)
+    (declName replacement : String) (stx : Syntax) (dropAsDuplicate := false) : Array Edit := Id.run do
+  let mut found := #[]
+  let shortName := (declName.splitOn ".").getLastD declName
+  if stx.isIdent && (stx.getId.toString == declName || stx.getId.toString == shortName) then
+    if let some range := stx.getRange? then
+      let start := if dropAsDuplicate then Id.run do
+        let mut p := range.start
+        while p.byteIdx > 0 do
+          let previous := p.unoffsetBy ⟨1⟩
+          let char := String.Pos.Raw.extract source previous p
+          if char == " " || char == "\t" then p := previous else break
+        return p
+      else range.start
+      found := found.push {
+        start, stop := range.stop
+        line := (fileMap.toPosition range.start).line + 1
+        replacement := if dropAsDuplicate then "" else replacement
+      }
+  let childIsDuplicate := dropAsDuplicate ||
+    (stx.isOfKind ``Lean.Parser.Tactic.unfold && syntaxContainsIdent replacement stx)
+  for child in stx.getArgs do
+    found := found ++ identifierEditsNamed source fileMap declName replacement child childIsDuplicate
+  return found
+
+private def collapseDeclaration (path declName replacement : String) (apply : Bool) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, fileMap, commands, _) ← elaborateFile path
+  let ((declStart, declStop), _) ← match declarationSite source commands declName with
+    | .ok site => pure site
+    | .error message => IO.eprintln s!"{path}: {message}"; return 1
+  let mut candidateEdits := #[{ start := declStart, stop := declStop, line := 0 }]
+  for cmd in commands do
+    for edit in identifierEditsNamed source fileMap declName replacement cmd do
+      -- Exclude the declaration being deleted, including its binding identifier and body.
+      unless declStart ≤ edit.start && edit.stop ≤ declStop do
+        candidateEdits := candidateEdits.push edit
+  let (selectedEdits, deferred) := independentEdits candidateEdits
+  if deferred != 0 then
+    IO.eprintln s!"{path}: refusing {deferred} overlapping collapse edit(s)"
+    return 1
+  IO.println s!"collapse `{declName}` into `{replacement}` in {path}: {selectedEdits.size - 1} use(s)"
+  for edit in selectedEdits do
+    if edit.line != 0 then IO.println s!"  line {edit.line}"
+  unless apply do IO.println "preview only; pass --apply to write"; return 0
+  let updated := applyEdits source selectedEdits
+  IO.FS.writeFile path updated
+  unless ← fileElaboratesCleanly path updated do
+    IO.FS.writeFile path source
+    IO.eprintln s!"{path}: collapsed source does not elaborate; restored"
+    return 1
+  IO.println "verifying the capped repository build after the collapse..."
+  let build ← repositoryBuild
+  if build.exitCode == 0 then
+    IO.println s!"whole-repository build passed; removed `{declName}`"
+    return 0
+  IO.FS.writeFile path source
+  unless build.stdout.isEmpty do IO.eprintln build.stdout
+  unless build.stderr.isEmpty do IO.eprintln build.stderr
+  IO.eprintln s!"whole-repository build failed after collapsing `{declName}`; restored"
   return 1
 
 /-- Does `line` use `name` as a standalone identifier (not as part of a longer one)? -/
@@ -867,7 +940,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -875,6 +948,10 @@ def main (args : List String) : IO UInt32 := do
       return ← moveDeclaration sourcePath declName targetPath false
   | ["move", sourcePath, declName, targetPath, "--apply"] =>
       return ← moveDeclaration sourcePath declName targetPath true
+  | ["collapse", sourcePath, declName, replacement] =>
+      return ← collapseDeclaration sourcePath declName replacement false
+  | ["collapse", sourcePath, declName, replacement, "--apply"] =>
+      return ← collapseDeclaration sourcePath declName replacement true
   | ["rename-file", path, declName, replacement] | ["rename-file", path, declName, replacement, "--apply"] =>
       let moduleName ← match moduleNameOfPath path with
         | .ok n => pure n
