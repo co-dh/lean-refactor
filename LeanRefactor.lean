@@ -337,6 +337,15 @@ private partial def leanFilesUnder (dir : System.FilePath) : IO (Array String) :
       files := files.push entry.path.toString
   pure files
 
+/-- Repository-relative `.lean` paths matching `pattern`.  Reports and returns empty if none match,
+    so every `--glob` subcommand shares one selection rule and one message. -/
+private def globSelectedFiles (pattern : String) : IO (Array String) := do
+  let files ← leanFilesUnder "."
+  let selected := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
+    |>.filter (globMatches pattern)
+  if selected.isEmpty then IO.eprintln s!"glob matched no Lean files: {pattern}"
+  return selected
+
 private def moduleNameOfPath (path : String) : Except String String := do
   unless path.endsWith ".lean" do throw s!"not a Lean source file: {path}"
   let relative := if path.startsWith "./" then path.drop 2 else path
@@ -624,6 +633,75 @@ private def renameReferences (path moduleName declName replacement : String) (ap
     IO.eprintln "  resolve those; check them by hand before deleting the declaration"
   return 0
 
+private def renameGlob (pattern declName replacement : String) (apply : Bool) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let selected ← globSelectedFiles pattern
+  if selected.isEmpty then return 1
+  let mut status : UInt32 := 0
+  for path in selected do
+    let moduleName ← match moduleNameOfPath path with
+      | .ok n => pure n
+      | .error msg => IO.eprintln msg; status := 1; continue
+    let code ← renameReferences path moduleName declName replacement apply
+    if code != 0 then status := code
+  return status
+
+/-! ## Token renaming (syntax-atom-anchored, for notation)
+
+`rename-token` rewrites a notation token (like `⊆c` → `⊆ₛ`) by walking the elaborated command
+syntax tree and replacing every `Syntax.atom` node whose value matches `<old-token>`.  Because it
+operates on the parse tree, it never touches a token inside a docstring, comment or string literal —
+those are not atom nodes.  The file is elaborated first so that the repo's own custom notation
+parses correctly. -/
+
+private partial def renameTokenAtoms (stx : Syntax) (oldToken newToken : String)
+    (fileMap : FileMap) : Array Edit := Id.run do
+  let mut edits := #[]
+  for child in stx.getArgs do
+    edits := edits ++ renameTokenAtoms child oldToken newToken fileMap
+  match stx with
+  | .atom _ val =>
+    if val.trimAscii.toString == oldToken then
+      if let some range := stx.getRange? then
+        let ln := (fileMap.toPosition range.start).line + 1
+        edits := edits.push { start := range.start, stop := range.stop, line := ln, replacement := newToken }
+  | _ => pure ()
+  return edits
+
+private def renameTokenFile (path oldToken newToken : String) (apply : Bool) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, fileMap, commands, _) ← elaborateFile path
+  let mut edits := #[]
+  for cmd in commands do
+    edits := edits ++ renameTokenAtoms cmd oldToken newToken fileMap
+  if edits.isEmpty then
+    IO.println s!"{path}: no atom `{oldToken}` in parse tree"
+    return 0
+  let (selected, deferred) := independentEdits edits
+  if deferred > 0 then
+    IO.println s!"deferred {deferred} overlapping token edit(s)"
+  for edit in selected do
+    let old := String.Pos.Raw.extract source edit.start edit.stop
+    IO.println s!"{path}:{edit.line}: {repr old} -> {repr newToken}"
+  unless apply do IO.println "preview only; pass --apply to write"; return 0
+  let updated := applyEdits source selected
+  IO.FS.writeFile path updated
+  unless ← fileElaboratesCleanly path updated do
+    IO.FS.writeFile path source
+    IO.eprintln s!"{path}: token rename does not elaborate; restored"
+    return 1
+  IO.println s!"applied {selected.size} token rename(s) to {path}"
+  return 0
+
+private def renameTokenGlob (pattern oldToken newToken : String) (apply : Bool) : IO UInt32 := do
+  let selected ← globSelectedFiles pattern
+  if selected.isEmpty then return 1
+  let mut status := 0
+  for path in selected do
+    let code ← renameTokenFile path oldToken newToken apply
+    if code != 0 then status := code
+  return status
+
 private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
     (tryRemoval := false) (includeVariables := true) : IO UInt32 := do
   let moduleName ← match moduleNameOfPath selector.path with
@@ -754,7 +832,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -762,10 +840,22 @@ def main (args : List String) : IO UInt32 := do
       return ← moveDeclaration sourcePath declName targetPath false
   | ["move", sourcePath, declName, targetPath, "--apply"] =>
       return ← moveDeclaration sourcePath declName targetPath true
+  | ["rename", "--glob", pattern, declName, replacement] =>
+      return ← renameGlob pattern declName replacement false
+  | ["rename", "--glob", pattern, declName, replacement, "--apply"] =>
+      return ← renameGlob pattern declName replacement true
   | ["rename", path, moduleName, declName, replacement] =>
       return ← renameReferences path moduleName declName replacement false
   | ["rename", path, moduleName, declName, replacement, "--apply"] =>
       return ← renameReferences path moduleName declName replacement true
+  | ["rename-token", "--glob", pattern, oldToken, newToken] =>
+      return ← renameTokenGlob pattern oldToken newToken false
+  | ["rename-token", "--glob", pattern, oldToken, newToken, "--apply"] =>
+      return ← renameTokenGlob pattern oldToken newToken true
+  | ["rename-token", path, oldToken, newToken] =>
+      return ← renameTokenFile path oldToken newToken false
+  | ["rename-token", path, oldToken, newToken, "--apply"] =>
+      return ← renameTokenFile path oldToken newToken true
   | ["unused", selector] | ["unused", selector, "--apply"] =>
       let parsed ← match parseWarningSelector selector with
         | .ok parsed => pure parsed
@@ -775,10 +865,8 @@ def main (args : List String) : IO UInt32 := do
       return ← refactorSuggestedWarnings parsed false
   | ["unused", "--glob", pattern] | ["unused", "--glob", pattern, "--apply"] =>
       let apply := args.getLast? == some "--apply"
-      let files ← leanFilesUnder "."
-      let selected := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
-        |>.filter (globMatches pattern)
-      if selected.isEmpty then IO.eprintln s!"glob matched no Lean files: {pattern}"; return 1
+      let selected ← globSelectedFiles pattern
+      if selected.isEmpty then return 1
       let mut status := 0
       for path in selected do
         let code ← if apply then refactorSuggestedWarningsUntilStable { path }
@@ -790,10 +878,8 @@ def main (args : List String) : IO UInt32 := do
         (includeVariables := false)
   | ["unused-simp", "--glob", pattern] | ["unused-simp", "--glob", pattern, "--apply"] =>
       let apply := args.getLast? == some "--apply"
-      let files ← leanFilesUnder "."
-      let selected := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
-        |>.filter (globMatches pattern)
-      if selected.isEmpty then IO.eprintln s!"glob matched no Lean files: {pattern}"; return 1
+      let selected ← globSelectedFiles pattern
+      if selected.isEmpty then return 1
       let mut status := 0
       for path in selected do
         let childArgs := #["exe", "lean-refactor", "unused-simp-file", path] ++
