@@ -555,6 +555,10 @@ private def insertionPoint? (commands : Array Syntax) (ns : Name) : Option Strin
       cmd.isOfKind ``Lean.Parser.Command.section || cmd.isOfKind ``Lean.Parser.Command.end
     if state.1 == ns && !isScope then
       if let some tail := cmd.getTailPos? then best := some tail
+    else if state.1 == ns && cmd.isOfKind ``Lean.Parser.Command.end then
+      -- An otherwise empty namespace still has a legal insertion point: immediately before its
+      -- matching `end`.  Using the start (not tail) keeps the declaration inside the namespace.
+      if let some start := cmd.getPos? then best := some start
     state := scopeStep state cmd
   return best
 
@@ -571,7 +575,7 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
       return 1
   let newSource := applyEdits source #[{ start, stop, line := 0 }]
   let newTarget := applyEdits target #[{ start := anchor, stop := anchor, line := 0,
-                                         replacement := "\n\n" ++ text }]
+                                         replacement := "\n\n" ++ text ++ "\n" }]
   IO.println s!"move `{declName}` ({text.length} bytes, namespace `{ns}`)"
   IO.println s!"  from {sourcePath}  to {targetPath}"
   unless apply do IO.println "preview only; pass --apply to write"; return 0
@@ -581,8 +585,12 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
     IO.FS.writeFile targetPath target; IO.FS.writeFile sourcePath source
   -- The declaration may have leaned on `variable`s of the section it is leaving, or on dependencies
   -- the target cannot reach; both surface here, in one cheap elaboration, before any build.
-  unless ← fileElaboratesCleanly targetPath newTarget do
+  let targetCheck ← IO.Process.output {
+    cmd := "./scripts/cap", args := #["lake", "env", "lean", targetPath] }
+  unless targetCheck.exitCode == 0 do
     restore
+    unless targetCheck.stdout.isEmpty do IO.eprintln targetCheck.stdout
+    unless targetCheck.stderr.isEmpty do IO.eprintln targetCheck.stderr
     IO.eprintln (s!"{targetPath} does not elaborate with `{declName}` added (it needs `variable`s " ++
       "or dependencies not available there); both files restored")
     return 1
