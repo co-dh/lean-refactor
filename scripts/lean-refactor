@@ -1,22 +1,9 @@
 #!/bin/sh
-# lean-refactor — run the refactoring tool under a per-process address-space cap.
+# lean-refactor — the refactoring tool, run under `cap`'s address-space limit.
 #
 # Belt to `claimElaboration`'s braces (Freyd/tool/LeanRefactor.lean): that guard catches the KNOWN
-# way to accumulate Lean `Environment`s — looping over files in one process — but it cannot catch a
-# runaway that is not a file loop. This cap turns any such runaway into a bounded, immediate failure
-# instead of an OOM kill that takes the whole machine (and any agent running beside it) down, as
-# happened 2026-07-25: `rename --glob` reached total-vm 56 GB / anon-rss 18.3 GB of 30 GB.
-#
-# Why 8 GB, and why address space: `ulimit -m` (resident) is not enforced on Linux and cgroup
-# `MemoryMax` needs a systemd user bus that is unavailable under the agent sandbox, so `-v` is what
-# is left. MEASURED headroom: a legitimate single-file run on `Freyd/S1_62.lean`, one of the largest
-# modules, peaks at VmPeak 1906 MB / VmHWM 803 MB. 8 GB is ~4x that and still an order of magnitude
-# under the runaway. Raise it for a genuinely large job with LEAN_REFACTOR_MEM_MB.
-#
-# `forkPerFile` spawns its per-file children as plain `lake exe lean-refactor`; rlimits are
-# inherited, so setting the cap once here covers the whole process tree.
+# way to accumulate Lean `Environment`s — looping over files in one process — but not a runaway that
+# is not a file loop. The cap lives in `scripts/cap` because the same hazard applies to every
+# long-running Lean process, not just this tool; see the reasoning and the measurements there.
 cd "$(dirname "$0")/.." || exit 1
-mb=${LEAN_REFACTOR_MEM_MB:-8192}
-ulimit -v $((mb * 1024)) 2>/dev/null ||
-  echo "lean-refactor: could not set a ${mb} MB address-space limit (hard limit lower?); continuing" >&2
-exec lake exe lean-refactor "$@"
+exec ./scripts/cap lake exe lean-refactor "$@"

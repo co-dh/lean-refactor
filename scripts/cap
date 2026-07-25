@@ -1,0 +1,31 @@
+#!/bin/sh
+# cap — run any command under a per-process address-space limit.
+#
+#   scripts/cap lake build Freyd
+#   CAP_MEM_MB=24576 scripts/cap lake env lean --run scripts/SpecScan.lean
+#
+# WHY: an unbounded Lean process does not fail politely, it gets OOM-killed by the kernel, and it
+# takes down whatever else is running — on 2026-07-25 a `lean-refactor rename --glob` reached
+# total-vm 56 GB / anon-rss 18.3 GB of this machine's 30 GB and killed a DeepSeek agent with it. A
+# per-process rlimit converts that into an immediate, attributable failure with a non-zero exit.
+# Wrap anything long-running and Lean-shaped: builds, scans, the refactoring tool, delegated agents.
+#
+# WHY ADDRESS SPACE: `ulimit -m` (resident) is a no-op on Linux, and cgroup `MemoryMax` needs a
+# systemd user bus that the agent sandbox denies (`systemd-run --user --scope` fails with "Failed to
+# connect to user scope bus via local transport: Operation not permitted"). `-v` is what is left.
+#
+# WHY 12 GB: MEASURED. The heaviest legitimate single processes in this repo are `lean` elaborating
+# Freyd/S1_62.lean at VmPeak 2545 MB, and `lean-refactor` on one file at VmPeak 1906 MB. 12 GB is
+# ~4.7x the worst of those and still less than half of RAM, so one runaway dies alone.
+#
+# LIMITATION, read this before trusting it: an rlimit is PER PROCESS, so it does not bound the
+# AGGREGATE of a parallel build — 8 workers x 2.5 GB is 20 GB and every worker is individually
+# legal. The control for that is bounded parallelism (`lake build -j N`) and not running two
+# full-repo builds at once; this cap only stops a SINGLE process from running away.
+#
+# rlimits are inherited, so wrapping the outermost command covers its whole process tree.
+[ $# -gt 0 ] || { echo "usage: cap <command> [args...]   (CAP_MEM_MB, default 12288)" >&2; exit 2; }
+mb=${CAP_MEM_MB:-12288}
+ulimit -v $((mb * 1024)) 2>/dev/null ||
+  echo "cap: could not set a ${mb} MB address-space limit (hard limit lower?); running uncapped" >&2
+exec "$@"
