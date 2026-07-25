@@ -575,7 +575,8 @@ The dedup report (`scripts/dep_dup.py`) flags duplicate groups where no member i
 the others: collapsing those needs the survivor RELOCATED to a module every caller already imports.
 That is the one edit the subcommands above cannot express, and the one the skill calls the riskiest
 to do by hand, so it is mechanised here: cut the declaration with its docstring, splice it into the
-target inside the same namespace, and refuse the edit unless BOTH files still elaborate. -/
+target namespace selected by `move` or explicit `move-into`, and refuse the edit unless BOTH files
+still elaborate. -/
 
 /-- Distinct files whose `Environment` this process has built.  Re-elaborating the SAME file is
     routine — `verifiedEdits` does it once per candidate edit — so only distinct paths are counted. -/
@@ -924,7 +925,7 @@ private def insertionPoint? (commands : Array Syntax) (ns : Name) : Option Strin
   return best
 
 private def moveDeclaration (sourcePath declName targetPath : String) (apply : Bool)
-    (omitBinders? : Option String := none) : IO UInt32 := do
+    (omitBinders? : Option String := none) (targetNamespace? : Option String := none) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let (source, _, sourceCommands, _) ← elaborateFile sourcePath
   let ((start, stop), ns) ← match declarationSite source sourceCommands declName with
@@ -934,17 +935,15 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
   let text := match omitBinders? with
     | some binders => "omit " ++ binders ++ " in\n" ++ declarationText
     | none => declarationText
+  let targetNs := targetNamespace?.map parseName |>.getD ns
   let (target, _, targetCommands, _) ← elaborateFile targetPath
-  let some anchor := insertionPoint? targetCommands ns
-    | IO.eprintln s!"{targetPath}: never opens namespace `{ns}`, so `{declName}` has nowhere to land"
-      IO.eprintln "parsed top-level command syntax:"
-      for cmd in targetCommands do
-        IO.eprintln s!"  {cmd.getKind}: {repr cmd}"
+  let some anchor := insertionPoint? targetCommands targetNs
+    | IO.eprintln s!"{targetPath}: never opens namespace `{targetNs}`, so `{declName}` has nowhere to land"
       return 1
   let newSource := applyEdits source #[{ start, stop, line := 0 }]
   let newTarget := applyEdits target #[{ start := anchor, stop := anchor, line := 0,
                                          replacement := "\n\n" ++ text ++ "\n" }]
-  IO.println s!"move `{declName}` ({text.length} bytes, namespace `{ns}`)"
+  IO.println s!"move `{declName}` ({text.length} bytes, namespace `{ns}` → `{targetNs}`)"
   IO.println s!"  from {sourcePath}  to {targetPath}"
   unless apply do IO.println "preview only; pass --apply to write"; return 0
   IO.FS.writeFile targetPath newTarget
@@ -1337,7 +1336,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1353,6 +1352,10 @@ def main (args : List String) : IO UInt32 := do
       return ← moveDeclaration sourcePath declName targetPath false
   | ["move", sourcePath, declName, targetPath, "--apply"] =>
       return ← moveDeclaration sourcePath declName targetPath true
+  | ["move-into", sourcePath, declName, targetPath, targetNamespace] =>
+      return ← moveDeclaration sourcePath declName targetPath false none (some targetNamespace)
+  | ["move-into", sourcePath, declName, targetPath, targetNamespace, "--apply"] =>
+      return ← moveDeclaration sourcePath declName targetPath true none (some targetNamespace)
   | ["move-omit", sourcePath, declName, targetPath, binders] =>
       return ← moveDeclaration sourcePath declName targetPath false (some binders)
   | ["move-omit", sourcePath, declName, targetPath, binders, "--apply"] =>
