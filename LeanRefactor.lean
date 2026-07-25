@@ -633,18 +633,26 @@ private def renameReferences (path moduleName declName replacement : String) (ap
     IO.eprintln "  resolve those; check them by hand before deleting the declaration"
   return 0
 
-private def renameGlob (pattern declName replacement : String) (apply : Bool) : IO UInt32 := do
-  initSearchPath (← findSysroot)
+/-- Run one `lean-refactor` subcommand per matching file, each in a CHILD process.
+
+    Elaborating a file retains its whole `Environment`, so looping over a glob IN-PROCESS
+    accumulates one environment per file.  Measured: a `rename --glob 'Freyd/*.lean'` over 200+
+    modules reached 18.3 GB resident and was OOM-killed.  A child per file hands the memory back at
+    every step, and one file's failure no longer takes the run down. -/
+private def forkPerFile (pattern : String) (childArgs : String → Array String) : IO UInt32 := do
   let selected ← globSelectedFiles pattern
   if selected.isEmpty then return 1
   let mut status : UInt32 := 0
   for path in selected do
-    let moduleName ← match moduleNameOfPath path with
-      | .ok n => pure n
-      | .error msg => IO.eprintln msg; status := 1; continue
-    let code ← renameReferences path moduleName declName replacement apply
-    if code != 0 then status := code
+    let output ← IO.Process.output { cmd := "lake", args := #["exe", "lean-refactor"] ++ childArgs path }
+    unless output.stdout.isEmpty do IO.print output.stdout
+    unless output.stderr.isEmpty do IO.eprint output.stderr
+    if output.exitCode != 0 then status := output.exitCode
   return status
+
+private def renameGlob (pattern declName replacement : String) (apply : Bool) : IO UInt32 :=
+  forkPerFile pattern fun path =>
+    #["rename-file", path, declName, replacement] ++ (if apply then #["--apply"] else #[])
 
 /-! ## Token renaming (syntax-atom-anchored, for notation)
 
@@ -693,14 +701,9 @@ private def renameTokenFile (path oldToken newToken : String) (apply : Bool) : I
   IO.println s!"applied {selected.size} token rename(s) to {path}"
   return 0
 
-private def renameTokenGlob (pattern oldToken newToken : String) (apply : Bool) : IO UInt32 := do
-  let selected ← globSelectedFiles pattern
-  if selected.isEmpty then return 1
-  let mut status := 0
-  for path in selected do
-    let code ← renameTokenFile path oldToken newToken apply
-    if code != 0 then status := code
-  return status
+private def renameTokenGlob (pattern oldToken newToken : String) (apply : Bool) : IO UInt32 :=
+  forkPerFile pattern fun path =>
+    #["rename-token", path, oldToken, newToken] ++ (if apply then #["--apply"] else #[])
 
 private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
     (tryRemoval := false) (includeVariables := true) : IO UInt32 := do
@@ -832,7 +835,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -840,6 +843,12 @@ def main (args : List String) : IO UInt32 := do
       return ← moveDeclaration sourcePath declName targetPath false
   | ["move", sourcePath, declName, targetPath, "--apply"] =>
       return ← moveDeclaration sourcePath declName targetPath true
+  | ["rename-file", path, declName, replacement] | ["rename-file", path, declName, replacement, "--apply"] =>
+      let moduleName ← match moduleNameOfPath path with
+        | .ok n => pure n
+        | .error message => IO.eprintln message; return 2
+      return ← renameReferences path moduleName declName replacement
+        (args.getLast? == some "--apply")
   | ["rename", "--glob", pattern, declName, replacement] =>
       return ← renameGlob pattern declName replacement false
   | ["rename", "--glob", pattern, declName, replacement, "--apply"] =>
@@ -878,17 +887,8 @@ def main (args : List String) : IO UInt32 := do
         (includeVariables := false)
   | ["unused-simp", "--glob", pattern] | ["unused-simp", "--glob", pattern, "--apply"] =>
       let apply := args.getLast? == some "--apply"
-      let selected ← globSelectedFiles pattern
-      if selected.isEmpty then return 1
-      let mut status := 0
-      for path in selected do
-        let childArgs := #["exe", "lean-refactor", "unused-simp-file", path] ++
-          (if apply then #["--apply"] else #[])
-        let output ← IO.Process.output { cmd := "lake", args := childArgs }
-        unless output.stdout.isEmpty do IO.print output.stdout
-        unless output.stderr.isEmpty do IO.eprint output.stderr
-        if output.exitCode != 0 then status := output.exitCode
-      return status
+      return ← forkPerFile pattern fun path =>
+        #["unused-simp-file", path] ++ (if apply then #["--apply"] else #[])
   | _ => pure ()
   let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, insertText?, apply) ← match args with
     | ["inspect", sourcePath, moduleName, declModule, declName] =>
