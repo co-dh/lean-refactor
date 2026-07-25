@@ -985,7 +985,13 @@ private partial def identifierEditsNamed (source : String) (fileMap : FileMap)
     (declName replacement : String) (stx : Syntax) (dropAsDuplicate := false) : Array Edit := Id.run do
   let mut found := #[]
   let shortName := (declName.splitOn ".").getLastD declName
-  if stx.isIdent && (stx.getId.toString == declName || stx.getId.toString == shortName) then
+  let identText := if stx.isIdent then stx.getId.toString else ""
+  let suffix? :=
+    if identText == declName || identText == shortName then some ""
+    else if identText.startsWith (declName ++ ".") then some (identText.drop declName.length).toString
+    else if identText.startsWith (shortName ++ ".") then some (identText.drop shortName.length).toString
+    else none
+  if stx.isIdent && suffix?.isSome then
     if let some range := stx.getRange? then
       let start := if dropAsDuplicate then Id.run do
         let mut p := range.start
@@ -998,7 +1004,7 @@ private partial def identifierEditsNamed (source : String) (fileMap : FileMap)
       found := found.push {
         start, stop := range.stop
         line := (fileMap.toPosition range.start).line + 1
-        replacement := if dropAsDuplicate then "" else replacement
+        replacement := if dropAsDuplicate then "" else replacement ++ suffix?.getD ""
       }
   let childIsDuplicate := dropAsDuplicate ||
     (stx.isOfKind ``Lean.Parser.Tactic.unfold && syntaxContainsIdent replacement stx)
