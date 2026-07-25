@@ -1017,7 +1017,8 @@ private partial def identifierEditsNamed (source : String) (fileMap : FileMap)
     found := found ++ identifierEditsNamed source fileMap declName replacement child childIsDuplicate
   return found
 
-private def collapseDeclaration (path declName replacement : String) (apply : Bool) : IO UInt32 := do
+private def collapseDeclaration (path declName replacement : String) (apply : Bool)
+    (dropCallArg? : Option Nat := none) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let (source, fileMap, commands, _) ← elaborateFile path
   let ((declStart, declStop), _) ← match declarationSite source commands declName with
@@ -1028,6 +1029,20 @@ private def collapseDeclaration (path declName replacement : String) (apply : Bo
     for edit in identifierEditsNamed source fileMap declName replacement cmd do
       -- Exclude the declaration being deleted, including its binding identifier and body.
       unless declStart ≤ edit.start && edit.stop ≤ declStop do
+        candidateEdits := candidateEdits.push edit
+  if let some argIndex := dropCallArg? then
+    if argIndex == 0 then
+      IO.eprintln "collapse-drop-call-arg uses a 1-based argument index"
+      return 1
+    let mut sites := #[]
+    for cmd in commands do
+      sites := sites ++ syntaxSitesNamed fileMap declName cmd
+    for site in sites do
+      let pos := fileMap.lspPosToUtf8Pos site.range.start
+      unless declStart ≤ pos && pos < declStop do
+        let edit ← match editForSite fileMap site commands (argIndex - 1) with
+          | .ok edit => pure edit
+          | .error message => IO.eprintln s!"{path}: {message}"; return 1
         candidateEdits := candidateEdits.push edit
   let (selectedEdits, deferred) := independentEdits candidateEdits
   if deferred != 0 then
@@ -1322,7 +1337,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1354,6 +1369,14 @@ def main (args : List String) : IO UInt32 := do
       return ← collapseDeclaration sourcePath declName replacement false
   | ["collapse", sourcePath, declName, replacement, "--apply"] =>
       return ← collapseDeclaration sourcePath declName replacement true
+  | ["collapse-drop-call-arg", sourcePath, declName, replacement, index] =>
+      let some argIndex := index.toNat?
+        | IO.eprintln s!"invalid argument index `{index}`"; return 2
+      return ← collapseDeclaration sourcePath declName replacement false (some argIndex)
+  | ["collapse-drop-call-arg", sourcePath, declName, replacement, index, "--apply"] =>
+      let some argIndex := index.toNat?
+        | IO.eprintln s!"invalid argument index `{index}`"; return 2
+      return ← collapseDeclaration sourcePath declName replacement true (some argIndex)
   | ["replace-body", sourcePath, declName, replacement] =>
       return ← replaceDeclarationBody sourcePath declName replacement false
   | ["replace-body", sourcePath, declName, replacement, "--apply"] =>
