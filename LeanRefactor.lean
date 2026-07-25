@@ -422,94 +422,59 @@ private def verifiedEdits (env : Environment) (path source : String) (edits : Ar
 private def repositoryBuild : IO IO.Process.Output :=
   IO.Process.output { cmd := "./scripts/cap", args := #["lake", "build", "Freyd"] }
 
-/-! ## Renaming a module
+/-! ## Book-aware declaration lints
 
-`rename-module` changes both a module's repository-relative filename and every Lean `import` that
-names it.  Import edits are deliberately line-oriented and exact: after the old module name only
-whitespace or a `--` comment is accepted, so docstrings, declaration names, and longer module names
-are left alone.
+These checks deliberately live beside the refactors rather than consuming `graph/decls.tsv`.
+They inspect the environment produced by elaborating the source file: declaration ownership,
+docstrings and result types are therefore Lean's semantic data, not guesses made from rendered TSV
+columns.  The glob driver still forks once per file, respecting the environment-retention bound.
+-/
 
-Applying the operation is transactional at repository scale.  The old file and all edited importers
-are restored when the capped repository build fails. -/
+private partial def terminalResult (type : Expr) : Expr :=
+  match type.consumeMData with
+  | .forallE _ _ body _ => terminalResult body
+  | .letE _ _ value body _ => terminalResult (body.instantiate1 value)
+  | result => result
 
-private def modulePath (moduleName : String) : Except String String := do
-  if moduleName.isEmpty then throw "module name must not be empty"
-  let parts := moduleName.splitOn "."
-  unless parts.all fun part => !part.isEmpty do
-    throw s!"invalid module name: {moduleName}"
-  pure <| moduleName.replace "." "/" ++ ".lean"
+private def isFunctorResult (type : Expr) : Bool :=
+  match (terminalResult type).getAppFn with
+  | .const name _ => name.toString == "Freyd.Functor"
+  | _ => false
 
-private def renameImportLine (line oldModule newModule : String) : String × Bool :=
-  let trimmed := line.trimAscii.toString
-  let oldImport := "import " ++ oldModule
-  let suffix := (trimmed.drop oldImport.length).trimAscii.toString
-  if trimmed.startsWith oldImport && (suffix.isEmpty || suffix.startsWith "--") then
-    (line.replace ("import " ++ oldModule) ("import " ++ newModule), true)
-  else
-    (line, false)
+private def hasFunctorRoleSuffix (name : Name) : Bool :=
+  let short := name.getString!
+  short.endsWith "Functor" || short.endsWith "Embedding" ||
+    short.endsWith "Representation"
 
-private def renameImports (source oldModule newModule : String) : String × Nat := Id.run do
-  let mut changed := 0
-  let mut lines := []
-  for line in source.splitOn "\n" do
-    let (line, didChange) := renameImportLine line oldModule newModule
-    if didChange then changed := changed + 1
-    lines := line :: lines
-  return (String.intercalate "\n" lines.reverse, changed)
+private def dropSpace : List Char → List Char
+  | c :: rest => if c.isWhitespace then dropSpace rest else c :: rest
+  | [] => []
 
-private def restoreModuleRename (oldPath newPath : String)
-    (backups : Array (String × String)) : IO Unit := do
-  if ← System.FilePath.pathExists newPath then
-    IO.FS.rename newPath oldPath
-  for (path, source) in backups do
-    IO.FS.writeFile path source
+private def decimalPrefix (chars : List Char) : Option (Nat × List Char) :=
+  let rec go (chars : List Char) (value count : Nat) :=
+    match chars with
+    | c :: rest =>
+        if c.isDigit then go rest (10 * value + (c.toNat - '0'.toNat)) (count + 1)
+        else if count == 0 then none else some (value, chars)
+    | [] => if count == 0 then none else some (value, [])
+  go chars 0 0
 
-private def renameModule (oldModule newModule : String) (apply : Bool) : IO UInt32 := do
-  let oldPath ← match modulePath oldModule with
-    | .ok path => pure path
-    | .error message => IO.eprintln message; return 2
-  let newPath ← match modulePath newModule with
-    | .ok path => pure path
-    | .error message => IO.eprintln message; return 2
-  if oldPath == newPath then
-    IO.eprintln "old and new module names resolve to the same path"
-    return 2
-  unless ← System.FilePath.pathExists oldPath do
-    IO.eprintln s!"module source does not exist: {oldPath}"
-    return 1
-  if ← System.FilePath.pathExists newPath then
-    IO.eprintln s!"refusing to overwrite existing module source: {newPath}"
-    return 1
-  let files ← leanFilesUnder "."
-  let mut changes : Array (String × String × String × Nat) := #[]
-  for rawPath in files do
-    let path := if rawPath.startsWith "./" then (rawPath.drop 2).toString else rawPath
-    let source ← IO.FS.readFile path
-    let (updated, count) := renameImports source oldModule newModule
-    if count > 0 then changes := changes.push (path, source, updated, count)
-  IO.println s!"rename {oldPath} -> {newPath}"
-  for (path, _, _, count) in changes do
-    IO.println s!"{path}: rewrite {count} import(s): {oldModule} -> {newModule}"
-  unless apply do
-    IO.println "preview only; pass --apply to write"
-    return 0
-  let backups := changes.map fun (path, source, _, _) => (path, source)
-  try
-    for (path, _, updated, _) in changes do IO.FS.writeFile path updated
-    IO.FS.rename oldPath newPath
-    let build ← repositoryBuild
-    unless build.stdout.isEmpty do IO.eprint build.stdout
-    unless build.stderr.isEmpty do IO.eprint build.stderr
-    if build.exitCode != 0 then
-      restoreModuleRename oldPath newPath backups
-      IO.eprintln s!"whole-repository build failed after renaming `{oldModule}`; restored"
-      return build.exitCode
-    IO.println s!"renamed module `{oldModule}` to `{newModule}`; whole-repository build passed"
-    return 0
-  catch error =>
-    restoreModuleRename oldPath newPath backups
-    IO.eprintln s!"module rename failed and was restored: {error}"
-    return 1
+private def sectionCitations (text : String) : Array (Nat × Nat) :=
+  ((text.splitOn "§").drop 1 |>.filterMap fun tail => do
+    let (chapter, rest) ← decimalPrefix (dropSpace tail.toList)
+    let '.' :: rest := rest | none
+    let (sectionDigits, _) ← decimalPrefix rest
+    some (chapter, sectionDigits)).toArray
+
+private def openingBanner (source : String) : String :=
+  String.intercalate "\n" <| (source.splitOn "\n").takeWhile fun line =>
+    !(line.trimAsciiStart.toString.startsWith "import ")
+
+private def bannerRange (source : String) (chapter : Nat) : Option (Nat × Nat) := do
+  let sections := (sectionCitations (openingBanner source)).filter (·.1 == chapter) |>.map (·.2)
+  let first ← sections[0]?
+  some <| sections.foldl (init := (first, first)) fun (lo, hi) sectionDigits =>
+    (min lo sectionDigits, max hi sectionDigits)
 
 /-! ## Moving a declaration between files
 
@@ -561,7 +526,7 @@ private def elaborateFile (path : String) : IO (String × FileMap × Array Synta
     for msg in messages.toList do IO.eprintln (← msg.toString)
     throw <| IO.userError s!"{path}: imports failed to elaborate"
   let frontend ← Elab.IO.processCommands ctx parserState (Elab.Command.mkState env {} {})
-  pure (source, ctx.fileMap, frontend.commands, env)
+  pure (source, ctx.fileMap, frontend.commands, frontend.commandState.env)
 
 /-- Re-elaborate a whole file (imports included) from candidate `source` text. -/
 private def fileElaboratesCleanly (path source : String) : IO Bool := do
@@ -628,6 +593,46 @@ private def declarationSite (source : String) (commands : Array Syntax) (declNam
           return .ok (wholeLines source range, state.1)
     state := scopeStep state cmd
   return .error s!"no declaration named `{declName}` in this file"
+
+private def sourceDeclarations (fileMap : FileMap) (env : Environment) (commands : Array Syntax) :
+    Array (Name × ConstantInfo × Nat) := Id.run do
+  let mut declarations := #[]
+  let mut state := (Name.anonymous, ([] : List Name))
+  for command in commands do
+    if command.isOfKind ``Lean.Parser.Command.declaration then
+      if let some short := declIdName? command then
+        let name := state.1 ++ short
+        if let some info := env.find? name then
+          if let some range := command.getRange? then
+            declarations := declarations.push (name, info, (fileMap.toPosition range.start).line)
+    state := scopeStep state command
+  return declarations
+
+private def lintBookFile (path : String) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, fileMap, commands, env) ← elaborateFile path
+  let mut hits := 0
+  for (name, info, line) in sourceDeclarations fileMap env commands do
+    let ctx : Core.Context := { fileName := path, fileMap }
+    let doc ←
+      try
+        let action : CoreM (Option String) := findDocString? env name
+        Prod.fst <$> action.toIO ctx { env }
+      catch _ => pure none
+    for (chapter, sectionDigits) in (sectionCitations (doc.getD "")).toList.eraseDups do
+      if let some (lo, hi) := bannerRange source chapter then
+        if sectionDigits < lo || hi < sectionDigits then
+          hits := hits + 1
+          IO.println s!"{path}:{line}: [section-home] {name}: doc cites §{chapter}.{sectionDigits} outside banner §{chapter}.{lo}–§{chapter}.{hi}"
+    if hasFunctorRoleSuffix name && !isFunctorResult info.type then
+      hits := hits + 1
+      let rendered ←
+        try
+          let (formatted, _) ← (Meta.MetaM.run' (Meta.ppExpr info.type)).toIO ctx { env }
+          pure ((toString formatted).replace "\n" " ")
+        catch _ => pure "<type unavailable>"
+      IO.println s!"{path}:{line}: [name-vs-type] {name}: role-name suffix but result is not `Functor`: {rendered}"
+  return if hits == 0 then 0 else 1
 
 /-- Where to splice a declaration whose namespace is `ns`: after the LAST command of the target that
     sits in exactly that namespace, so the surrounding `namespace`/`end` already match and the
@@ -1041,14 +1046,14 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
-  | ["rename-module", oldModule, newModule] =>
-      return ← renameModule oldModule newModule false
-  | ["rename-module", oldModule, newModule, "--apply"] =>
-      return ← renameModule oldModule newModule true
+  | ["lint-book-file", path] =>
+      return ← lintBookFile path
+  | ["lint-book", "--glob", pattern] =>
+      return ← forkPerFile pattern fun path => #["lint-book-file", path]
   | ["move", sourcePath, declName, targetPath] =>
       return ← moveDeclaration sourcePath declName targetPath false
   | ["move", sourcePath, declName, targetPath, "--apply"] =>
