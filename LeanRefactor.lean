@@ -679,11 +679,13 @@ private def declarationSite (source : String) (commands : Array Syntax) (declNam
   let wanted := parseName declName
   let mut state := (Name.anonymous, ([] : List Name))
   for cmd in commands do
-    if cmd.isOfKind ``Lean.Parser.Command.declaration then
-      if let some short := declIdName? cmd then
-        if state.1 ++ short == wanted then
-          let some range := cmd.getRange? | return .error s!"`{declName}` has no source range"
-          return .ok (wholeLines source range, state.1)
+    -- Command wrappers such as `omit [...] in` contain the declaration syntax rather than being
+    -- `Command.declaration` themselves.  Search recursively and retain the wrapper's range so
+    -- structural operations move the binder-control command together with its declaration.
+    if let some short := declIdName? cmd then
+      if state.1 ++ short == wanted then
+        let some range := cmd.getRange? | return .error s!"`{declName}` has no source range"
+        return .ok (wholeLines source range, state.1)
     state := scopeStep state cmd
   return .error s!"no declaration named `{declName}` in this file"
 
@@ -693,9 +695,8 @@ private def declarationSyntax (commands : Array Syntax) (declName : String) :
   let wanted := parseName declName
   let mut state := (Name.anonymous, ([] : List Name))
   for cmd in commands do
-    if cmd.isOfKind ``Lean.Parser.Command.declaration then
-      if let some short := declIdName? cmd then
-        if state.1 ++ short == wanted then return .ok cmd
+    if let some short := declIdName? cmd then
+      if state.1 ++ short == wanted then return .ok cmd
     state := scopeStep state cmd
   return .error s!"no declaration named `{declName}` in this file"
 
@@ -922,13 +923,17 @@ private def insertionPoint? (commands : Array Syntax) (ns : Name) : Option Strin
     state := scopeStep state cmd
   return best
 
-private def moveDeclaration (sourcePath declName targetPath : String) (apply : Bool) : IO UInt32 := do
+private def moveDeclaration (sourcePath declName targetPath : String) (apply : Bool)
+    (omitBinders? : Option String := none) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let (source, _, sourceCommands, _) ← elaborateFile sourcePath
   let ((start, stop), ns) ← match declarationSite source sourceCommands declName with
     | .ok site => pure site
     | .error message => IO.eprintln s!"{sourcePath}: {message}"; return 1
-  let text := (String.Pos.Raw.extract source start stop).trimAscii.toString
+  let declarationText := (String.Pos.Raw.extract source start stop).trimAscii.toString
+  let text := match omitBinders? with
+    | some binders => "omit " ++ binders ++ " in\n" ++ declarationText
+    | none => declarationText
   let (target, _, targetCommands, _) ← elaborateFile targetPath
   let some anchor := insertionPoint? targetCommands ns
     | IO.eprintln s!"{targetPath}: never opens namespace `{ns}`, so `{declName}` has nowhere to land"
@@ -1317,7 +1322,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1333,6 +1338,10 @@ def main (args : List String) : IO UInt32 := do
       return ← moveDeclaration sourcePath declName targetPath false
   | ["move", sourcePath, declName, targetPath, "--apply"] =>
       return ← moveDeclaration sourcePath declName targetPath true
+  | ["move-omit", sourcePath, declName, targetPath, binders] =>
+      return ← moveDeclaration sourcePath declName targetPath false (some binders)
+  | ["move-omit", sourcePath, declName, targetPath, binders, "--apply"] =>
+      return ← moveDeclaration sourcePath declName targetPath true (some binders)
   | ["relocate-before", sourcePath, declName, anchorName] =>
       return ← relocateDeclarationBefore sourcePath declName anchorName false
   | ["relocate-before", sourcePath, declName, anchorName, "--apply"] =>
