@@ -793,6 +793,40 @@ private def replaceDeclaration (path declName replacement : String) (apply : Boo
   IO.eprintln s!"whole-repository build failed after replacing `{declName}`; restored"
   return 1
 
+/-- Remove one complete parsed declaration command. Preview by default; on application, restore the
+    source if either the edited file or the capped repository build fails. -/
+private def removeDeclaration (path declName : String) (apply : Bool) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, _, commands, _) ← elaborateFile path
+  let ((start, stop), _) ← match declarationSite source commands declName with
+    | .ok site => pure site
+    | .error message => IO.eprintln s!"{path}: {message}"; return 1
+  let edit : Edit := { start, stop, line := 0, replacement := "" }
+  let updated := applyEdits source #[edit]
+  IO.println s!"remove declaration `{declName}` from {path}"
+  unless apply do
+    IO.println "preview only; pass --apply to write"
+    return 0
+  IO.FS.writeFile path updated
+  let check ← IO.Process.output {
+    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+  unless check.exitCode == 0 do
+    IO.FS.writeFile path source
+    unless check.stdout.isEmpty do IO.eprintln check.stdout
+    unless check.stderr.isEmpty do IO.eprintln check.stderr
+    IO.eprintln s!"{path}: declaration removal does not elaborate; restored"
+    return 1
+  IO.println "verifying the capped repository build after removing the declaration..."
+  let build ← repositoryBuild
+  if build.exitCode == 0 then
+    IO.println s!"whole-repository build passed; removed declaration `{declName}`"
+    return 0
+  IO.FS.writeFile path source
+  unless build.stdout.isEmpty do IO.eprintln build.stdout
+  unless build.stderr.isEmpty do IO.eprintln build.stderr
+  IO.eprintln s!"whole-repository build failed after removing `{declName}`; restored"
+  return 1
+
 /-- Move a declaration within its file to immediately before another declaration in the same
     namespace.  Both boundaries come from parsed command syntax; preview and rollback follow the
     same transaction contract as the other structural operations. -/
@@ -1375,7 +1409,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1427,6 +1461,10 @@ def main (args : List String) : IO UInt32 := do
       return ← replaceDeclaration sourcePath declName replacement false
   | ["replace-declaration", sourcePath, declName, replacement, "--apply"] =>
       return ← replaceDeclaration sourcePath declName replacement true
+  | ["remove-declaration", sourcePath, declName] =>
+      return ← removeDeclaration sourcePath declName false
+  | ["remove-declaration", sourcePath, declName, "--apply"] =>
+      return ← removeDeclaration sourcePath declName true
   | ["rename-file", path, declName, replacement] | ["rename-file", path, declName, replacement, "--apply"] =>
       let moduleName ← match moduleNameOfPath path with
         | .ok n => pure n
