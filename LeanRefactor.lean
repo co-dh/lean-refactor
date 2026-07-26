@@ -1331,14 +1331,19 @@ private def renameDeclStage (path declName replacement stagePath : String) : IO 
     warnLeftovers path updated declName
     return 0
 
-private def renameDeclGlob (pattern declName replacement : String) (apply : Bool) : IO UInt32 := do
+/-- Fork a staging child per file, swap every staged file in at once, and check with ONE capped
+    repository build; any failure restores every file.  This is the shape a cross-file edit needs —
+    no per-file check can pass while the change is half applied.  A child exits 3 to say its file is
+    not affected, which is not a failure. -/
+private def stagedGlob (pattern description : String) (childArgs : String → String → Array String)
+    (apply : Bool) : IO UInt32 := do
   let selected ← globSelectedFiles pattern
   if selected.isEmpty then return 1
   let mut staged : Array String := #[]
   let mut failed := false
   for path in selected do
-    let output ← IO.Process.output { cmd := "lake", args := #["exe", "lean-refactor",
-      "rename-decl-stage", path, declName, replacement, stagePathFor path] }
+    let args := #["exe", "lean-refactor"] ++ childArgs path (stagePathFor path)
+    let output ← IO.Process.output { cmd := "lake", args }
     unless output.stdout.isEmpty do IO.print output.stdout
     unless output.stderr.isEmpty do IO.eprint output.stderr
     if output.exitCode == 0 then staged := staged.push path
@@ -1346,10 +1351,10 @@ private def renameDeclGlob (pattern declName replacement : String) (apply : Bool
   let stagedFiles := staged
   if failed then
     dropStagedFiles stagedFiles
-    IO.eprintln s!"staging `{declName}` failed; nothing was written"
+    IO.eprintln s!"staging failed ({description}); nothing was written"
     return 1
   if stagedFiles.isEmpty then
-    IO.eprintln s!"no file matching `{pattern}` names `{declName}`"
+    IO.eprintln s!"no file matching `{pattern}` is affected: {description}"
     return 1
   unless apply do
     dropStagedFiles stagedFiles
@@ -1366,10 +1371,14 @@ private def renameDeclGlob (pattern declName replacement : String) (apply : Bool
   unless build.stderr.isEmpty do IO.eprint build.stderr
   if build.exitCode != 0 then
     for (path, source) in restore do IO.FS.writeFile path source
-    IO.eprintln s!"whole-repository build failed after renaming `{declName}`; restored"
+    IO.eprintln s!"whole-repository build failed ({description}); restored"
     return build.exitCode
-  IO.println s!"renamed `{declName}` to `{replacement}` in {stagedFiles.size} file(s); build passed"
+  IO.println s!"{description}: {stagedFiles.size} file(s); build passed"
   return 0
+
+private def renameDeclGlob (pattern declName replacement : String) (apply : Bool) : IO UInt32 :=
+  stagedGlob pattern s!"renamed `{declName}` to `{replacement}`"
+    (fun path stage => #["rename-decl-stage", path, declName, replacement, stage]) apply
 
 /-! ## Token renaming (syntax-atom-anchored, for notation)
 
@@ -1421,6 +1430,71 @@ private def renameTokenFile (path oldToken newToken : String) (apply : Bool) : I
 private def renameTokenGlob (pattern oldToken newToken : String) (apply : Bool) : IO UInt32 :=
   forkPerFile pattern fun path =>
     #["rename-token", path, oldToken, newToken] ++ (if apply then #["--apply"] else #[])
+
+/-! ## Applied form to infix
+
+A binary declaration that has notation — `OrderedCat.le` and its `≤` — should be READ through the
+notation, or the source says one thing and the paper it transcribes says another.  Rewriting
+`f a b` to `a ⊗ b` by hand is where paren errors come from, so the argument spans are taken from
+the parse tree: whatever text the source gave each argument, including its parentheses, is what is
+emitted around the token.  The edit is source-level only — `f a b` and `a ⊗ b` are the same term. -/
+
+private def identNames (declName : String) (id : String) : Bool :=
+  declName == id || declName.endsWith ("." ++ id)
+
+/-- The span to read an operand from.  A function application or a bare name never needs brackets
+    around it, at any operator precedence, so the author's parentheses come off — that is what turns
+    `OrderedCat.le (𝟙 a) R` into `𝟙 a ≤ R` rather than `(𝟙 a) ≤ R`.  Anything else keeps exactly the
+    text the author wrote: whether THAT needs bracketing is a precedence question, and guessing it
+    wrong changes the term. -/
+private partial def unwrapOperand (stx : Syntax) : Syntax :=
+  if stx.isOfKind ``Lean.Parser.Term.paren || stx.isOfKind nullKind then
+    match stx.getArgs.filter fun child => !child.isAtom && child.getRange?.isSome with
+    | #[inner] => unwrapOperand inner
+    | _ => stx
+  else stx
+
+private def operandRange (stx : Syntax) : Option Lean.Syntax.Range :=
+  let inner := unwrapOperand stx
+  if inner.isOfKind ``Lean.Parser.Term.app || inner.isIdent then inner.getRange? else stx.getRange?
+
+private partial def infixSites (stx : Syntax) (declName token source : String) : Array Edit :=
+  Id.run do
+  let mut edits := #[]
+  for child in stx.getArgs do
+    edits := edits ++ infixSites child declName token source
+  if stx.isOfKind ``Lean.Parser.Term.app then
+    let fn := stx[0]
+    let args := stx[1].getArgs
+    if fn.isIdent && identNames declName fn.getId.toString && args.size == 2 then
+      if let (some whole, some left, some right) :=
+          (stx.getRange?, operandRange args[0]!, operandRange args[1]!) then
+        let text (r : Lean.Syntax.Range) := String.Pos.Raw.extract source r.start r.stop
+        let written := s!"{text left} {token} {text right}"
+        edits := edits.push
+          { start := whole.start, stop := whole.stop, line := 0, replacement := written }
+  return edits
+
+/-- Stage `path` with every application of `declName` written infix with `token`. -/
+private def infixStage (path declName token stagePath : String) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, fileMap, commands, _) ← elaborateFile path
+  let mut edits := #[]
+  for cmd in commands do
+    edits := edits ++ infixSites cmd declName token source
+  if edits.isEmpty then IO.println s!"{path}: no application of `{declName}`"; return 3
+  let positioned := edits.map fun edit =>
+    { edit with line := (fileMap.toPosition edit.start).line + 1 }
+  let (selected, deferred) := independentEdits positioned
+  if deferred > 0 then IO.println s!"{path}: deferred {deferred} nested application(s)"
+  for edit in selected do
+    IO.println s!"{path}:{edit.line}: {repr (String.Pos.Raw.extract source edit.start edit.stop)} -> {repr edit.replacement}"
+  IO.FS.writeFile stagePath (applyEdits source selected)
+  return 0
+
+private def infixGlob (pattern declName token : String) (apply : Bool) : IO UInt32 :=
+  stagedGlob pattern s!"wrote `{declName}` infix as `{token}`"
+    (fun path stage => #["infix-stage", path, declName, token, stage]) apply
 
 private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
     (tryRemoval := false) (includeVariables := true) : IO UInt32 := do
@@ -1553,7 +1627,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-decl --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-decl --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1625,6 +1699,12 @@ def main (args : List String) : IO UInt32 := do
       return ← renameDeclGlob pattern declName replacement true
   | ["rename-decl-stage", path, declName, replacement, stagePath] =>
       return ← renameDeclStage path declName replacement stagePath
+  | ["infix", "--glob", pattern, declName, token] =>
+      return ← infixGlob pattern declName token false
+  | ["infix", "--glob", pattern, declName, token, "--apply"] =>
+      return ← infixGlob pattern declName token true
+  | ["infix-stage", path, declName, token, stagePath] =>
+      return ← infixStage path declName token stagePath
   | ["rename", path, moduleName, declName, replacement] =>
       return ← renameReferences path moduleName declName replacement false
   | ["rename", path, moduleName, declName, replacement, "--apply"] =>
