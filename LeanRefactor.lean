@@ -54,6 +54,18 @@ private def usageSitesNamed (references : Lsp.ModuleRefs) (declName : String) : 
           { range := loc.range, parent? := loc.parentDecl? }
   return sites
 
+/-- The BINDING site of `declName` — where the name is introduced, not where it is used.  A rename
+    that moves the uses without this leaves the file naming a declaration that no longer exists; a
+    rename that moves this without the uses leaves the uses dangling.  `rename-decl` takes both. -/
+private def definitionSitesNamed (references : Lsp.ModuleRefs) (declName : String) : Array ReferenceSite := Id.run do
+  let mut sites := #[]
+  for (ident, info) in references do
+    if let .const _ name := ident then
+      if name == declName then
+        if let some loc := info.definition? then
+          sites := sites.push { range := loc.range, parent? := loc.parentDecl? }
+  return sites
+
 private partial def syntaxSitesNamed (fileMap : FileMap) (declName : String) (stx : Syntax) : Array ReferenceSite := Id.run do
   let mut sites := #[]
   let shortName := (declName.splitOn ".").getLastD declName
@@ -423,8 +435,11 @@ private def verifiedEdits (env : Environment) (path source : String) (edits : Ar
     if ← elaboratesCleanly env path (applyEdits source candidate) then kept := candidate
   pure kept
 
+/-- The check every transactional refactor is measured against.  NO TARGET is named on purpose: the
+    package has four lib roots (`Freyd`, `AOP`, `leet`, `rel`) plus `diag`, and `lake build Freyd`
+    builds one of them — a rename that broke `diag` was reported as "build passed". -/
 private def repositoryBuild : IO IO.Process.Output :=
-  IO.Process.output { cmd := "./scripts/cap", args := #["lake", "build", "Freyd"] }
+  IO.Process.output { cmd := "./scripts/cap", args := #["lake", "build"] }
 
 /-! ## Book-aware declaration lints
 
@@ -1156,12 +1171,41 @@ private def isIdentifierUse (line name : String) : Bool := Id.run do
     rest := rest.drop 1
   return false
 
-/-- Rewrite every reference to `declName` in `path` to `replacement`, resolved semantically: the
-    `.ilean` reference data first, then this module's own info trees, and only then identifier
-    syntax.  The declaration's own binding site is left alone — renaming a use is not renaming a
-    definition, and the two are different edits. -/
-private def renameReferences (path moduleName declName replacement : String) (apply : Bool) :
-    IO UInt32 := do
+private structure DeclSites where
+  source : String
+  env : Environment
+  edits : Array Edit
+
+/-- A reference site spans the WHOLE identifier as written, qualifier included, so replacing it with
+    a bare new name deletes the namespace: `CartBicat.cop` became `delta`, which resolves nowhere.
+    When the replacement is a simple name, only the last component moves and the writer's chosen
+    qualification is kept.  A dotted replacement is taken verbatim — that is a caller asking for a
+    different namespace, not for a rename. -/
+private def qualifierPreserving (source declName : String) (edit : Edit) : Edit :=
+  if (edit.replacement.splitOn ".").length > 1 then edit else
+  let parts := (String.Pos.Raw.extract source edit.start edit.stop).splitOn "."
+  if parts.length > 1 && parts.getLastD "" == (declName.splitOn ".").getLastD declName then
+    { edit with replacement := String.intercalate "." (parts.dropLast ++ [edit.replacement]) }
+  else edit
+
+/-- The semantic and syntactic passes both see a site that is both a reference and an identifier,
+    so the union has to be taken by position or the same span is reported — and counted — twice. -/
+private def dedupeEdits (edits : Array Edit) : Array Edit := Id.run do
+  let mut seen : Array Nat := #[]
+  let mut kept := #[]
+  for edit in edits do
+    unless seen.contains edit.start.byteIdx do
+      seen := seen.push edit.start.byteIdx
+      kept := kept.push edit
+  return kept
+
+/-- Every site in `path` that names `declName`, resolved semantically: the `.ilean` reference data
+    first, then this module's own info trees, and only then identifier syntax.  `withDefinition`
+    picks which edit is wanted — renaming a USE is not renaming a DEFINITION.  `rename` moves the
+    uses only (the binding site is a separate edit the caller may not want); `rename-decl` moves
+    both, which is what an actual rename of a declaration is. -/
+private def declSites (path moduleName declName replacement : String) (withDefinition : Bool) :
+    IO (Except UInt32 DeclSites) := do
   claimElaboration path
   initSearchPath (← findSysroot)
   let source ← IO.FS.readFile path
@@ -1171,40 +1215,64 @@ private def renameReferences (path moduleName declName replacement : String) (ap
     (mainModule := parseName moduleName)
   unless !headerMessages.hasErrors do
     for msg in headerMessages.toList do IO.eprintln (← msg.toString)
-    return 1
+    return .error 1
   let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
   let references := Server.findModuleRefs inputCtx.fileMap
     frontend.commandState.infoState.trees.toArray (localVars := false)
   let (liveReferences, _) ← references.toLspModuleRefs
   let mut sites := usageSitesNamed liveReferences declName
+  if withDefinition then
+    sites := sites ++ definitionSitesNamed liveReferences declName
+    -- A `class`/`structure` field is used by the very laws declared beside it, and inside that body
+    -- the field is a BINDER reference, not a `.const` — the info trees do not record it.  Without
+    -- the syntax pass, renaming a field leaves its own laws naming the old one, so the file no
+    -- longer elaborates.  Only `rename-decl` needs this: it is the operation that moves the
+    -- binding site, hence the only one for which the declaring body is in scope.
+    for cmd in frontend.commands do
+      sites := sites ++ syntaxSitesNamed inputCtx.fileMap declName cmd
   if sites.isEmpty then
     for cmd in frontend.commands do
       sites := sites ++ syntaxSitesNamed inputCtx.fileMap declName cmd
-  if sites.isEmpty then IO.println s!"{path}: no reference to `{declName}`"; return 0
   let edits := sites.map fun site =>
     { start := inputCtx.fileMap.lspPosToUtf8Pos site.range.start,
       stop := inputCtx.fileMap.lspPosToUtf8Pos site.range.end,
       line := site.range.start.line + 1, replacement }
+  return .ok { source, env, edits := (dedupeEdits edits).map (qualifierPreserving source declName) }
+
+private def reportEdits (path source replacement : String) (edits : Array Edit) : IO Unit := do
   for edit in edits do
     IO.println s!"{path}:{edit.line}: {repr (String.Pos.Raw.extract source edit.start edit.stop)} -> {repr replacement}"
-  unless apply do IO.println "preview only; pass --apply to write"; return 0
-  let updated := applyEdits source (independentEdits edits).1
-  IO.FS.writeFile path updated
-  unless ← elaboratesCleanly env path updated do
-    IO.FS.writeFile path source
-    IO.eprintln s!"{path}: rewriting `{declName}` to `{replacement}` does not elaborate; restored"
-    return 1
-  IO.println s!"applied {edits.size} rename(s) to {path}"
-  -- The info trees do not record EVERY occurrence — `unfold`'s arguments, among others, resolve
-  -- without leaving a term reference — so a semantic pass can silently half-rename a file and only
-  -- break once the old declaration is deleted.  Say so rather than report a clean run.
+
+/-- The info trees do not record EVERY occurrence — `unfold`'s arguments, among others, resolve
+    without leaving a term reference — so a semantic pass can silently half-rename a file and only
+    break once the old declaration is deleted.  Say so rather than report a clean run. -/
+private def warnLeftovers (path updated declName : String) : IO Unit := do
   let short := (declName.splitOn ".").getLastD declName
   let leftovers := (updated.splitOn "\n").zipIdx.filterMap fun (line, i) =>
     if isIdentifierUse line short then some (i + 1) else none
   unless leftovers.isEmpty do
     IO.eprintln s!"{path}: `{short}` still occurs on line(s) {leftovers} — the info trees did not"
     IO.eprintln "  resolve those; check them by hand before deleting the declaration"
-  return 0
+
+/-- Rewrite every reference to `declName` in `path` to `replacement`.  The declaration's own binding
+    site is left alone; use `rename-decl` to move both. -/
+private def renameReferences (path moduleName declName replacement : String) (apply : Bool) :
+    IO UInt32 := do
+  match ← declSites path moduleName declName replacement (withDefinition := false) with
+  | .error code => return code
+  | .ok found =>
+    if found.edits.isEmpty then IO.println s!"{path}: no reference to `{declName}`"; return 0
+    reportEdits path found.source replacement found.edits
+    unless apply do IO.println "preview only; pass --apply to write"; return 0
+    let updated := applyEdits found.source (independentEdits found.edits).1
+    IO.FS.writeFile path updated
+    unless ← elaboratesCleanly found.env path updated do
+      IO.FS.writeFile path found.source
+      IO.eprintln s!"{path}: rewriting `{declName}` to `{replacement}` does not elaborate; restored"
+      return 1
+    IO.println s!"applied {found.edits.size} rename(s) to {path}"
+    warnLeftovers path updated declName
+    return 0
 
 /-- Run one `lean-refactor` subcommand per matching file, each in a CHILD process.
 
@@ -1226,6 +1294,82 @@ private def forkPerFile (pattern : String) (childArgs : String → Array String)
 private def renameGlob (pattern declName replacement : String) (apply : Bool) : IO UInt32 :=
   forkPerFile pattern fun path =>
     #["rename-file", path, declName, replacement] ++ (if apply then #["--apply"] else #[])
+
+/-! ## Renaming a declaration
+
+`rename` moves the USES of a declaration and checks each file on its own.  That check is exactly
+what a real rename cannot pass: the moment the binding site moves, every file still on the old name
+stops elaborating, and every file already on the new name stops elaborating until the binding site
+moves.  No ordering of per-file edits makes both halves valid at once.
+
+So `rename-decl` splits the work.  Each file is analysed in a CHILD process (one `Environment` per
+process — see `forkPerFile`) that writes its result to a STAGING file and leaves the original
+alone.  Only when every file has staged successfully are the originals replaced, and the check is
+then a single capped whole-repository build.  A failure restores every file, so the operation is
+transactional at repository scale — the same contract as `rename-module`. -/
+
+private def stagePathFor (path : String) : String := path ++ ".rename-stage"
+
+private def dropStagedFiles (staged : Array String) : IO Unit := do
+  for path in staged do
+    let stage := stagePathFor path
+    if ← System.FilePath.pathExists stage then IO.FS.removeFile stage
+
+/-- Analyse one file and write the renamed text to `stagePath`, never to `path`.  Exit 3 means the
+    file does not name `declName` at all, which is not an error. -/
+private def renameDeclStage (path declName replacement stagePath : String) : IO UInt32 := do
+  let moduleName ← match moduleNameOfPath path with
+    | .ok name => pure name
+    | .error message => IO.eprintln message; return 2
+  match ← declSites path moduleName declName replacement (withDefinition := true) with
+  | .error code => return code
+  | .ok found =>
+    if found.edits.isEmpty then IO.println s!"{path}: no reference to `{declName}`"; return 3
+    reportEdits path found.source replacement found.edits
+    let updated := applyEdits found.source (independentEdits found.edits).1
+    IO.FS.writeFile stagePath updated
+    warnLeftovers path updated declName
+    return 0
+
+private def renameDeclGlob (pattern declName replacement : String) (apply : Bool) : IO UInt32 := do
+  let selected ← globSelectedFiles pattern
+  if selected.isEmpty then return 1
+  let mut staged : Array String := #[]
+  let mut failed := false
+  for path in selected do
+    let output ← IO.Process.output { cmd := "lake", args := #["exe", "lean-refactor",
+      "rename-decl-stage", path, declName, replacement, stagePathFor path] }
+    unless output.stdout.isEmpty do IO.print output.stdout
+    unless output.stderr.isEmpty do IO.eprint output.stderr
+    if output.exitCode == 0 then staged := staged.push path
+    else if output.exitCode != 3 then failed := true
+  let stagedFiles := staged
+  if failed then
+    dropStagedFiles stagedFiles
+    IO.eprintln s!"staging `{declName}` failed; nothing was written"
+    return 1
+  if stagedFiles.isEmpty then
+    IO.eprintln s!"no file matching `{pattern}` names `{declName}`"
+    return 1
+  unless apply do
+    dropStagedFiles stagedFiles
+    IO.println "preview only; pass --apply to write"
+    return 0
+  let mut backups : Array (String × String) := #[]
+  for path in stagedFiles do
+    backups := backups.push (path, ← IO.FS.readFile path)
+    IO.FS.writeFile path (← IO.FS.readFile (stagePathFor path))
+  dropStagedFiles stagedFiles
+  let restore := backups
+  let build ← repositoryBuild
+  unless build.stdout.isEmpty do IO.eprint build.stdout
+  unless build.stderr.isEmpty do IO.eprint build.stderr
+  if build.exitCode != 0 then
+    for (path, source) in restore do IO.FS.writeFile path source
+    IO.eprintln s!"whole-repository build failed after renaming `{declName}`; restored"
+    return build.exitCode
+  IO.println s!"renamed `{declName}` to `{replacement}` in {stagedFiles.size} file(s); build passed"
+  return 0
 
 /-! ## Token renaming (syntax-atom-anchored, for notation)
 
@@ -1409,7 +1553,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-decl --glob '<pattern>' <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-file <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1475,6 +1619,12 @@ def main (args : List String) : IO UInt32 := do
       return ← renameGlob pattern declName replacement false
   | ["rename", "--glob", pattern, declName, replacement, "--apply"] =>
       return ← renameGlob pattern declName replacement true
+  | ["rename-decl", "--glob", pattern, declName, replacement] =>
+      return ← renameDeclGlob pattern declName replacement false
+  | ["rename-decl", "--glob", pattern, declName, replacement, "--apply"] =>
+      return ← renameDeclGlob pattern declName replacement true
+  | ["rename-decl-stage", path, declName, replacement, stagePath] =>
+      return ← renameDeclStage path declName replacement stagePath
   | ["rename", path, moduleName, declName, replacement] =>
       return ← renameReferences path moduleName declName replacement false
   | ["rename", path, moduleName, declName, replacement, "--apply"] =>
