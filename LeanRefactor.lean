@@ -81,6 +81,25 @@ private partial def syntaxSitesNamed (fileMap : FileMap) (declName : String) (st
   for child in stx.getArgs do sites := sites ++ syntaxSitesNamed fileMap declName child
   return sites
 
+/-- Uses written through NOTATION.  `∇ n` is `CartBicat.«∇» n` after expansion, but the source has
+    no identifier to match — the head is an atom the notation declared — so neither the semantic
+    passes nor `syntaxSitesNamed` sees it, and a call-argument edit would silently skip every such
+    use.  Matching the atom finds them; the enclosing application is then read as usual. -/
+private partial def tokenSitesNamed (fileMap : FileMap) (token : String) (stx : Syntax) :
+    Array ReferenceSite := Id.run do
+  let mut sites := #[]
+  for child in stx.getArgs do sites := sites ++ tokenSitesNamed fileMap token child
+  match stx with
+  | .atom _ val =>
+    if val.trimAscii.toString == token then
+      if let some range := stx.getRange? then
+        sites := sites.push {
+          range := ⟨fileMap.utf8PosToLspPos range.start, fileMap.utf8PosToLspPos range.stop⟩
+          parent? := none
+        }
+  | _ => pure ()
+  return sites
+
 private def usageSites (ilean : Ilean) (declModule declName : String) : Array ReferenceSite :=
   usageSitesIn ilean.references declModule declName
 
@@ -110,6 +129,22 @@ private def enclosingApp (fileMap : FileMap) (site : ReferenceSite)
   let pos := fileMap.lspPosToUtf8Pos site.range.start
   let (_, parents) ← commands.findSome? (syntaxAt pos)
   parents.find? (·.isOfKind ``Lean.Parser.Term.app)
+
+/-- The `(f a)` that wraps the application, when the parentheses hold nothing else.  Removing an
+    application's SOLE argument leaves the parentheses redundant — `(Δ n)` must become `Δ`, not
+    `(Δ)` — and only the parent chain can say whether they are there. -/
+private def enclosingParen (fileMap : FileMap) (site : ReferenceSite)
+    (commands : Array Syntax) (app : Syntax) : Option Syntax := do
+  let pos := fileMap.lspPosToUtf8Pos site.range.start
+  let (_, parents) ← commands.findSome? (syntaxAt pos)
+  let appRange ← app.getRange?
+  let paren ← parents.find? fun parent =>
+    parent.isOfKind ``Lean.Parser.Term.paren &&
+      (parent.getArgs.filter fun child => !child.isAtom && child.getRange?.isSome).size == 1 &&
+      (match parent.getArgs[1]?.bind (·.getRange?) with
+        | some inner => inner.start == appRange.start && inner.stop == appRange.stop
+        | none => false)
+  some paren
 
 private def appArgs (app : Syntax) : Option (Array Syntax) := do
   guard (app.isOfKind ``Lean.Parser.Term.app)
@@ -220,7 +255,7 @@ private def declarationAtPosition? (ilean : Ilean) (pos : Lsp.Position) : Option
   return best.map (·.1)
 
 private def editForSite (fileMap : FileMap) (site : ReferenceSite)
-    (commands : Array Syntax) (argIndex : Nat) : Except String Edit := do
+    (commands : Array Syntax) (argIndex : Nat) (source : String) : Except String Edit := do
   let some app := enclosingApp fileMap site commands
     | throw s!"line {site.range.start.line + 1}: resolved reference is not inside an application"
   let some args := appArgs app
@@ -229,6 +264,25 @@ private def editForSite (fileMap : FileMap) (site : ReferenceSite)
     | throw s!"line {site.range.start.line + 1}: application has only {args.size} explicit argument(s)"
   let some targetRange := target.getRange?
     | throw s!"line {site.range.start.line + 1}: argument has no original source range"
+  -- The SOLE argument is a different edit from any other: what is left is not an application at
+  -- all but the bare function, so the span runs from the end of the function, and the parentheses
+  -- that existed only to hold the application go with it.  This is the shape a parameter takes
+  -- when it becomes implicit — `Δ n` becomes `Δ`, `(Δ n)` becomes `Δ`.
+  if argIndex == 0 && args.size == 1 then
+    let some fn := app.getArgs[0]?
+      | throw s!"line {site.range.start.line + 1}: application has no function part"
+    let some fnRange := fn.getRange?
+      | throw s!"line {site.range.start.line + 1}: function part has no source range"
+    let fnText := String.Pos.Raw.extract source fnRange.start fnRange.stop
+    match enclosingParen fileMap site commands app with
+    | some paren =>
+      let some parenRange := paren.getRange?
+        | throw s!"line {site.range.start.line + 1}: parenthesis has no source range"
+      return { start := parenRange.start, stop := parenRange.stop,
+               line := site.range.start.line + 1, replacement := fnText }
+    | none =>
+      return { start := fnRange.stop, stop := targetRange.stop,
+               line := site.range.start.line + 1 }
   let start ← if argIndex > 0 then
       let some previous := args[argIndex - 1]?
         | throw "internal argument-index error"
@@ -303,7 +357,7 @@ private def unusedVariableEdits (source : String) (fileMap : FileMap) (commands 
     | throw "cannot resolve the enclosing declaration name"
   let mut edits := #[binderRemoval]
   for site in usageSites ilean moduleName declName do
-    edits := edits.push (← editForSite fileMap site commands argumentIndex)
+    edits := edits.push (← editForSite fileMap site commands argumentIndex source)
   pure edits
 
 private def unusedBinderName? (message : String) : Option String := do
@@ -1147,7 +1201,7 @@ private def collapseDeclaration (path declName replacement : String) (apply : Bo
     for site in sites do
       let pos := fileMap.lspPosToUtf8Pos site.range.start
       unless declStart ≤ pos && pos < declStop do
-        let edit ← match editForSite fileMap site commands (argIndex - 1) with
+        let edit ← match editForSite fileMap site commands (argIndex - 1) source with
           | .ok edit => pure edit
           | .error message => IO.eprintln s!"{path}: {message}"; return 1
         candidateEdits := candidateEdits.push edit
@@ -1778,7 +1832,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1900,21 +1954,33 @@ def main (args : List String) : IO UInt32 := do
       return ← forkPerFile pattern fun path =>
         #["unused-simp-file", path] ++ (if apply then #["--apply"] else #[])
   | _ => pure ()
-  let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, insertText?, apply) ← match args with
+  let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, insertText?, token?, apply) ← match args with
     | ["inspect", sourcePath, moduleName, declModule, declName] =>
-        pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, none, false)
+        pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, none, none, false)
     | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, false)
+        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, none, false)
     | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--apply"] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, true)
+        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, none, true)
+    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--syntax"] =>
+        pure ("remove-syntax", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, none, false)
+    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--syntax", "--apply"] =>
+        pure ("remove-syntax", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, none, true)
+    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--syntax", "--token", token] =>
+        pure ("remove-syntax", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, some token, false)
+    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--syntax", "--token", token, "--apply"] =>
+        pure ("remove-syntax", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, some token, true)
+    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--token", token] =>
+        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, some token, false)
+    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--token", token, "--apply"] =>
+        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, some token, true)
     | ["insert-call-arg", sourcePath, moduleName, declModule, declName, index, term] =>
-        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term, false)
+        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term, none, false)
     | ["insert-call-arg", sourcePath, moduleName, declModule, declName, index, term, "--apply"] =>
-        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term, true)
+        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term, none, true)
     | ["remove-parameter", sourcePath, moduleName, declName, binderName, index] =>
-        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, false)
+        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, none, false)
     | ["remove-parameter", sourcePath, moduleName, declName, binderName, index, "--apply"] =>
-        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, true)
+        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, none, true)
     | _ => IO.eprintln usage; return 2
   claimElaboration sourcePath
   let source ← IO.FS.readFile sourcePath
@@ -1931,14 +1997,17 @@ def main (args : List String) : IO UInt32 := do
     return 1
   let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
   unless !frontend.commandState.messages.hasErrors do
-    if mode != "remove" && mode != "insert" then
+    if mode != "remove" && mode != "remove-syntax" && mode != "insert" then
       for msg in frontend.commandState.messages.toList do IO.eprintln (← msg.toString)
       return 1
   let commands := frontend.commands
   let ileanPath := System.FilePath.mk ".lake/build/lib/lean" /
     System.FilePath.mk (moduleName.replace "." "/" ++ ".ilean")
   let ilean ← Ilean.load ileanPath
-  let mut sites := usageSites ilean declModule declName
+  let mut sites := if mode == "remove-syntax" then #[] else usageSites ilean declModule declName
+  if mode == "remove-syntax" then
+    for command in frontend.commands do
+      sites := sites ++ syntaxSitesNamed inputCtx.fileMap declName command
   if sites.isEmpty && (mode == "remove" || mode == "insert") then
     let refs := Server.findModuleRefs inputCtx.fileMap
       frontend.commandState.infoState.trees.toArray (localVars := false)
@@ -1948,6 +2017,9 @@ def main (args : List String) : IO UInt32 := do
     if sites.isEmpty && env.contains (parseName declName) then
       for command in frontend.commands do
         sites := sites ++ syntaxSitesNamed inputCtx.fileMap declName command
+  if let some token := token? then
+    for command in frontend.commands do
+      sites := sites ++ tokenSitesNamed inputCtx.fileMap token command
   IO.println s!"{declName}: {sites.size} resolved use(s) in {moduleName}; parsed {commands.size} command(s)"
   if mode == "inspect" then
     for site in sites do showContext inputCtx.fileMap site commands
@@ -1958,9 +2030,15 @@ def main (args : List String) : IO UInt32 := do
     for site in sites do
       let result := if mode == "insert" then
         insertionForSite inputCtx.fileMap site commands (oneBased - 1) (insertText?.getD "")
-      else editForSite inputCtx.fileMap site commands (oneBased - 1)
+      else editForSite inputCtx.fileMap site commands (oneBased - 1) source
       match result with
-      | .error message => IO.eprintln message; return 1
+      | .error message =>
+          -- `--syntax` matches by name, so the declaration's own binder line answers to it and is
+          -- not an application: report and carry on rather than abandoning the file.
+          unless mode == "remove-syntax" do
+            IO.eprintln message
+            return 1
+          IO.println s!"skipped: {message}"
       | .ok edit => edits := edits.push edit
     if mode == "parameter" then
       let some binderName := binderName? | IO.eprintln "missing binder name"; return 2
