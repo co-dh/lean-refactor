@@ -1,0 +1,158 @@
+module
+
+import Lean
+import LeanRefactor.Db
+import LeanRefactor.IleanRows
+import LeanRefactor.OleanRows
+
+open Lean
+
+namespace LeanRefactor.Index
+
+/-- A built module found under `buildDir`: its dotted name (the SQL key), the hierarchical name the
+    olean header knows (from the path, exactly as the compiler's `moduleNameOfFileName`), the derived
+    source path, the two artifact hashes, and the path of its `.ilean` below `buildDir`. -/
+private structure Module where
+  name      : String
+  srcName   : Name
+  source    : String
+  ileanHash : String
+  oleanHash : String
+  relPath   : String
+
+/-- Read `p`, trimmed; a missing file reads as `""`. -/
+private def readTrimmed (p : System.FilePath) : IO String := do
+  try return (← IO.FS.readFile p).trimAscii.toString catch _ => return ""
+
+/-- The trimmed contents of every existing `X.olean*.hash` file in `dir`, in sorted filename order,
+    joined by `,`. Lean 4.28 splits a module into `X.olean`, `X.olean.private` and `X.olean.server`,
+    each with its own `.hash`; an ordinary module has only `X.olean.hash`. -/
+private def oleanHashes (dir : System.FilePath) (entries : Array IO.FS.DirEntry) (fileBase : String) : IO String := do
+  let hashNames := (entries.filter fun e =>
+      e.fileName.startsWith (fileBase ++ ".olean") && e.fileName.endsWith ".hash")
+    |>.map (·.fileName)
+    |>.qsort (· < ·)
+  let mut parts := #[]
+  for h in hashNames do
+    parts := parts.push (← readTrimmed (dir / System.FilePath.mk h))
+  return String.intercalate "," parts.toList
+
+/-- Recurse `relDir` ("" for the build root) collecting every `.ilean` as a `Module`.
+    A `.ilean` whose module name would be empty is skipped. -/
+private partial def scanDir (buildDir relDir : String) : IO (Array Module) := do
+  let dir := System.FilePath.mk buildDir / System.FilePath.mk relDir
+  let entries ← System.FilePath.readDir dir
+  let mut acc := #[]
+  for entry in entries do
+    if ← entry.path.isDir then
+      acc := acc ++ (← scanDir buildDir (relDir ++ entry.fileName ++ "/"))
+    else if entry.fileName.endsWith ".ilean" then
+      let rel := relDir ++ entry.fileName
+      let base := (rel.dropEnd ".ilean".length).toString
+      unless base.isEmpty do
+        let name := base.replace "/" "."
+        let ileanHash ← readTrimmed (dir / System.FilePath.mk (entry.fileName ++ ".hash"))
+        let oleanHash ← oleanHashes dir entries ((entry.fileName.dropEnd ".ilean".length).toString)
+        acc := acc.push {
+          name,
+          srcName := (System.FilePath.mk base).components.foldl Name.mkStr Name.anonymous,
+          source := name.replace "." "/" ++ ".lean",
+          ileanHash, oleanHash, relPath := rel }
+  return acc
+
+/-- The `module` table as a map from name to the stored hash pair. -/
+private def storedModules (dbPath : String) : IO (Std.HashMap String (String × String)) := do
+  let j ← Db.query dbPath "select name, ilean_hash, olean_hash from module;"
+  let mut map : Std.HashMap String (String × String) := {}
+  match j with
+  | .arr rows =>
+      for row in rows do
+        map := map.insert (row.getObjValAs? String "name" |>.toOption |>.getD "")
+          ((row.getObjValAs? String "ilean_hash" |>.toOption |>.getD ""),
+           (row.getObjValAs? String "olean_hash" |>.toOption |>.getD ""))
+  | _ => pure ()
+  return map
+
+/-- The scanned modules whose hash pair differs from the stored pair, plus scanned modules not
+    stored at all. -/
+private def staleModules (scanned : Array Module) (stored : Std.HashMap String (String × String)) : Array Module :=
+  scanned.filter fun m =>
+    match stored.get? m.name with
+    | none => true
+    | some (ileanHash, oleanHash) => ileanHash != m.ileanHash || oleanHash != m.oleanHash
+
+/-- The stored modules the scan no longer found. -/
+private def removedModules (scanned : Array Module) (stored : Std.HashMap String (String × String)) : Array String :=
+  let scannedNames := scanned.foldl (fun (s : Std.HashSet String) m => s.insert m.name) ∅
+  stored.fold (fun acc name _ => if scannedNames.contains name then acc else acc.push name) #[]
+
+/-- Delete every partition row owned by `modules`, in one transaction. Single quotes in a module
+    name are escaped by doubling, as SQL string literals require. -/
+private def deletePartitions (dbPath : String) (modules : Array String) : IO Unit := do
+  unless modules.isEmpty do
+    let mut sql := "begin;\n"
+    for m in modules do
+      let m := m.replace "'" "''"
+      sql := sql ++ s!"delete from decl_range where module = '{m}';\n" ++
+        s!"delete from decl_info where module = '{m}';\n" ++
+        s!"delete from use_site where use_module = '{m}';\n" ++
+        s!"delete from dep where module = '{m}';\n" ++
+        s!"delete from module where name = '{m}';\n"
+    Db.exec dbPath (sql ++ "commit;")
+
+/-- How many modules the `module` table holds — exactly the set the scan found, because every
+    stale row is deleted and re-inserted under the same name. -/
+private def moduleCount (dbPath : String) : IO Nat := do
+  let j ← Db.query dbPath "select count(*) from module;"
+  match j with
+  | .arr rows =>
+      if let some row := rows[0]? then
+        return (row.getObjValAs? Nat "count(*)" |>.toOption |>.getD 0)
+      return 0
+  | _ => return 0
+
+/-- Refresh the index at `dbPath`, scanning `buildDir`. With `full := true`, discard the database first.
+    Returns (modules re-extracted, modules dropped). -/
+public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat) := do
+  if full then
+    -- Drop the WAL and SHM too, so a stale write-ahead log cannot be replayed into the fresh file.
+    for f in #[dbPath, dbPath ++ "-wal", dbPath ++ "-shm"] do
+      try IO.FS.removeFile f catch _ => pure ()
+  _ ← Db.ensureSchema dbPath
+  let scanned ← scanDir buildDir ""
+  let stored ← storedModules dbPath
+  let stale := staleModules scanned stored
+  let removed := removedModules scanned stored
+  deletePartitions dbPath (stale.map (·.name) ++ removed)
+  let mut declRanges := #[]
+  let mut useSites := #[]
+  for m in stale do
+    let rows ← IleanRows.ofIlean (System.FilePath.mk buildDir / System.FilePath.mk m.relPath)
+    declRanges := declRanges ++ rows.declRanges
+    useSites := useSites ++ rows.useSites
+  -- ONE import for the whole stale set: the memory rule of this project is one environment per
+  -- refresh, never one per module.
+  let oleanRows ← if stale.isEmpty then pure { declInfos := #[], deps := #[] } else
+    OleanRows.ofModules (stale.map (·.srcName))
+  Db.importRows dbPath "decl_range" declRanges
+  Db.importRows dbPath "use_site" useSites
+  Db.importRows dbPath "decl_info" oleanRows.declInfos
+  Db.importRows dbPath "dep" oleanRows.deps
+  Db.importRows dbPath "module" (stale.map fun m => Db.row #[m.name, m.source, m.ileanHash, m.oleanHash])
+  return (stale.size, removed.size)
+
+/-- `lean-refactor index [--full]`: refresh and print a one-line summary. Returns the process exit code. -/
+public def run (full : Bool) : IO UInt32 := do
+  let buildDir := ".lake/build/lib/lean"
+  unless ← System.FilePath.isDir buildDir do
+    IO.eprintln s!"{buildDir} does not exist; run `lake build` first"
+    return 1
+  let dbPath := ".lake/build/refactor-index.db"
+  let t0 ← IO.monoMsNow
+  let (reExtracted, dropped) ← refresh dbPath buildDir full
+  let elapsed := (← IO.monoMsNow) - t0
+  let scanned ← moduleCount dbPath
+  IO.println s!"indexed {scanned} module(s): {reExtracted} re-extracted, {dropped} dropped, in {elapsed} ms"
+  return 0
+
+end LeanRefactor.Index
