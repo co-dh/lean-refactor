@@ -1,0 +1,126 @@
+module
+
+import Lean
+public import Lean.Data.Json
+
+open Lean
+
+namespace LeanRefactor.Db
+
+/-- Field and record separators, matching sqlite3's `--ascii` import mode (0x1F, 0x1E). -/
+public def fieldSep : String := "\x1f"
+public def recordSep : String := "\x1e"
+
+/-- One row: the cell values joined by `fieldSep`. -/
+public def row (cells : Array String) : String :=
+  String.intercalate fieldSep cells.toList
+
+/-- The schema version stored in `meta`. Bump when `schemaSql` changes. -/
+public def schemaVersion : String := "1"
+
+/-- The complete DDL (given below verbatim). -/
+public def schemaSql : String :=
+"create table meta (key text primary key, value text);
+
+create table module (
+  name       text primary key,
+  source     text,
+  ilean_hash text,
+  olean_hash text
+);
+
+create table decl_range (
+  name text, module text,
+  l1 int, c1 int, l2 int, c2 int,
+  sl1 int, sc1 int, sl2 int, sc2 int,
+  primary key (name, module)
+);
+
+create table decl_info (
+  name text, module text,
+  kind text,
+  type_key integer,
+  primary key (name, module)
+);
+
+create table use_site (
+  name        text,
+  decl_module text,
+  use_module  text,
+  l1 int, c1 int, l2 int, c2 int,
+  parent      text,
+  is_definition int
+);
+
+create table dep (src text, dst text, module text);
+
+create index i_use_name   on use_site(name);
+create index i_use_module on use_site(use_module);
+create index i_dep_dst    on dep(dst);
+create index i_dep_src    on dep(src);
+create index i_decl_key   on decl_info(type_key);
+"
+
+/-- Spawn `sqlite3` with `extraArgs`, feeding it `sql` from the temp file `tmp` via `.read`.
+    `tmp` is chosen by the caller so concurrent runs never share a temp file. -/
+private def runSqlite (dbPath : String) (tmp : String) (extraArgs : Array String) (sql : String) : IO String := do
+  IO.FS.writeFile tmp sql
+  let out ← IO.Process.output { cmd := "sqlite3", args := extraArgs ++ #["-batch", dbPath, ".read " ++ tmp] }
+  try IO.FS.removeFile tmp catch _ => pure ()
+  if out.exitCode != 0 then
+    throw <| IO.userError s!"sqlite3 failed on {dbPath}: {out.stderr}"
+  else
+    return out.stdout
+
+/-- Run `sql` against the database, creating the file if needed.
+    Throws `IO.userError` carrying sqlite3's stderr when sqlite3 exits non-zero. -/
+public def exec (dbPath : String) (sql : String) : IO Unit := do
+  _ ← runSqlite dbPath (dbPath ++ ".sql.tmp") #[] sql
+  pure ()
+
+/-- Run `sql` and return the rows sqlite3 prints in `-json` mode.
+    Zero rows: sqlite3 prints nothing, and this must return `Json.arr #[]`, not an error. -/
+public def query (dbPath : String) (sql : String) : IO Json := do
+  let stdout ← runSqlite dbPath (dbPath ++ ".sql.tmp") #["-json"] sql
+  if stdout.isEmpty then
+    return Json.arr #[]
+  else
+    match Json.parse stdout with
+    | .ok j => return j
+    | .error e => throw <| IO.userError s!"sqlite3 on {dbPath} returned invalid JSON: {e}"
+
+/-- True when the database already carries `schemaVersion` in `meta`.
+    Any failure (missing file, missing `meta` table, corrupt db) means not current. -/
+private def schemaCurrent (dbPath : String) : IO Bool := do
+  try
+    let v ← runSqlite dbPath (dbPath ++ ".sql.tmp") #[] "select value from meta where key = 'schema_version';"
+    return v.trimAscii.toString == schemaVersion
+  catch _ => return false
+
+/-- Apply `schemaSql` when the database is new or its `meta.schema_version` differs from `schemaVersion`.
+    Returns `true` when the schema was (re)created, `false` when the existing database was already current.
+    Recreating means: delete the database file and start over — this is a derived cache, never a source of truth. -/
+public def ensureSchema (dbPath : String) : IO Bool := do
+  if (← schemaCurrent dbPath) then
+    return false
+  else
+    try IO.FS.removeFile dbPath catch _ => pure ()
+    exec dbPath schemaSql
+    exec dbPath "pragma journal_mode = wal;"
+    exec dbPath s!"insert into meta (key, value) values ('schema_version', '{schemaVersion}');"
+    return true
+
+/-- Bulk-load ASCII-separated `records` into `table`, in one transaction.
+    An empty `records` array is a no-op that must not spawn sqlite3.
+    Write the records to a temporary file and use `.import --ascii <file> <table>`. -/
+public def importRows (dbPath : String) (table : String) (records : Array String) : IO Unit := do
+  unless records.isEmpty do
+    let rowsTmp := dbPath ++ "." ++ table ++ ".rows.tmp"
+    IO.FS.writeFile rowsTmp (String.intercalate recordSep records.toList)
+    try
+      _ ← runSqlite dbPath (dbPath ++ "." ++ table ++ ".import.tmp") #[] s!".import --ascii {rowsTmp} {table}"
+      pure ()
+    finally
+      try IO.FS.removeFile rowsTmp catch _ => pure ()
+
+end LeanRefactor.Db
