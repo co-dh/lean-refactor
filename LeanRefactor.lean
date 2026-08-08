@@ -2,6 +2,7 @@ module
 
 import Lean
 import LeanRefactor.Index
+import LeanRefactor.Query
 
 /-!
 `lean-refactor` performs conservative source edits using two pieces of information produced by Lean:
@@ -1364,17 +1365,26 @@ private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool
       line := site.range.start.line + 1, replacement := r.replacement }
   return (dedupeEdits edits).map (qualifierPreserving scan.source r.declName)
 
-/-- The whole batch's edits for one scanned file, or a refusal.
+/-- The same edits `renameEdits` builds, from sites the index already recorded rather than from a
+    fresh elaboration.  The tail — position conversion, de-duplication, qualifier preservation —
+    is the shared part and must stay identical, or the two paths stop agreeing. -/
+private def indexRenameEdits (fileMap : FileMap) (source : String) (r : Rename)
+    (sites : Array Query.Site) : Array Edit :=
+  (dedupeEdits (sites.map fun site =>
+    { start := fileMap.lspPosToUtf8Pos ⟨site.l1, site.c1⟩,
+      stop  := fileMap.lspPosToUtf8Pos ⟨site.l2, site.c2⟩,
+      line  := site.l1 + 1, replacement := r.replacement })).map (qualifierPreserving source r.declName)
 
-    Two renames can claim the SAME span: `syntaxSitesNamed` matches a short name, so `A.bar` and
-    `B.bar` both answer to `bar`.  Rewriting such a site to one of the two silently would be a wrong
-    edit, so the batch is refused and the caller told to run those two renames separately.  Identical
-    claims are just the duplicate they look like, and collapse. -/
-private def batchRenameEdits (scan : ScannedFile) (renames : Array Rename) (withDefinition : Bool) :
+/-- The conflict check every batch of renames must pass.  Two renames can claim the SAME span:
+    `syntaxSitesNamed` matches a short name, so `A.bar` and `B.bar` both answer to `bar`.
+    Rewriting such a site to one of the two silently would be a wrong edit, so the batch is
+    refused and the caller told to run those two renames separately.  Identical claims are just
+    the duplicate they look like, and collapse. -/
+private def checkedBatch (renames : Array Rename) (editsFor : Rename → Array Edit) :
     Except String (Array Edit) := Id.run do
   let mut kept : Array (Rename × Edit) := #[]
   for r in renames do
-    for edit in renameEdits scan r withDefinition do
+    for edit in editsFor r do
       match kept.find? fun (_, other) => other.start == edit.start && other.stop == edit.stop with
       | some (first, other) =>
           if other.replacement != edit.replacement then
@@ -1384,9 +1394,26 @@ private def batchRenameEdits (scan : ScannedFile) (renames : Array Rename) (with
       | none => kept := kept.push (r, edit)
   return .ok (kept.map (·.2))
 
+/-- The whole batch's edits for one scanned file, or a refusal: `checkedBatch` over a fresh
+    elaboration. -/
+private def batchRenameEdits (scan : ScannedFile) (renames : Array Rename) (withDefinition : Bool) :
+    Except String (Array Edit) :=
+  checkedBatch renames fun r => renameEdits scan r withDefinition
+
+/-- `checkedBatch` over index sites, so a batch the elaboration path refuses is refused here with
+    the same message. -/
+private def indexBatchRenameEdits (fileMap : FileMap) (source : String) (renames : Array Rename)
+    (sitesByDecl : Std.HashMap String (Array Query.Site)) : Except String (Array Edit) :=
+  checkedBatch renames fun r => indexRenameEdits fileMap source r (sitesByDecl.getD r.declName #[])
+
+/-- The lines `reportEdits` prints, as data: the index path collects them into the output shape a
+    forked child would have produced, so both paths print the identical report. -/
+private def reportLines (path source : String) (edits : Array Edit) : Array String :=
+  edits.map fun edit =>
+    s!"{path}:{edit.line}: {repr (String.Pos.Raw.extract source edit.start edit.stop)} -> {repr edit.replacement}"
+
 private def reportEdits (path source : String) (edits : Array Edit) : IO Unit := do
-  for edit in edits do
-    IO.println s!"{path}:{edit.line}: {repr (String.Pos.Raw.extract source edit.start edit.stop)} -> {repr edit.replacement}"
+  for line in reportLines path source edits do IO.println line
 
 /-- The info trees do not record EVERY occurrence — `unfold`'s arguments, among others, resolve
     without leaving a term reference — so a semantic pass can silently half-rename a file and only
@@ -1488,11 +1515,97 @@ private def forkPerFile (pattern : String) (childArgs : String → Array String)
     if output.exitCode != 0 then status := output.exitCode
   return status
 
-private def renameGlob (pattern : String) (renames : Array Rename) (apply : Bool) : IO UInt32 :=
-  forkPerFile pattern
-    (fun path => #["rename-file", path] ++ renameArgs renames ++
-      (if apply then #["--apply"] else #[]))
-    (mentioning := renames.map fun r => shortName r.declName)
+/-- The freshness guard.  A source file EDITED BUT NOT REBUILT has an unchanged `.ilean` whose
+    recorded positions have moved, so the index would point at stale text.  A file may use the
+    fast path only when its `.ilean` is at least as new as the source; a missing file of either
+    side also fails the guard.  `metadata` throws for a missing file, and the throw is the guard. -/
+private def ileanAtLeastAsNew (path : String) : IO Bool := do
+  let some moduleName := moduleNameOfPath path |>.toOption
+    | return false
+  let ileanPath := System.FilePath.mk ".lake/build/lib/lean" /
+    System.FilePath.mk (moduleName.replace "." "/" ++ ".ilean")
+  try
+    let sourceModified := (← (System.FilePath.mk path).metadata).modified
+    let ileanModified := (← ileanPath.metadata).modified
+    return match compare ileanModified sourceModified with
+      | .lt => false  -- source is newer than its `.ilean`: the positions may have moved
+      | _ => true
+  catch _ => return false
+
+/-- The whole fast-path file output, in the same shape a forked child would have produced: the
+    `reportEdits` lines and the preview note on stdout, a batch refusal on stderr, the same exit
+    codes as `renameReferences`.  No file is elaborated; the sites come from the index. -/
+private def fastRenameFileOutput (path : String) (renames : Array Rename)
+    (sitesByDecl : Std.HashMap String (Array Query.Site)) : IO IO.Process.Output := do
+  let source ← IO.FS.readFile path
+  let fileMap := (Parser.mkInputContext source path).fileMap
+  match indexBatchRenameEdits fileMap source renames sitesByDecl with
+  | .error message => return { stdout := "", stderr := s!"{path}: {message}", exitCode := 1 }
+  | .ok edits =>
+      if edits.isEmpty then
+        return { stdout := s!"{path}: no reference to {renameList renames}\n", stderr := "",
+                 exitCode := 0 }
+      let lines := (reportLines path source edits).map (· ++ "\n")
+      let lines := lines.push "preview only; pass --apply to write\n"
+      return { stdout := String.intercalate "" lines.toList, stderr := "", exitCode := 0 }
+
+/-- The index half of the glob driver: a silent refresh at the target repository's
+    `.lake/build/refactor-index.db`, then every rename's use sites grouped by source path.  Any
+    failure — no build directory, refresh throws — yields `none` and prints one line on stderr;
+    the caller then falls back to the per-file elaboration path, never aborting a rename because
+    the index is unavailable. -/
+private def indexSitesByPath (renames : Array Rename) :
+    IO (Option (Std.HashMap String (Std.HashMap String (Array Query.Site)))) := do
+  try
+    let buildDir := ".lake/build/lib/lean"
+    unless ← System.FilePath.isDir buildDir do
+      IO.eprintln s!"refactor index unavailable: {buildDir} does not exist; \
+        falling back to per-file elaboration"
+      return none
+    let dbPath := ".lake/build/refactor-index.db"
+    _ ← Index.refresh dbPath buildDir false
+    let mut byPath : Std.HashMap String (Std.HashMap String (Array Query.Site)) := {}
+    for r in renames do
+      let sites ← Query.useSitesByFile dbPath r.declName
+      for (path, fileSites) in sites do
+        let perDecl := byPath.getD path {}
+        byPath := byPath.insert path (perDecl.insert r.declName fileSites)
+    pure (some byPath)
+  catch e =>
+    IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
+    pure none
+
+/-- The glob driver.  In preview the index answers where the references are without elaborating
+    the files — a repository-wide rename spends its minutes recomputing what `lake build` already
+    wrote to `.ilean`, and the index holds exactly those positions.  A file takes the fast path
+    when the freshness guard passes, whether or not the index has sites there: a fresh index that
+    records nothing for the file is itself the "no reference" answer.  A file whose `.ilean` is
+    missing or older than its source is elaborated by a child as before — the index may be silent
+    where the elaborated file would speak.  `--apply` cannot use the fast path: applying
+    re-elaborates each file to verify the result, which is the elaboration the fast path skips. -/
+private def renameGlob (pattern : String) (renames : Array Rename) (apply noIndex : Bool) :
+    IO UInt32 := do
+  let mentioning := renames.map fun r => shortName r.declName
+  let fast? ← if apply || noIndex then pure none else indexSitesByPath renames
+  let selected ← globSelectedFiles pattern mentioning
+  if selected.isEmpty then return 1
+  let self := (← IO.appPath).toString
+  let childArgs := fun path => #["rename-file", path] ++ renameArgs renames ++
+    (if apply then #["--apply"] else #[])
+  let outputs ← mapFilesParallel (← scanJobs) selected fun path => do
+    match fast? with
+    | some byPath =>
+        if ← ileanAtLeastAsNew path then
+          fastRenameFileOutput path renames (byPath.getD path {})
+        else
+          IO.Process.output { cmd := self, args := childArgs path }
+    | none => IO.Process.output { cmd := self, args := childArgs path }
+  let mut status : UInt32 := 0
+  for output in outputs do
+    unless output.stdout.isEmpty do IO.print output.stdout
+    unless output.stderr.isEmpty do IO.eprint output.stderr
+    if output.exitCode != 0 then status := output.exitCode
+  return status
 
 /-! ## Renaming a declaration
 
@@ -1833,7 +1946,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor index [--full]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor index [--full]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -1899,11 +2012,23 @@ def main (args : List String) : IO UInt32 := do
       match parseRenames pairs with
       | .error message => IO.eprintln message; return 2
       | .ok renames => return ← renameReferences path moduleName renames apply
-  | "rename" :: "--glob" :: pattern :: rest =>
-      let (pairs, apply) := stripApply rest
-      match parseRenames pairs with
-      | .error message => IO.eprintln message; return 2
-      | .ok renames => return ← renameGlob pattern renames apply
+  | "rename" :: args =>
+      -- `--no-index` may appear anywhere in the argument list: it forces the glob driver onto
+      -- the per-file elaboration path so the two paths can be diffed against each other.
+      let noIndex := args.contains "--no-index"
+      let args := args.filter (· != "--no-index")
+      match args with
+      | "--glob" :: pattern :: rest =>
+          let (pairs, apply) := stripApply rest
+          match parseRenames pairs with
+          | .error message => IO.eprintln message; return 2
+          | .ok renames => return ← renameGlob pattern renames apply noIndex
+      | path :: moduleName :: rest =>
+          let (pairs, apply) := stripApply rest
+          match parseRenames pairs with
+          | .error message => IO.eprintln message; return 2
+          | .ok renames => return ← renameReferences path moduleName renames apply
+      | _ => IO.eprintln usage; return 2
   | "rename-decl" :: "--glob" :: pattern :: rest =>
       let (pairs, apply) := stripApply rest
       match parseRenames pairs with
@@ -1919,11 +2044,6 @@ def main (args : List String) : IO UInt32 := do
       return ← infixGlob pattern declName token true
   | ["infix-stage", path, declName, token, stagePath] =>
       return ← infixStage path declName token stagePath
-  | "rename" :: path :: moduleName :: rest =>
-      let (pairs, apply) := stripApply rest
-      match parseRenames pairs with
-      | .error message => IO.eprintln message; return 2
-      | .ok renames => return ← renameReferences path moduleName renames apply
   | ["rename-token", "--glob", pattern, oldToken, newToken] =>
       return ← renameTokenGlob pattern oldToken newToken false
   | ["rename-token", "--glob", pattern, oldToken, newToken, "--apply"] =>

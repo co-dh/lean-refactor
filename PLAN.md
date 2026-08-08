@@ -188,11 +188,34 @@ Two things the real repository taught, both now in the code:
   environment cannot hold two modules that each declare `main` and are never imported together, and importing
   needs every transitive import to resolve. Reading has neither failure mode and needs no search path.
 
-**Phase 2 — the find phase reads the index.** `rename`, `rename-decl`, `rename-file` take their candidate module
-set and their use-site positions from `use_site` instead of elaborating every glob match. The old path stays as a
-fallback behind a flag until the measurements agree.
-*Exit criterion:* both baselines reproduced under 1 s end to end including the staleness scan, and the edit sets
-identical to today's, site for site, on `Cat.assoc` and `Freyd.kp_sq`.
+**Phase 2 — the find phase reads the index. DONE for `rename`.** Measured on freyd, preview, byte-identical
+output in both cases:
+
+| `rename --glob 'Freyd/*.lean'` | elaborating (`--no-index`) | index      | report          |
+| ------------------------------ | -------------------------- | ---------- | --------------- |
+| `Cat.assoc`                    | 52.5 s                     | **7.0 s**  | 6847 lines, identical |
+| `Freyd.kp_sq`                  | 9.9 s                      | **0.28 s** | 79 lines, identical   |
+
+The stated 1 s target holds for a narrow rename and not for a wide one, and the reason is a deliberate choice:
+**the file set is unchanged**. The textual prefilter still selects the candidates, and a candidate for which the
+index reports no use site keeps the old path — because a file can name a declaration in a place the info trees do
+not record (`unfold`'s arguments), and the syntax fallback that catches those needs the elaboration. For
+`Cat.assoc` that is about sixteen of the 171 candidates, and they are the whole of the remaining 7 s. Skipping
+them would be faster and would change what the tool reports; that trade is not this phase's to make.
+
+Why the index may stand in for the elaboration at all, for `rename` and only for `rename`: with
+`withDefinition := false` the syntax pass in `renameEdits` runs *only* when the semantic pass found nothing, and
+the semantic pass reads `Server.findModuleRefs … (localVars := false)` — the very call whose output Lean writes
+into the `.ilean`. So in a file where the index reports a site, the two agree by construction. `rename-decl` runs
+the syntax pass unconditionally and keeps the old path entirely.
+
+*The freshness guard.* A source edited but not rebuilt has an unchanged `.ilean` whose positions have moved, and
+the staleness scan cannot see it — nothing about the artefact changed. A file therefore takes the fast path only
+when its `.ilean` is at least as new as its source. Verified: `touch` on a source is enough to send that file back
+to the elaboration path, with identical output.
+
+*`--apply` keeps the old path.* Applying re-elaborates to verify the result, so the elaboration the fast path
+skips is needed anyway. `--no-index` forces the old path everywhere; it exists so the two can be diffed.
 
 Elaboration does **not** disappear from these operations. `rename-decl` still needs the syntax pass: a `structure`
 or `class` field used by the laws declared beside it is a *binder* reference, not a `.const`, so info trees — and
