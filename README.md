@@ -33,6 +33,17 @@ files and namespaces, relocating them within a file, collapsing a duplicate onto
 or a whole declaration, adding and removing call arguments and parameters, and clearing unused-variable and
 unused-`simp`-argument warnings.
 
+Finding what to collapse is part of the same job, so it is the same tool:
+
+```sh
+lean-refactor dup                              # declarations that state the same thing
+lean-refactor dup --proof [--min-nodes 12]     # declarations that prove the same thing
+```
+
+A group is a candidate, not a task — nothing here checks that its members can see each other, or that
+the copy is not a deliberate weaker-hypothesis restatement. Members print in module order so a group
+with one obvious home reads apart from one spread over leaves that never import each other.
+
 **Run it from the target repository's root.** Paths are CWD-relative: the tool loads
 `.lake/build/lib/lean/<Module>.ilean` and verifies with `./scripts/cap lake build`, both resolved against the
 current directory. `scripts/lean-refactor` deliberately does not `cd` anywhere — it builds the tool in its own
