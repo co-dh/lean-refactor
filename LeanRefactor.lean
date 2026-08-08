@@ -1626,6 +1626,106 @@ private def usesReport (declName : String) : IO UInt32 := do
     for path in namedPaths do IO.println s!"    {path}"
   return 0
 
+/-! ## Adopting the module system
+
+`module` is opt-in per file, and adopting it takes three edits at once: the `module` keyword, every
+`import` turned into a `public import`, and `public` on each declaration something outside the file
+names.  The index answers the third — every `dep` edge whose using module is not the declaring one —
+and the first two are line-oriented.
+
+Every import becomes public, which is exactly what an import means today: without the module system
+it is transitively visible to everything downstream, so making them all public preserves the
+current meaning. Narrowing them is a separate pass, and once a repository is on the module system
+`lake shake` is the tool for it.
+
+The edits cannot disturb each other, because none of them is a line number. Each is a byte range
+into the source as read; `independentEdits` refuses any pair that overlaps; and `applyEdits` sorts
+DESCENDING on `start` and folds, so every edit still to be applied points exactly where it did when
+it was computed. -/
+
+/-- Where `public` goes in a declaration, or `none` when the source already says `private`/`public`.
+    `Lean.Parser.Command.declModifiers` fixes the order — docstring, attributes, VISIBILITY,
+    `protected`, `meta`/`noncomputable`, `unsafe`, `partial`/`nonrec` — so the slot is before the
+    first modifier that follows visibility, and before the declaration keyword when there is none. -/
+private def visibilityInsertion? (cmd : Syntax) : Option String.Pos.Raw := Id.run do
+  let some decl := cmd.find? (·.isOfKind ``Lean.Parser.Command.declaration) | return none
+  let mods := decl[0]
+  unless mods[2].getRange?.isNone do return none
+  for later in #[mods[3], mods[4], mods[5], mods[6], decl[1]] do
+    if let some range := later.getRange? then return some range.start
+  return none
+
+/-- The edits that put one file on the module system, as byte ranges into `source`. -/
+private def modularizeEdits (dbPath path source : String) (commands : Array Syntax) :
+    IO (Except String (Array Edit)) := do
+  let moduleName ← match moduleNameOfPath path with
+    | .ok name => pure name
+    | .error message => return .error message
+  let lines := source.splitOn "\n"
+  if lines.any (·.trimAsciiStart.toString.startsWith "module") then
+    return .error s!"{path}: already on the module system"
+  let mut edits : Array Edit := #[]
+  let mut offset : String.Pos.Raw := ⟨0⟩
+  let mut imports := 0
+  for line in lines do
+    -- Line-oriented and exact, as `rename-module`'s import edits are: only a module name follows the
+    -- keyword, so no docstring or declaration can match.
+    if line.trimAsciiStart.toString.startsWith "import " then
+      let imported := (line.trimAscii.toString.drop "import ".length).trimAscii.toString
+      -- `cannot import non-`module` X from `module`` — the conversion is not per-file: a file can
+      -- only become a module once everything it imports already is one, so the repository has to be
+      -- walked bottom-up through the import graph.  An import whose source is not in this repository
+      -- is Lean's own, which is already on the module system.
+      let importedPath := System.FilePath.mk (imported.replace "." "/" ++ ".lean")
+      if ← System.FilePath.pathExists importedPath then
+        let importedSource ← IO.FS.readFile importedPath
+        unless (importedSource.splitOn "\n").any (·.trimAsciiStart.toString.startsWith "module") do
+          return .error s!"{path}: `{imported}` ({importedPath}) is not a `module` yet, and a module \
+            cannot import one that is not; convert it first"
+      if imports == 0 then
+        edits := edits.push { start := offset, stop := offset, line := 0, replacement := "module\n\n" }
+      edits := edits.push { start := offset, stop := offset, line := 0, replacement := "public " }
+      imports := imports + 1
+    offset := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
+  -- A root module imports nothing, so there is no import line to hang the keyword on; it goes at the
+  -- very start, above the banner comment, which is the only position that needs no parsing.
+  if imports == 0 then
+    edits := edits.push { start := ⟨0⟩, stop := ⟨0⟩, line := 0, replacement := "module\n\n" }
+  let mut marked := 0
+  for declName in ← Query.publicDecls dbPath moduleName do
+    -- A name the index has but the file does not write is a projection or a derived instance; it
+    -- inherits its parent's visibility, so there is nothing to edit.
+    if let .ok cmd := declarationSyntax commands declName then
+      if let some slot := visibilityInsertion? cmd then
+        edits := edits.push { start := slot, stop := slot, line := 0, replacement := "public " }
+        marked := marked + 1
+  IO.println s!"{path}: `module`, {imports} public import(s), {marked} public declaration(s)"
+  return .ok edits
+
+/-- `lean-refactor modularize`: put one file on the module system, verifying that it still
+    elaborates. Visibility is the only thing here the index decides, and it decides it from the
+    dependency edges — a declaration is public exactly when something outside this file names it. -/
+private def modularize (path : String) (apply : Bool) : IO UInt32 := do
+  let some dbPath ← refreshedIndex? | return 1
+  initSearchPath (← findSysroot)
+  let (source, _, commands, _) ← elaborateFile path
+  let edits ← match ← modularizeEdits dbPath path source commands with
+    | .error message => IO.eprintln message; return 1
+    | .ok edits => pure edits
+  let (selected, deferred) := independentEdits edits
+  if deferred != 0 then
+    IO.eprintln s!"{path}: refusing {deferred} overlapping edit(s)"
+    return 1
+  unless apply do IO.println "preview only; pass --apply to write"; return 0
+  let updated := applyEdits source selected
+  IO.FS.writeFile path updated
+  unless ← fileElaboratesCleanly path updated do
+    IO.FS.writeFile path source
+    IO.eprintln s!"{path}: the modularised source does not elaborate; restored"
+    return 1
+  IO.println s!"applied {selected.size} edit(s) to {path}"
+  return 0
+
 /-- `lean-refactor dup`: declarations the index groups as saying, or proving, the same thing.
 
     Two keys, because they miss opposite things.  The STATEMENT key is the elaborated type up to
@@ -2026,13 +2126,15 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor dup\n  lean-refactor dup --proof [--min-nodes <n>]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor dup\n  lean-refactor dup --proof [--min-nodes <n>]\n  lean-refactor modularize <source.lean> [--apply]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
   | ["index"] => return ← Index.run false
   | ["index", "--full"] => return ← Index.run true
   | ["uses", declName] => return ← usesReport declName
+  | ["modularize", path] => return ← modularize path false
+  | ["modularize", path, "--apply"] => return ← modularize path true
   | ["dup"] => return ← dupReport false 0
   | ["dup", "--proof"] => return ← dupReport true 12
   | ["dup", "--proof", "--min-nodes", nodes] =>

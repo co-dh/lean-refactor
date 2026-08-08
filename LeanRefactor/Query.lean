@@ -130,6 +130,26 @@ public def statementGroups (dbPath : String) : IO (Array DupGroup) :=
 public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) :=
   groupsOn dbPath "proof_key" s!"and i.proof_nodes >= {minNodes}"
 
+/-- The declarations of `module` that the module system would have to mark `public`: the ones
+    something outside the module names, plus the notation and parser declarations.
+
+    A notation declaration has no incoming edge — downstream elaborated terms name the function the
+    notation expands to, never the parser constant — and the `.ilean` half records nothing for it
+    either, so the dependency rule alone would make it private and every downstream file would stop
+    parsing.  They are recognised instead by what they are: a declaration whose type mentions
+    `Lean.ParserDescr`.
+
+    Declarations the source already marks `private` are excluded: they are mangled to `_private.…`
+    and stay module-local either way. -/
+public def publicDecls (dbPath moduleName : String) : IO (Array String) := do
+  let m := escaped moduleName
+  let j ← Db.query dbPath s!"select i.name as m from decl_info i
+where i.module = '{m}' and i.internal = 0 and i.name not like '\\_private%' escape '\\'
+  and (exists (select 1 from dep d where d.dst = i.name and d.module != i.module)
+       or exists (select 1 from dep p where p.src = i.name and p.dst like 'Lean.%ParserDescr%'))
+order by i.name"
+  return (namedModules j)
+
 /-- The `module.source` path of every module, keyed by its `module.name` — the join the path-facing
     callers need when a query returns module names. -/
 public def moduleSources (dbPath : String) : IO (Std.HashMap String String) := do
