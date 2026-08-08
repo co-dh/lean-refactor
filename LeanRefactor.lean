@@ -1549,31 +1549,82 @@ private def fastRenameFileOutput (path : String) (renames : Array Rename)
       let lines := lines.push "preview only; pass --apply to write\n"
       return { stdout := String.intercalate "" lines.toList, stderr := "", exitCode := 0 }
 
-/-- The index half of the glob driver: a silent refresh at the target repository's
-    `.lake/build/refactor-index.db`, then every rename's use sites grouped by source path.  Any
-    failure — no build directory, refresh throws — yields `none` and prints one line on stderr;
-    the caller then falls back to the per-file elaboration path, never aborting a rename because
+/-- Refresh the target repository's index and return its database path.  Any failure — no build
+    directory, the refresh throws — prints the one-line unavailability note on stderr and returns
+    `none`; the callers then fall back to per-file elaboration, never aborting a rename because
     the index is unavailable. -/
-private def indexSitesByPath (renames : Array Rename) :
-    IO (Option (Std.HashMap String (Std.HashMap String (Array Query.Site)))) := do
+private def refreshedIndex? : IO (Option String) := do
+  let buildDir := ".lake/build/lib/lean"
+  unless ← System.FilePath.isDir buildDir do
+    IO.eprintln s!"refactor index unavailable: {buildDir} does not exist; \
+      falling back to per-file elaboration"
+    return none
+  let dbPath := ".lake/build/refactor-index.db"
   try
-    let buildDir := ".lake/build/lib/lean"
-    unless ← System.FilePath.isDir buildDir do
-      IO.eprintln s!"refactor index unavailable: {buildDir} does not exist; \
-        falling back to per-file elaboration"
-      return none
-    let dbPath := ".lake/build/refactor-index.db"
     _ ← Index.refresh dbPath buildDir false
+    pure (some dbPath)
+  catch e =>
+    IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
+    pure none
+
+/-- The index half of the glob driver: a silent refresh at the target repository's
+    `.lake/build/refactor-index.db`, then every rename's use sites grouped by source path, with the
+    database path for the callers that need it.  Any failure — no build directory, refresh throws —
+    yields `none` and prints one line on stderr; the caller then falls back to the per-file
+    elaboration path, never aborting a rename because the index is unavailable. -/
+private def indexSitesByPath (renames : Array Rename) :
+    IO (Option (String × Std.HashMap String (Std.HashMap String (Array Query.Site)))) := do
+  try
+    let some dbPath ← refreshedIndex? | return none
     let mut byPath : Std.HashMap String (Std.HashMap String (Array Query.Site)) := {}
     for r in renames do
       let sites ← Query.useSitesByFile dbPath r.declName
       for (path, fileSites) in sites do
         let perDecl := byPath.getD path {}
         byPath := byPath.insert path (perDecl.insert r.declName fileSites)
-    pure (some byPath)
+    pure (some (dbPath, byPath))
   catch e =>
     IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
     pure none
+
+/-- One warning line after a rename preview: modules that depend on `declName` without naming it
+    anywhere the info trees recorded — reached only through notation or macro expansion.  No edit is
+    needed there, the notation is declared once, but they must still compile: they are exactly the
+    modules a rename can break without touching.  The list is `lean-refactor uses`'s job; this is
+    one line. -/
+private def warnSilentDependents (dbPath declName : String) : IO Unit := do
+  let dependents ← Query.silentDependents dbPath declName
+  unless dependents.isEmpty do
+    IO.eprintln (s!"{dependents.size} module(s) depend on {declName} without naming it (notation or " ++
+      s!"macro expansion); no edit is needed there, but\n" ++
+      s!"  they must still compile — `lean-refactor uses {declName}` lists them")
+
+/-- `lean-refactor uses`: what the two halves of the index each see for `declName`, as source paths
+    — the modules with recorded use sites, the modules that depend without naming it, and the
+    modules that name it without depending on it.  A read-only report; the caller edits files, so
+    every module name is joined to its `module.source` path first. -/
+private def usesReport (declName : String) : IO UInt32 := do
+  let some dbPath ← refreshedIndex? | return 1
+  let sites ← Query.useModules dbPath declName
+  let dependents ← Query.dependentModules dbPath declName
+  let silent ← Query.silentDependents dbPath declName
+  let sources ← Query.moduleSources dbPath
+  let pathOf (module : String) : String := sources.getD module module
+  let used := (sites.map fun (module, count) => (pathOf module, count)).qsort (·.1 < ·.1)
+  let namedWithout := sites.filter fun (module, _) => !dependents.contains module
+  let namedPaths := (namedWithout.map (fun (module, _) => pathOf module)).qsort (· < ·)
+  let silentPaths := (silent.map pathOf).qsort (· < ·)
+  IO.println s!"{declName}: {sites.foldl (fun total (_, count) => total + count) 0} site(s) in {sites.size} module(s), {dependents.size} module(s) depend on it"
+  unless used.isEmpty do
+    IO.println "  used in:"
+    for (path, count) in used do IO.println s!"    {path}: {count}"
+  unless silentPaths.isEmpty do
+    IO.println s!"  depend without naming it ({silentPaths.size}):"
+    for path in silentPaths do IO.println s!"    {path}"
+  unless namedPaths.isEmpty do
+    IO.println s!"  name it without depending on it ({namedPaths.size}):"
+    for path in namedPaths do IO.println s!"    {path}"
+  return 0
 
 /-- The glob driver.  In preview the index answers where the references are without elaborating
     the files — a repository-wide rename spends its minutes recomputing what `lake build` already
@@ -1594,7 +1645,7 @@ private def renameGlob (pattern : String) (renames : Array Rename) (apply noInde
     (if apply then #["--apply"] else #[])
   let outputs ← mapFilesParallel (← scanJobs) selected fun path => do
     match fast? with
-    | some byPath =>
+    | some (_, byPath) =>
         if ← ileanAtLeastAsNew path then
           fastRenameFileOutput path renames (byPath.getD path {})
         else
@@ -1605,6 +1656,8 @@ private def renameGlob (pattern : String) (renames : Array Rename) (apply noInde
     unless output.stdout.isEmpty do IO.print output.stdout
     unless output.stderr.isEmpty do IO.eprint output.stderr
     if output.exitCode != 0 then status := output.exitCode
+  if let some (dbPath, _) := fast? then
+    for r in renames do warnSilentDependents dbPath r.declName
   return status
 
 /-! ## Renaming a declaration
@@ -1692,10 +1745,14 @@ private def stagedGlob (pattern description : String) (childArgs : String → St
   IO.println s!"{description}: {stagedFiles.size} file(s); build passed"
   return 0
 
-private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : Bool) : IO UInt32 :=
-  stagedGlob pattern s!"renamed {renameList renames}"
+private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : Bool) : IO UInt32 := do
+  let dbPath? ← refreshedIndex?
+  let status ← stagedGlob pattern s!"renamed {renameList renames}"
     (fun path stage => #["rename-decl-stage", path, stage] ++ renameArgs renames) apply
     (mentioning := renames.map fun r => shortName r.declName)
+  if let some dbPath := dbPath? then
+    for r in renames do warnSilentDependents dbPath r.declName
+  return status
 
 /-! ## Token renaming (syntax-atom-anchored, for notation)
 
@@ -1946,12 +2003,13 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor index [--full]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
   | ["index"] => return ← Index.run false
   | ["index", "--full"] => return ← Index.run true
+  | ["uses", declName] => return ← usesReport declName
   | ["lint-book-file", path] =>
       return ← lintBookFile path
   | ["lint-book", "--glob", pattern] =>

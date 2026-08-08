@@ -222,12 +222,29 @@ or `class` field used by the laws declared beside it is a *binder* reference, no
 therefore the index — do not record it. What changes is that the syntax pass runs on the handful of files the index
 named, not on every file whose text happens to contain the short name.
 
-**Phase 3 — the capabilities the index adds.**
-* *Blast radius.* `select distinct module from dep where dst = ?` — the file
-  set that can stop compiling. Drives verification scope, so a local change need not trigger a whole-repository
-  build.
-* *Notation-backed renames.* Today a constant reached only through notation has no recorded use sites, so the token
-  pass runs over a textual glob. `dep(dst)` gives the exact module list first.
+**Phase 3 — say what each half sees. DONE.** `lean-refactor uses <declaration>` reports, from the index, the
+files with recorded use sites, the files that depend on the declaration without naming it, and the files that name
+it without depending on it. A rename prints one stderr line when the second set is non-empty.
+
+Neither set contains the other, and both directions are real:
+
+```
+Cat.comp:    178 site(s) in  53 module(s), 330 module(s) depend on it   → 281 depend without naming it
+Cat.assoc:  7059 site(s) in 190 module(s), 178 module(s) depend on it   →  12 name it without depending on it
+Freyd.kp_sq:  63 site(s) in  15 module(s),  15 module(s) depend on it   → neither, a declaration with nothing hidden
+```
+
+* **Depend without naming it** — reached through notation or macro expansion, which elaborates to a synthetic
+  identifier with no source position, so the `.ilean` half records nothing. Renaming `Cat.comp` edits 53 files and
+  can break 330. No edit is needed in the other 281, because the notation is declared once, but they must still
+  compile — and until now nothing in the toolchain could say so.
+* **Name it without depending on it** — the occurrence supplies rather than consumes. `AOP/A6_1_RelSet.lean:46`
+  writes `assoc R S T := …`, defining the structure field inside an instance, so the source names it and the term
+  depends on nothing.
+
+The blast-radius query was going to drive verification scope as well; it does not, and should not. `lake build` is
+already incremental, so it rebuilds exactly that cone anyway — the query's value is telling a person what they are
+about to disturb, not telling the build what to do.
 
 ## Non-goals
 
