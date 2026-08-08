@@ -1,0 +1,16 @@
+name = "lean-refactor"
+version = "0.1.0"
+keywords = ["lean4", "refactor", "tooling"]
+defaultTargets = ["lean-refactor"]
+
+# No `require`: the tool reads `.ilean` reference data and elaborates target files with Lean core
+# only, so it stays dependency-free and builds in seconds.
+
+[leanOptions]
+pp.unicode.fun = true
+relaxedAutoImplicit = false
+
+[[lean_exe]]
+name = "lean-refactor"
+root = "LeanRefactor"
+supportInterpreter = true # the tool re-elaborates target sources in-process (`Elab.IO.processCommands`)

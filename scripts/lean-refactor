@@ -1,9 +1,18 @@
 #!/bin/sh
-# lean-refactor — the refactoring tool, run under `cap`'s address-space limit.
+# lean-refactor — run the refactoring tool against the repository in the CURRENT directory.
 #
-# Belt to `claimElaboration`'s braces (Freyd/tool/LeanRefactor.lean): that guard catches the KNOWN
-# way to accumulate Lean `Environment`s — looping over files in one process — but not a runaway that
-# is not a file loop. The cap lives in `scripts/cap` because the same hazard applies to every
-# long-running Lean process, not just this tool; see the reasoning and the measurements there.
-cd "$(dirname "$0")/.." || exit 1
-exec ./scripts/cap lake exe lean-refactor "$@"
+# The tool is CWD-relative by design: it loads `.lake/build/lib/lean/<Module>.ilean` from the
+# repository being edited and verifies edits with that repository's build, so this script must NOT
+# cd into the tool's own root. It builds the tool there and comes back.
+#
+# `lake env` supplies the TARGET repository's LEAN_PATH (and the interpreter's LD_LIBRARY_PATH), which
+# is what lets the tool import the headers of the files it edits. Target and tool must therefore be on
+# the same toolchain; a mismatch shows up as an olean version error.
+#
+# `cap` bounds address space: belt to `claimElaboration`'s braces (LeanRefactor.lean), which catches
+# the KNOWN way to accumulate Lean `Environment`s — looping over files in one process — but not a
+# runaway that is not a file loop. See the measurements in scripts/cap.
+root=$(dirname "$(dirname "$(readlink -f "$0")")")
+bin=$root/.lake/build/bin/lean-refactor
+[ -x "$bin" ] || (cd "$root" && ./scripts/cap lake build) || exit 1
+exec "$root/scripts/cap" lake env "$bin" "$@"
