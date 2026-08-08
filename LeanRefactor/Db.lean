@@ -15,8 +15,12 @@ public def recordSep : String := "\x1e"
 public def row (cells : Array String) : String :=
   String.intercalate fieldSep cells.toList
 
-/-- The schema version stored in `meta`. Bump when `schemaSql` changes. -/
-public def schemaVersion : String := "1"
+/-- The schema version stored in `meta`. Bump when `schemaSql` changes, and also whenever a stored
+    column changes MEANING rather than shape.
+    `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
+    the modules whose artefacts changed, so after a keying change the untouched modules would keep
+    rows computed by the old algorithm and a grouping query would silently mix two generations. -/
+public def schemaVersion : String := "2"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
@@ -37,9 +41,12 @@ create table decl_range (
 );
 
 create table decl_info (
-  name text, module text,
+  name text, user_name text, module text,
   kind text,
-  type_key integer,
+  stmt_key integer,
+  proof_key integer,
+  proof_nodes int,
+  internal int,
   primary key (name, module)
 );
 
@@ -58,7 +65,8 @@ create index i_use_name   on use_site(name);
 create index i_use_module on use_site(use_module);
 create index i_dep_dst    on dep(dst);
 create index i_dep_src    on dep(src);
-create index i_decl_key   on decl_info(type_key);
+create index i_decl_stmt  on decl_info(stmt_key);
+create index i_decl_proof on decl_info(proof_key);
 "
 
 /-- Spawn `sqlite3` with `extraArgs`, feeding it `sql` from the temp file `tmp` via `.read`.

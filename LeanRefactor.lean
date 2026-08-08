@@ -1626,6 +1626,29 @@ private def usesReport (declName : String) : IO UInt32 := do
     for path in namedPaths do IO.println s!"    {path}"
   return 0
 
+/-- `lean-refactor dup`: declarations the index groups as saying, or proving, the same thing.
+
+    Two keys, because they miss opposite things.  The STATEMENT key is the elaborated type up to
+    binder and universe renaming (type and body for a definition): equal keys are the same fact,
+    however it was proved.  The PROOF key is the structural skeleton of the value — the application
+    tree and the constants it calls — which finds a copy-pasted-then-adapted proof whose statement
+    changed, and which no type-keyed pass can see.
+
+    A group is a candidate, not a task.  Members are printed in module order so a group with one
+    obvious home reads apart from one spread over leaves that never import each other, and nothing
+    here checks whether a member can even see the others. -/
+private def dupReport (proofs : Bool) (minNodes : Nat) : IO UInt32 := do
+  let some dbPath ← refreshedIndex? | return 1
+  let groups ← if proofs then Query.proofGroups dbPath minNodes else Query.statementGroups dbPath
+  let what := if proofs then s!"same proof (≥ {minNodes} skeleton nodes)" else "same statement"
+  IO.println s!"{groups.size} group(s) with the {what}"
+  for group in groups do
+    let modules := group.members.foldl (fun (s : Std.HashSet String) (_, _, m) => s.insert m) ∅
+    IO.println s!"  {group.members.size}× in {modules.size} module(s):"
+    for (name, source, _) in group.members do
+      IO.println s!"    {name}  ({source})"
+  return 0
+
 /-- The glob driver.  In preview the index answers where the references are without elaborating
     the files — a repository-wide rename spends its minutes recomputing what `lake build` already
     wrote to `.ilean`, and the index holds exactly those positions.  A file takes the fast path
@@ -2003,13 +2026,18 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor dup\n  lean-refactor dup --proof [--min-nodes <n>]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
   | ["index"] => return ← Index.run false
   | ["index", "--full"] => return ← Index.run true
   | ["uses", declName] => return ← usesReport declName
+  | ["dup"] => return ← dupReport false 0
+  | ["dup", "--proof"] => return ← dupReport true 12
+  | ["dup", "--proof", "--min-nodes", nodes] =>
+      let some n := nodes.toNat? | IO.eprintln s!"invalid --min-nodes value `{nodes}`"; return 2
+      return ← dupReport true n
   | ["lint-book-file", path] =>
       return ← lintBookFile path
   | ["lint-book", "--glob", pattern] =>

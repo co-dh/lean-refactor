@@ -82,6 +82,54 @@ except select distinct use_module from use_site where name = '{escaped declName}
 order by 1"
   return (namedModules j)
 
+/-- One group of declarations that share a key: what they have in common, and each member as
+    `user-name`, source path and module. -/
+public structure DupGroup where
+  members : Array (String × String × String)
+
+/-- `select` over `decl_info` joined to its source path, collected into groups of two or more.
+    `keyColumn` is the column the group is formed on; `extra` narrows the rows first. -/
+private def groupsOn (dbPath keyColumn extra : String) : IO (Array DupGroup) := do
+  -- Notation and parser declarations (`«term_∩_»` and friends) share one elaborator skeleton by the
+  -- dozen and say nothing about duplication, so they never enter a group.
+  let sql := s!"with d as (
+  select i.user_name as u, m.source as s, i.module as md, i.{keyColumn} as k
+  from decl_info i join module m on m.name = i.module
+  where i.internal = 0 and i.{keyColumn} != '' and i.user_name not like '%.«term%'
+    and i.user_name not like '%.term\\_%' escape '\\' {extra}
+)
+select k, group_concat(u, char(31)) as us, group_concat(s, char(31)) as ss,
+       group_concat(md, char(31)) as ms
+from d group by k having count(*) > 1 order by count(*) desc, k"
+  let j ← Db.query dbPath sql
+  match j with
+  | .arr rows =>
+      let mut out := #[]
+      for row in rows do
+        let us := (row.getObjValAs? String "us").toOption.getD ""
+        let ss := (row.getObjValAs? String "ss").toOption.getD ""
+        let ms := (row.getObjValAs? String "ms").toOption.getD ""
+        let names := us.splitOn "\x1f"
+        let sources := ss.splitOn "\x1f"
+        let modules := ms.splitOn "\x1f"
+        if names.length == sources.length && names.length == modules.length then
+          -- Module order, so "one canonical plus its stragglers" reads apart from "N independent leaves".
+          let members := (names.zip (sources.zip modules)).toArray
+          out := out.push { members := members.qsort fun a b => a.2.2 < b.2.2 }
+      return out
+  | _ => return #[]
+
+/-- Declarations stating the same thing: equal `stmt_key` is the elaborated statement up to binder
+    and universe renaming, so for a theorem it is the same fact however it was proved, and for a
+    definition it is type AND body, i.e. a copy-paste. -/
+public def statementGroups (dbPath : String) : IO (Array DupGroup) :=
+  groupsOn dbPath "stmt_key" ""
+
+/-- Declarations with the same proof, whatever their statements say. Proofs below `minNodes` distinct
+    skeleton nodes are dropped: short ones collide en masse and carry no signal. -/
+public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) :=
+  groupsOn dbPath "proof_key" s!"and i.proof_nodes >= {minNodes}"
+
 /-- The `module.source` path of every module, keyed by its `module.name` — the join the path-facing
     callers need when a query returns module names. -/
 public def moduleSources (dbPath : String) : IO (Std.HashMap String String) := do
