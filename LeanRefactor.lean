@@ -1655,12 +1655,14 @@ private def visibilityInsertion? (cmd : Syntax) : Option String.Pos.Raw := Id.ru
     if let some range := later.getRange? then return some range.start
   return none
 
-/-- The edits that put one file on the module system, as byte ranges into `source`. -/
-private def modularizeEdits (dbPath path source : String) (commands : Array Syntax) :
-    IO (Except String (Array Edit)) := do
-  let moduleName ← match moduleNameOfPath path with
-    | .ok name => pure name
-    | .error message => return .error message
+/-- The edits that put one file on the module system, as byte ranges into `source`.  With
+    `checkImports`, refuse an import that is not yet a module — right for one file, wrong for a
+    batch, where the whole set becomes a module together and only the final build can judge.
+    `publics` are the declarations the index says something outside the file names; the CALLER
+    reads them from the index, so the batch's forked stage children never run sqlite: Db's
+    invocations share one temp file, and concurrent processes corrupt each other's reads. -/
+private def modularizeEdits (path source : String) (publics : Array String) (commands : Array Syntax)
+    (checkImports : Bool) : IO (Except String (Array Edit)) := do
   let lines := source.splitOn "\n"
   if lines.any (·.trimAsciiStart.toString.startsWith "module") then
     return .error s!"{path}: already on the module system"
@@ -1675,13 +1677,15 @@ private def modularizeEdits (dbPath path source : String) (commands : Array Synt
       -- `cannot import non-`module` X from `module`` — the conversion is not per-file: a file can
       -- only become a module once everything it imports already is one, so the repository has to be
       -- walked bottom-up through the import graph.  An import whose source is not in this repository
-      -- is Lean's own, which is already on the module system.
-      let importedPath := System.FilePath.mk (imported.replace "." "/" ++ ".lean")
-      if ← System.FilePath.pathExists importedPath then
-        let importedSource ← IO.FS.readFile importedPath
-        unless (importedSource.splitOn "\n").any (·.trimAsciiStart.toString.startsWith "module") do
-          return .error s!"{path}: `{imported}` ({importedPath}) is not a `module` yet, and a module \
-            cannot import one that is not; convert it first"
+      -- is Lean's own, which is already on the module system.  A batch skips the check: the whole
+      -- set becomes a module together, so it would only refuse files that the set itself fixes.
+      if checkImports then
+        let importedPath := System.FilePath.mk (imported.replace "." "/" ++ ".lean")
+        if ← System.FilePath.pathExists importedPath then
+          let importedSource ← IO.FS.readFile importedPath
+          unless (importedSource.splitOn "\n").any (·.trimAsciiStart.toString.startsWith "module") do
+            return .error s!"{path}: `{imported}` ({importedPath}) is not a `module` yet, and a module \
+              cannot import one that is not; convert it first"
       if imports == 0 then
         edits := edits.push { start := offset, stop := offset, line := 0, replacement := "module\n\n" }
       edits := edits.push { start := offset, stop := offset, line := 0, replacement := "public " }
@@ -1692,7 +1696,7 @@ private def modularizeEdits (dbPath path source : String) (commands : Array Synt
   if imports == 0 then
     edits := edits.push { start := ⟨0⟩, stop := ⟨0⟩, line := 0, replacement := "module\n\n" }
   let mut marked := 0
-  for declName in ← Query.publicDecls dbPath moduleName do
+  for declName in publics do
     -- A name the index has but the file does not write is a projection or a derived instance; it
     -- inherits its parent's visibility, so there is nothing to edit.
     if let .ok cmd := declarationSyntax commands declName then
@@ -1709,7 +1713,9 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   let some dbPath ← refreshedIndex? | return 1
   initSearchPath (← findSysroot)
   let (source, _, commands, _) ← elaborateFile path
-  let edits ← match ← modularizeEdits dbPath path source commands with
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let publics ← Query.publicDecls dbPath moduleName
+  let edits ← match ← modularizeEdits path source publics commands true with
     | .error message => IO.eprintln message; return 1
     | .ok edits => pure edits
   let (selected, deferred) := independentEdits edits
@@ -1724,6 +1730,29 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
     IO.eprintln s!"{path}: the modularised source does not elaborate; restored"
     return 1
   IO.println s!"applied {selected.size} edit(s) to {path}"
+  return 0
+
+/-- Analyse one file for the batch driver and write the edits to `stagePath`, never to `path`.
+    `publics` come from the parent, which read the index before forking.  Exit 3 means the file is
+    already a module, which is not a failure for a batch.  There is no per-file verify here:
+    mid-batch a converted file's imports are not yet rebuilt, so the one repository build at the
+    end is the gate. -/
+private def modularizeStage (path stagePath : String) (publics : Array String) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let (source, _, commands, _) ← elaborateFile path
+  let edits ← match ← modularizeEdits path source publics commands false with
+    | .error message =>
+        if message.endsWith "already on the module system" then
+          IO.println message
+          return 3
+        IO.eprintln message
+        return 1
+    | .ok edits => pure edits
+  let (selected, deferred) := independentEdits edits
+  if deferred != 0 then
+    IO.eprintln s!"{path}: refusing {deferred} overlapping edit(s)"
+    return 1
+  IO.FS.writeFile stagePath (applyEdits source selected)
   return 0
 
 /-- `lean-refactor dup`: declarations the index groups as saying, or proving, the same thing.
@@ -1876,6 +1905,20 @@ private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : 
   if let some dbPath := dbPath? then
     for r in renames do warnSilentDependents dbPath r.declName
   return status
+
+/-- `lean-refactor modularize --glob`: put every file matching the pattern on the module system
+    together, staging per file and swapping all in at once — the shape `rename-decl` uses for
+    exactly this situation.  The index is read HERE, in the parent, and each child receives its
+    declarations as arguments: Db's sqlite3 invocations share one temp file, so the forked stage
+    children must never run sqlite against it concurrently. -/
+private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
+  let some dbPath ← refreshedIndex? | return 1
+  let mut publics : Std.HashMap String (Array String) := {}
+  for path in ← globSelectedFiles pattern do
+    let moduleName ← IO.ofExcept (moduleNameOfPath path)
+    publics := publics.insert path (← Query.publicDecls dbPath moduleName)
+  stagedGlob pattern "put on the module system"
+    (fun path stage => #["modularize-stage", path, stage] ++ publics.getD path #[]) apply
 
 /-! ## Token renaming (syntax-atom-anchored, for notation)
 
@@ -2126,15 +2169,18 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor dup\n  lean-refactor dup --proof [--min-nodes <n>]\n  lean-refactor modularize <source.lean> [--apply]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
+  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor dup\n  lean-refactor dup --proof [--min-nodes <n>]\n  lean-refactor modularize <source.lean> [--apply]\n  lean-refactor modularize --glob '<pattern>' [--apply]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
   | ["index"] => return ← Index.run false
   | ["index", "--full"] => return ← Index.run true
   | ["uses", declName] => return ← usesReport declName
+  | ["modularize", "--glob", pattern] => return ← modularizeGlob pattern false
+  | ["modularize", "--glob", pattern, "--apply"] => return ← modularizeGlob pattern true
   | ["modularize", path] => return ← modularize path false
   | ["modularize", path, "--apply"] => return ← modularize path true
+  | "modularize-stage" :: path :: stagePath :: publics => return ← modularizeStage path stagePath publics.toArray
   | ["dup"] => return ← dupReport false 0
   | ["dup", "--proof"] => return ← dupReport true 12
   | ["dup", "--proof", "--min-nodes", nodes] =>
