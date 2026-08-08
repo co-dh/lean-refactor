@@ -33,25 +33,42 @@ private def kindOf (ci : ConstantInfo) : Option String :=
 private def typeKey (e : Expr) : String :=
   toString (e.hash &&& 0x7fffffffffffffff)
 
-/-- Import `modules` — ONE environment, in this one process — and produce rows for exactly those modules.
-    Modules that are not found in the environment header are skipped, not an error. -/
-public def ofModules (modules : Array Name) : IO Rows := do
-  initSearchPath (← findSysroot)
-  -- `importModules` throws on a module whose `.olean` is not in the search path; drop those first.
-  let modules ← modules.filterM fun n => do
-    try
-      _ ← findOLean n
-      pure true
-    catch _ =>
-      pure false
-  let env ← importModules (modules.map fun n => { module := n, importAll := true }) {}
-  let names := env.header.moduleNames
-  let data := env.header.moduleData
+/-- The `.olean` files of one module under `buildDir`, in the order the module system saves them:
+    the main part, then the server and private parts when the module is split. -/
+private def oleanParts (buildDir : String) (mod : Name) : Array System.FilePath :=
+  let base := System.FilePath.mk (buildDir ++ "/" ++ (toString mod).replace "." "/")
+  #[base.addExtension "olean", base.addExtension "olean.server", base.addExtension "olean.private"]
+
+/-- The constants of one module from its parts, one entry per name. The parts overlap: the private
+    part holds every constant, the exported and server parts the exported subset, with definitions
+    weakened to axioms. The private part comes last, so the last occurrence wins and the weakened
+    forms are discarded. -/
+private def moduleConstants (datas : Array ModuleData) : Array ConstantInfo :=
+  let byName : Std.HashMap Name ConstantInfo := {}
+  (datas.foldl (fun m data => data.constants.foldl (fun m ci => m.insert ci.name ci) m) byName).valuesArray
+
+/-- Read each module's `.olean` under `buildDir` — no environment, no imports, no search path — and produce its
+    rows. A module whose `.olean` is missing or unreadable is skipped, not an error. -/
+public def ofModules (modules : Array Name) (buildDir : String := ".lake/build/lib/lean") : IO Rows := do
   let mut declInfos := #[]
   let mut deps := #[]
   for mod in modules do
-    let some idx := names.idxOf? mod | continue
-    for ci in data[idx]!.constants do
+    let parts ← (oleanParts buildDir mod).filterM fun p => do System.FilePath.pathExists p
+    if parts.isEmpty then continue
+    -- A split module's parts share compacted data, so they must be read together; if that fails, the
+    -- main part alone still holds every constant.
+    let datas ←
+      if parts.size == 1 then
+        let part ← readModuleData parts[0]!
+        pure #[part.1]
+      else
+        try
+          let mdps ← readModuleDataParts parts
+          pure (mdps.map (·.1))
+        catch _ =>
+          let part ← readModuleData parts[0]!
+          pure #[part.1]
+    for ci in moduleConstants datas do
       let some kind := kindOf ci | continue
       let name := toString ci.name
       declInfos := declInfos.push s!"{name}{fieldSep}{toString mod}{fieldSep}{kind}{fieldSep}{typeKey ci.type}"
