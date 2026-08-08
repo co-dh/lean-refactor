@@ -162,18 +162,31 @@ selected source file has no built `.ilean`, say so and exit non-zero, naming the
 
 ## Phases
 
-**Phase 0 — measure and settle the two unknowns.** (a) Time a full `.olean` extraction over the whole repository;
-it is the one number with no baseline, and it bounds the worst-case incremental cost. (b) Determine empirically
-whether `.hash` files are content hashes of the artifact or trace hashes of its inputs: `touch` a base module,
-rebuild, and see how far the hash changes propagate. If they are input traces, an edit to a base module invalidates
-its whole downstream cone and incremental degrades toward full — acceptable, but say so. Fallback if needed: hash
-the artifact bytes directly (67 MB total, under a second).
+**Phase 0 — measure and settle the two unknowns. DONE.**
 
-**Phase 1 — indexer, no behaviour change.** `lean-refactor index` builds and refreshes the database. Nothing else
-reads it yet.
-*Exit criterion:* full build, then touch one module and refresh incrementally, then full rebuild — the incremental
-database and the rebuilt database must be identical modulo row order. This equivalence is the whole correctness
-argument for the partition invariant; it is not optional.
+(a) A full index of freyd — 495 modules, both halves — takes **2.5 s**, and an unchanged re-scan **13 ms**. The
+database is 147 MB: 12,335 declaration ranges, 303,333 use sites, 28,104 declarations, 541,427 edges. Against the
+52.09 s that a repository-wide rename spends locating its sites, the whole index costs less than one twentieth of
+one such run.
+
+(b) The `.hash` files are **per-artefact content hashes**, not trace hashes of inputs. Two measurements: `touch`
+plus a rebuild changes no hash and re-extracts nothing, and a real edit to one module re-extracts exactly that
+module — its downstream cone stays valid. So incremental never degrades toward full, and the fallback of hashing
+artefact bytes ourselves is unnecessary.
+
+**Phase 1 — indexer, no behaviour change. DONE.** `lean-refactor index [--full]` builds and refreshes the
+database. Nothing else reads it yet.
+*Exit criterion, met:* full build, then a real edit to one module, refresh incrementally, then full rebuild — all
+five tables identical modulo row order, and reverting the edit removes the rows again. A `touch` is not a test:
+it changes no content, so it changes no hash and exercises nothing.
+
+Two things the real repository taught, both now in the code:
+
+* An artefact whose source file is gone is skipped and counted, never silently dropped. freyd's `.lake` held 583
+  `Fredy/*.ilean` from an old rename, one of which still imported a package the repository no longer requires.
+* The `.olean` half reads each module's file directly rather than importing a batch into one environment. An
+  environment cannot hold two modules that each declare `main` and are never imported together, and importing
+  needs every transitive import to resolve. Reading has neither failure mode and needs no search path.
 
 **Phase 2 — the find phase reads the index.** `rename`, `rename-decl`, `rename-file` take their candidate module
 set and their use-site positions from `use_site` instead of elaborating every glob match. The old path stays as a
