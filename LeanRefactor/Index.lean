@@ -111,15 +111,26 @@ private def moduleCount (dbPath : String) : IO Nat := do
       return 0
   | _ => return 0
 
+/-- A build directory outlives the sources that produced it: renaming `Fredy` to `Freyd` left 583
+    `Fredy/*.ilean` behind in this repository's `.lake`, one of which still imports a package that is
+    no longer required, so importing the scan as a whole failed outright.  An artefact whose source
+    file is gone is not part of the repository being indexed — it cannot be edited, so nothing that
+    reads this index can act on it.  Dropped, never silently: the count is reported. -/
+private def withSources (scanned : Array Module) : IO (Array Module × Nat) := do
+  let mut kept := #[]
+  for m in scanned do
+    if ← System.FilePath.pathExists (System.FilePath.mk m.source) then kept := kept.push m
+  return (kept, scanned.size - kept.size)
+
 /-- Refresh the index at `dbPath`, scanning `buildDir`. With `full := true`, discard the database first.
-    Returns (modules re-extracted, modules dropped). -/
-public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat) := do
+    Returns (modules re-extracted, modules dropped, source-less artefacts skipped). -/
+public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × Nat) := do
   if full then
     -- Drop the WAL and SHM too, so a stale write-ahead log cannot be replayed into the fresh file.
     for f in #[dbPath, dbPath ++ "-wal", dbPath ++ "-shm"] do
       try IO.FS.removeFile f catch _ => pure ()
   _ ← Db.ensureSchema dbPath
-  let scanned ← scanDir buildDir ""
+  let (scanned, orphaned) ← withSources (← scanDir buildDir "")
   let stored ← storedModules dbPath
   let stale := staleModules scanned stored
   let removed := removedModules scanned stored
@@ -132,14 +143,19 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat) :=
     useSites := useSites ++ rows.useSites
   -- ONE import for the whole stale set: the memory rule of this project is one environment per
   -- refresh, never one per module.
+  -- One import for the whole batch means one unimportable module takes the batch with it, so say
+  -- which repository state caused it rather than letting Lean's bare search-path error surface.
   let oleanRows ← if stale.isEmpty then pure { declInfos := #[], deps := #[] } else
-    OleanRows.ofModules (stale.map (·.srcName))
+    try OleanRows.ofModules (stale.map (·.srcName))
+    catch e => throw <| IO.userError s!"cannot import the modules to index: {e}\n\
+      the build directory holds an artefact whose imports no longer resolve; \
+      rebuild with `lake build`, or delete the stale artefacts under {buildDir}"
   Db.importRows dbPath "decl_range" declRanges
   Db.importRows dbPath "use_site" useSites
   Db.importRows dbPath "decl_info" oleanRows.declInfos
   Db.importRows dbPath "dep" oleanRows.deps
   Db.importRows dbPath "module" (stale.map fun m => Db.row #[m.name, m.source, m.ileanHash, m.oleanHash])
-  return (stale.size, removed.size)
+  return (stale.size, removed.size, orphaned)
 
 /-- `lean-refactor index [--full]`: refresh and print a one-line summary. Returns the process exit code. -/
 public def run (full : Bool) : IO UInt32 := do
@@ -149,10 +165,11 @@ public def run (full : Bool) : IO UInt32 := do
     return 1
   let dbPath := ".lake/build/refactor-index.db"
   let t0 ← IO.monoMsNow
-  let (reExtracted, dropped) ← refresh dbPath buildDir full
+  let (reExtracted, dropped, orphaned) ← refresh dbPath buildDir full
   let elapsed := (← IO.monoMsNow) - t0
   let scanned ← moduleCount dbPath
-  IO.println s!"indexed {scanned} module(s): {reExtracted} re-extracted, {dropped} dropped, in {elapsed} ms"
+  IO.println s!"indexed {scanned} module(s): {reExtracted} re-extracted, {dropped} dropped, \
+    {orphaned} skipped as source-less artefacts, in {elapsed} ms"
   return 0
 
 end LeanRefactor.Index
