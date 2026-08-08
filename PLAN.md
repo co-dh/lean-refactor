@@ -61,13 +61,19 @@ create table module (
   olean_hash text
 );
 
-create table decl (                        -- from .ilean decls (ranges) + .olean (kind, type_key)
-  name    text, module text,
-  kind    text,                            -- thm | def | axiom | ind | opaque
-  type_key integer,                        -- alpha/universe-normalised statement hash; equal keys = duplicates
+-- One producer per table, so the partitioned delete never has two writers for one row.
+create table decl_range (                  -- from .ilean
+  name text, module text,
   l1 int, c1 int, l2 int, c2 int,          -- whole declaration, including its docstring
   sl1 int, sc1 int, sl2 int, sc2 int,      -- the name itself (selection range)
   primary key (name, module)               -- NOT name alone: orphan modules can define the same name
+);
+
+create table decl_info (                   -- from .olean
+  name text, module text,
+  kind text,                               -- thm | def | axiom | ind | opaque
+  type_key integer,                        -- statement hash; equal keys are duplicate candidates
+  primary key (name, module)
 );
 
 create table use_site (                    -- from .ilean references
@@ -83,10 +89,13 @@ create table dep (src text, dst text, module text);   -- module = owner of src, 
 
 create index i_use_name   on use_site(name);
 create index i_use_module on use_site(use_module);
-create index i_dep_dst    on dep(dst);        -- blast radius: who depends on X
+create index i_dep_dst    on dep(dst);             -- blast radius: who depends on X
 create index i_dep_src    on dep(src);
-create index i_decl_key   on decl(type_key);  -- duplicate detection
+create index i_decl_key   on decl_info(type_key);  -- duplicate detection
 ```
+
+`type_key` starts as a plain hash of the statement. Alpha/universe normalisation (freyd's `declKey`) is what makes
+equal keys mean *duplicate*, and it belongs with the consumer that needs it — not in the first indexer.
 
 Names are stored as repeated TEXT. Interning them into a `name(id, text)` table would cut size several-fold, but it
 complicates the partitioned delete (orphaned name rows) and 110 MB of derived cache is not a problem worth paying
@@ -178,7 +187,7 @@ therefore the index — do not record it. What changes is that the syntax pass r
 named, not on every file whose text happens to contain the short name.
 
 **Phase 3 — the capabilities the index adds.**
-* *Blast radius.* `select distinct module from decl join dep on decl.name = dep.src where dep.dst = ?` — the file
+* *Blast radius.* `select distinct module from dep where dst = ?` — the file
   set that can stop compiling. Drives verification scope, so a local change need not trigger a whole-repository
   build.
 * *Notation-backed renames.* Today a constant reached only through notation has no recorded use sites, so the token
