@@ -389,14 +389,21 @@ private def independentEdits (edits : Array Edit) : Array Edit × Nat := Id.run 
       accepted := accepted.push edit
   return (accepted, deferred)
 
+/-- Ordinary glob semantics: `*` stays inside one path segment, `**` crosses separators.  The
+    distinction is what lets a pattern name a directory without swallowing its subdirectories —
+    `Freyd/*.lean` is the 226 section files, `Freyd/**.lean` those plus the six deliberately
+    un-imported `Freyd/tool` modules, which have no `.olean` and cannot be elaborated at all. -/
 private def globMatches (pattern value : String) : Bool :=
   go pattern.toList value.toList
 where
   go : List Char → List Char → Bool
     | [], [] => true
     | [], _ => false
-    | '*' :: ps, cs => go ps cs || match cs with | [] => false | _ :: cs => go ('*' :: ps) cs
-    | '?' :: ps, _ :: cs => go ps cs
+    | '*' :: '*' :: ps, cs => go ps cs || match cs with | [] => false | _ :: cs => go ('*' :: '*' :: ps) cs
+    | '*' :: ps, cs => go ps cs || match cs with
+      | [] => false
+      | c :: cs => c != '/' && go ('*' :: ps) cs
+    | '?' :: ps, c :: cs => c != '/' && go ps cs
     | '?' :: _, [] => false
     | p :: ps, c :: cs => p == c && go ps cs
     | _ :: _, [] => false
@@ -425,8 +432,11 @@ private partial def leanFilesUnder (dir : System.FilePath) : IO (Array String) :
 private def globSelectedFiles (pattern : String) (mentioning : Array String := #[]) :
     IO (Array String) := do
   let files ← leanFilesUnder "."
+  -- `*` crosses `/`, so a single pattern cannot name two directories, and a batch that must be
+  -- closed under imports rarely fits inside one.  Commas union several patterns; no path holds one.
+  let patterns := (pattern.splitOn ",").map (·.trimAscii.toString)
   let matched := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
-    |>.filter (globMatches pattern)
+    |>.filter fun path => patterns.any (globMatches · path)
   if matched.isEmpty then
     IO.eprintln s!"glob matched no Lean files: {pattern}"
     return matched
@@ -1686,9 +1696,12 @@ private def modularizeEdits (path source : String) (publics : Array String) (com
           unless (importedSource.splitOn "\n").any (·.trimAsciiStart.toString.startsWith "module") do
             return .error s!"{path}: `{imported}` ({importedPath}) is not a `module` yet, and a module \
               cannot import one that is not; convert it first"
-      if imports == 0 then
-        edits := edits.push { start := offset, stop := offset, line := 0, replacement := "module\n\n" }
-      edits := edits.push { start := offset, stop := offset, line := 0, replacement := "public " }
+      -- The keyword and the first import's `public` are ONE edit, not two. Two zero-width edits at
+      -- the same offset do not overlap, so `independentEdits` accepts both, and `applyEdits` sorts
+      -- on `start` alone — leaving their order to the sort, which wrote `public module` half the
+      -- time and broke every file that had it.
+      let header := if imports == 0 then "module\n\npublic " else "public "
+      edits := edits.push { start := offset, stop := offset, line := 0, replacement := header }
       imports := imports + 1
     offset := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
   -- A root module imports nothing, so there is no import line to hang the keyword on; it goes at the
