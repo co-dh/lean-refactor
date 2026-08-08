@@ -10,6 +10,10 @@ defaultTargets = ["lean-refactor"]
 pp.unicode.fun = true
 relaxedAutoImplicit = false
 
+[[lean_lib]]
+name = "LeanRefactor"    # glob so a new LeanRefactor/*.lean is built even before the exe imports it
+globs = ["LeanRefactor.+"]
+
 [[lean_exe]]
 name = "lean-refactor"
 root = "LeanRefactor"
