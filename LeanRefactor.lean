@@ -2236,9 +2236,13 @@ def main (args : List String) : IO UInt32 := do
       match declarationBinderEdit source inputCtx.fileMap definitionSite commands binderName with
       | .error message => IO.eprintln message; return 1
       | .ok edit => edits := edits.push edit
+    -- `insert-call-arg` produces a zero-width edit, which spans no text to report as removed; the
+    -- preview is the only thing the caller sees before `--apply`, so it must name the real operation.
     for edit in edits do
-      let removed := String.Pos.Raw.extract source edit.start edit.stop
-      IO.println s!"line {edit.line}: remove {repr removed}"
+      if edit.start == edit.stop then
+        IO.println s!"line {edit.line}: insert {repr edit.replacement}"
+      else
+        IO.println s!"line {edit.line}: remove {repr (String.Pos.Raw.extract source edit.start edit.stop)}"
     if apply then
       IO.FS.writeFile sourcePath (applyEdits source edits)
       IO.println s!"applied {edits.size} edit(s) to {sourcePath}"
