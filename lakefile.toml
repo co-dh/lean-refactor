@@ -1,7 +1,7 @@
 name = "lean-refactor"
 version = "0.1.0"
 keywords = ["lean4", "refactor", "tooling"]
-defaultTargets = ["lean-refactor"]
+defaultTargets = ["lean-refactor", "LeanRefactor"]
 
 # No `require`: the tool reads `.ilean` reference data and elaborates target files with Lean core
 # only, so it stays dependency-free and builds in seconds.
