@@ -1679,6 +1679,7 @@ private def modularizeEdits (path source : String) (publics : Array String) (com
   let mut edits : Array Edit := #[]
   let mut offset : String.Pos.Raw := ⟨0⟩
   let mut imports := 0
+  let mut afterImports : String.Pos.Raw := ⟨0⟩
   for line in lines do
     -- Line-oriented and exact, as `rename-module`'s import edits are: only a module name follows the
     -- keyword, so no docstring or declaration can match.
@@ -1703,11 +1704,23 @@ private def modularizeEdits (path source : String) (publics : Array String) (com
       let header := if imports == 0 then "module\n\npublic " else "public "
       edits := edits.push { start := offset, stop := offset, line := 0, replacement := header }
       imports := imports + 1
+      afterImports := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
     offset := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
   -- A root module imports nothing, so there is no import line to hang the keyword on; it goes at the
   -- very start, above the banner comment, which is the only position that needs no parsing.
-  if imports == 0 then
-    edits := edits.push { start := ⟨0⟩, stop := ⟨0⟩, line := 0, replacement := "module\n\n" }
+  -- `public` and `@[expose]` are independent: the first says the NAME is visible downstream, the
+  -- second that the BODY is.  The index answers the first — something outside names it — and cannot
+  -- answer the second, because a `dep` edge records that a term mentions a constant, never that it
+  -- had to unfold it.  Without the module system every body is transparent, so exposing the whole
+  -- file preserves exactly today's meaning; narrowing it is a separate pass with the build as its
+  -- only oracle, since Lean reports a missing exposure as an ordinary elaboration failure
+  -- (`Function expected at`, `'show' tactic failed`) and never names what to expose.
+  -- A root module imports nothing, so there is no import line to hang either keyword on: both go at
+  -- the very start, as ONE edit. Two zero-width edits at one offset have no order — the mistake
+  -- that wrote `public module`, made a second time here and caught by the same symptom, a file that
+  -- built but was not a module, so everything importing it refused.
+  let header := if imports == 0 then "module\n\n@[expose] section\n\n" else "\n@[expose] section\n"
+  edits := edits.push { start := afterImports, stop := afterImports, line := 0, replacement := header }
   let mut marked := 0
   for declName in publics do
     -- A name the index has but the file does not write is a projection or a derived instance; it
