@@ -12,7 +12,11 @@
 # `cap` bounds address space: belt to `claimElaboration`'s braces (LeanRefactor.lean), which catches
 # the KNOWN way to accumulate Lean `Environment`s — looping over files in one process — but not a
 # runaway that is not a file loop. See the measurements in scripts/cap.
+#
+# Build on EVERY invocation, not just when the binary is missing: the workflow for a refactor the tool
+# cannot yet express is "improve the tool, then use the new operation", and a stale binary makes that
+# silently run the old code. A no-op lake resolve costs ~100 ms, once — `forkPerFile`'s children re-exec
+# `IO.appPath`, not this script, so it does not multiply.
 root=$(dirname "$(dirname "$(readlink -f "$0")")")
-bin=$root/.lake/build/bin/lean-refactor
-[ -x "$bin" ] || (cd "$root" && ./scripts/cap lake build) || exit 1
-exec "$root/scripts/cap" lake env "$bin" "$@"
+(cd "$root" && ./scripts/cap lake build -q) || exit 1
+exec "$root/scripts/cap" lake env "$root/.lake/build/bin/lean-refactor" "$@"

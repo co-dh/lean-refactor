@@ -6,7 +6,7 @@
 label=$1
 shift
 start=$(date +%s%N)
-out=$(lake exe lean-refactor "$@" 2>&1)
+out=$("$(dirname "$0")/lean-refactor" "$@" 2>&1)
 code=$?
 end=$(date +%s%N)
 printf '%s\t%d.%03d\t%d\n' "$label" $(( (end - start) / 1000000000 )) \
