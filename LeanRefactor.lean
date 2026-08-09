@@ -1953,7 +1953,7 @@ private def visibilitySlot? (source declName : String) (comments : Array (Nat ×
     wrong for a batch, where the whole set becomes a module together and only the final build can
     judge.  `sites` are the 0-based LSP positions of the declarations the index says something
     outside the file names. -/
-private def modularizeEdits (path source : String) (sites : Array (String × Nat × Nat))
+private def modularizeEdits (path source : String) (sites : Array (String × Nat × Nat × Bool))
     (checkImports : Bool) : IO (Except String (Array Edit × String)) := do
   let lines := source.splitOn "\n"
   if sourceIsModule source then
@@ -1995,7 +1995,7 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
   let fileMap := FileMap.ofString source
   let commands := sourceCommands source comments
   let mut marked := 0
-  for (declName, line, column) in sites do
+  for (declName, line, column, exposable) in sites do
     let atIndex := visibilitySlot? source declName comments (fileMap.lspPosToUtf8Pos ⟨line, column⟩)
     -- The text checks the index's position, and is also what a wrong one is corrected from; only a
     -- position the source does not confirm EITHER way is reported.
@@ -2011,7 +2011,8 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
         -- exposing exactly it leaves no exposed body naming an unexposed constant.  A `theorem` is
         -- never exposed — proof irrelevance means no downstream elaboration needs its value — and
         -- Lean refuses the attribute on anything but a `def`, which `abbrev` and `instance` are.
-        let exposed := #["def", "abbrev", "instance"].contains keyword
+        -- A body that names a `private` constant cannot be published at all, so it stays unexposed.
+        let exposed := exposable && #["def", "abbrev", "instance"].contains keyword
         -- Two attribute brackets in a row do not parse, so an existing one is joined rather than
         -- preceded.  `@[simp, expose] public theorem` is the shape Lean accepts.
         let existing := if exposed then attributeBracketBefore source comments slot else none
@@ -2060,7 +2061,7 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
     module, which is not a failure for a batch.  There is no per-file verify: mid-batch a converted
     file's imports are not yet rebuilt, so the one repository build at the end is the gate — and
     since nothing here elaborates, there is no `Environment` to hand back and no child to fork. -/
-private def modularizeStage (path stagePath : String) (sites : Array (String × Nat × Nat)) :
+private def modularizeStage (path stagePath : String) (sites : Array (String × Nat × Nat × Bool)) :
     IO IO.Process.Output := do
   let source ← IO.FS.readFile path
   match ← modularizeEdits path source sites false with
@@ -2238,7 +2239,7 @@ private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : 
 private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
   let some dbPath ← refreshedIndex? | return 1
   let indexed ← Query.moduleSources dbPath
-  let mut sites : Std.HashMap String (Array (String × Nat × Nat)) := {}
+  let mut sites : Std.HashMap String (Array (String × Nat × Nat × Bool)) := {}
   let mut unbuilt := #[]
   for path in ← globSelectedFiles pattern do
     let moduleName ← IO.ofExcept (moduleNameOfPath path)

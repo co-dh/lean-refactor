@@ -180,9 +180,16 @@ public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) 
 
     Declarations the source already marks `private` are excluded: they are mangled to `_private.…`
     and stay module-local either way.  So are the ones neither half places — a structure field or a
-    derived instance, which the source never writes and which inherits its parent's visibility. -/
+    derived instance, which the source never writes and which inherits its parent's visibility.
+
+    The last field says whether the body may be EXPOSED, which a `private` dependency forbids:
+    publishing a body that names a constant no one downstream can name is not possible, and
+    `Freyd.S2_165_Spl`'s instance failed on exactly that, one step removed — its own `_proof_1`
+    names the `private theorem splObj_semiSimple_of_ssd`.  So the taint follows a declaration's
+    INTERNAL auxiliaries, which are published with it, and stops at its public dependencies, which
+    are published on their own terms. -/
 public def publicDeclSites (dbPath moduleName : String) (instanceLines : Array Nat) :
-    IO (Array (String × Nat × Nat)) := do
+    IO (Array (String × Nat × Nat × Bool)) := do
   let m := escaped moduleName
   -- `in ()` is not SQL, and no line is negative.
   let onInstanceLine :=
@@ -207,12 +214,22 @@ reachable(n) as (
   select n from named
   union
   select d.dst from dep d join reachable on d.src = reachable.n where d.module = '{m}'
+),
+tainted(n) as (
+  select d.src from dep d
+  where d.module = '{m}' and d.dst like '\\_private%' escape '\\'
+  union
+  select d.src from dep d join tainted on d.dst = tainted.n
+    join decl_info a on a.name = tainted.n and a.module = '{m}' and a.internal = 1
+  where d.module = '{m}'
 )
-select i.user_name as n, coalesce(r.sl1, u.l1) as l, coalesce(r.sc1, u.c1) as c
+select i.user_name as n, coalesce(r.sl1, u.l1) as l, coalesce(r.sc1, u.c1) as c,
+       case when t.n is null then 1 else 0 end as e
 from decl_info i
 join reachable on reachable.n = i.name
 left join decl_range r on r.name = i.name and r.module = i.module
 left join use_site u on u.name = i.name and u.use_module = i.module and u.is_definition = 1
+left join tainted t on t.n = i.name
 where i.module = '{m}' and i.internal = 0 and i.name not like '\\_private%' escape '\\'
   and (r.name is not null or u.name is not null)
 order by l, c"
@@ -223,7 +240,8 @@ order by l, c"
         let n ← (row.getObjValAs? String "n").toOption
         let l ← (row.getObjValAs? Nat "l").toOption
         let c ← (row.getObjValAs? Nat "c").toOption
-        pure (n, l, c)
+        let e ← (row.getObjValAs? Nat "e").toOption
+        pure (n, l, c, e == 1)
   | _ => return #[]
 
 /-- The `module.source` path of every module, keyed by its `module.name` — the join the path-facing
