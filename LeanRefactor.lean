@@ -2241,6 +2241,7 @@ private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
   let indexed ← Query.moduleSources dbPath
   let mut sites : Std.HashMap String (Array (String × Nat × Nat × Bool)) := {}
   let mut unbuilt := #[]
+  let mut blockers : Array (String × String × String × Bool) := #[]
   for path in ← globSelectedFiles pattern do
     let moduleName ← IO.ofExcept (moduleNameOfPath path)
     -- A module the index has never seen was never built, so nothing is known about what names it
@@ -2248,13 +2249,27 @@ private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
     -- module may not import a plain module, but a plain module may import a module, so a file
     -- outside the build blocks nothing — and nothing imports it either, or it would be built.
     if indexed.contains moduleName then
-      sites := sites.insert path
-        (← Query.publicDeclSites dbPath moduleName (instanceLines (← IO.FS.readFile path)))
+      let lines := instanceLines (← IO.FS.readFile path)
+      sites := sites.insert path (← Query.publicDeclSites dbPath moduleName lines)
+      for (instanceName, blocked, needed) in ← Query.privateBlockers dbPath moduleName lines do
+        blockers := blockers.push (path, instanceName, blocked, needed)
     else
       unbuilt := unbuilt.push path
   unless unbuilt.isEmpty do
     IO.println <| s!"leaving {unbuilt.size} file(s) alone: never built, so the index knows nothing \
       about what names them:\n" ++ String.intercalate "\n" (unbuilt.toList.map ("  " ++ ·))
+  -- Reported rather than attempted: no marking this pass can write makes a public instance's body
+  -- able to name a private constant, so the source has to drop the `private` first.
+  unless blockers.isEmpty do
+    let line (path instanceName blocked : String) (needed : Bool) : String :=
+      s!"  {path}: `private {blocked}` is named by the body of `instance {instanceName}`" ++
+        (if needed then ", which something outside the file depends on" else "")
+    IO.eprintln <| s!"{blockers.size} `private` declaration(s) block the conversion — an instance is \
+      public whether or not anything outside names it, and a public instance publishes its body:\n" ++
+      String.intercalate "\n"
+        (blockers.toList.map fun (path, instanceName, blocked, needed) =>
+          line path instanceName blocked needed)
+    return 1
   -- Exit 3 is `stagedGlob`'s "this file is not affected", which is exactly an unbuilt one's case.
   stagedGlob pattern "put on the module system" (fun path stage =>
     match sites[path]? with

@@ -260,4 +260,61 @@ public def moduleSources (dbPath : String) : IO (Std.HashMap String String) := d
   | _ => pure ()
   return map
 
+/-- The `private` declarations that stand in the way of putting `moduleName` on the module system,
+    as (instance, private constant it names, whether anything outside needs the instance).
+
+    An instance is public whether or not anything outside names it — typeclass resolution consults
+    it while elaborating every public signature — and a public instance publishes its BODY, with or
+    without `@[expose]`: four lines reproduce it, `public instance : Inhabited Nat := ⟨hidden⟩` over
+    a `private def hidden`, and Lean answers `a private declaration hidden exists but would need to
+    be public to access here`.  So an instance whose body names a private constant cannot be
+    converted while that constant stays private, and no marking this pass could write would help.
+
+    A private constant named in the PROOF of a public theorem is not a blocker and is not reported:
+    an unexposed theorem publishes its statement only.  That is the difference between the 417
+    private constants this repository names from non-private ones and the handful that actually
+    stop a build.
+
+    The taint follows the instance's INTERNAL auxiliaries, which are published as part of it, and
+    stops at its public dependencies, which answer for their own bodies. -/
+public def privateBlockers (dbPath moduleName : String) (instanceLines : Array Nat) :
+    IO (Array (String × String × Bool)) := do
+  let m := escaped moduleName
+  let onInstanceLine :=
+    if instanceLines.isEmpty then "-1"
+    else String.intercalate ", " (instanceLines.toList.map toString)
+  let j ← Db.query dbPath s!"with recursive seeded(n) as (
+  select i.name from decl_info i
+  left join decl_range r on r.name = i.name and r.module = i.module
+  left join use_site u on u.name = i.name and u.use_module = i.module and u.is_definition = 1
+  where i.module = '{m}' and i.internal = 0 and i.name not like '\\_private%' escape '\\'
+    and (r.sl1 in ({onInstanceLine}) or u.l1 in ({onInstanceLine}))
+),
+published(root, n) as (
+  select n, n from seeded
+  union
+  select published.root, d.dst from dep d join published on d.src = published.n
+    join decl_info a on a.name = d.dst and a.module = '{m}' and a.internal = 1
+  where d.module = '{m}'
+)
+select distinct r.user_name as i, b.user_name as p,
+       case when exists (select 1 from dep x where x.dst = published.root and x.module != '{m}')
+              or exists (select 1 from use_site s where s.name = published.root
+                         and s.use_module != '{m}' and s.is_definition = 0)
+            then 1 else 0 end as n
+from published
+join dep d on d.src = published.n and d.module = '{m}'
+join decl_info b on b.name = d.dst and b.module = '{m}'
+join decl_info r on r.name = published.root and r.module = '{m}'
+where d.dst like '\\_private%' escape '\\'
+order by i, p"
+  match j with
+  | .arr rows =>
+      return rows.filterMap fun row => do
+        let i ← (row.getObjValAs? String "i").toOption
+        let p ← (row.getObjValAs? String "p").toOption
+        let n ← (row.getObjValAs? Nat "n").toOption
+        pure (i, p, n == 1)
+  | _ => return #[]
+
 end LeanRefactor.Query
