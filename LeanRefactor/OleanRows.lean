@@ -38,14 +38,24 @@ private def numbered (pre text : String) : Bool :=
   text.startsWith pre &&
     (let rest := text.drop pre.length; !rest.isEmpty && rest.all Char.isDigit)
 
+/-- The auxiliary shapes a leading underscore actually marks.  `Name.isInternalDetail` calls ANY
+    `_`-prefixed component the compiler's own, and this repository writes `_prodPB`, `_idB`,
+    `_mfTerm` by hand — 51 of them, every one with a source position.  Called internal, they were
+    dropped from the public set while the definitions naming them stayed in it, so the underscore
+    alone does not decide this and the shapes do. -/
+private def auxiliaryPrefix (s : String) : Bool :=
+  ["_aux_", "_proof_", "_private", "_cstage", "_spec", "_redArg", "_lam_", "_flat_ctor",
+   "_sizeOf_", "_hyg", "_elabRules", "_simp_", "_regBuiltin", "_closed"].any (s.startsWith ·)
+
 /-- Names the compiler wrote, not a person: equation lemmas, match auxiliaries, the `injEq`/
     `noConfusion`/recursor family. `isInternalDetail` alone leaves `match_1.splitter` and `eq_3`
     behind, and those group by the dozen across every module that uses the same definition — noise
     that would open every duplicate report. Recorded once here as a column, so no reader has to
     reinvent the filter as a pattern match on names. -/
 private def generatedName (n : Name) : Bool :=
-  n.isInternalDetail || n.components.any fun component =>
+  n.components.any fun component =>
     let s := toString component
+    auxiliaryPrefix s ||
     numbered "match_" s || numbered "proof_" s || numbered "eq_" s ||
       -- No `mk`: a real constructor never reaches here, `kindOf` having dropped it, so the only
       -- names the component matched were hand-written `def mk`s — and hiding one of those from
