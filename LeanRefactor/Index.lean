@@ -2,10 +2,12 @@ module
 
 import Lean
 import LeanRefactor.Db
+import LeanRefactor.Fork
 import LeanRefactor.IleanRows
 import LeanRefactor.OleanRows
+import LeanRefactor.SyntaxRows
 
-open Lean
+open Lean LeanRefactor.Fork
 
 namespace LeanRefactor.Index
 
@@ -97,6 +99,7 @@ private def deletePartitions (dbPath : String) (modules : Array String) : IO Uni
         s!"delete from decl_info where module = '{m}';\n" ++
         s!"delete from use_site where use_module = '{m}';\n" ++
         s!"delete from dep where module = '{m}';\n" ++
+        s!"delete from syntax_node where module = '{m}';\n" ++
         s!"delete from module where name = '{m}';\n"
     Db.exec dbPath (sql ++ "commit;")
 
@@ -123,7 +126,11 @@ private def withSources (scanned : Array Module) : IO (Array Module × Nat) := d
   return (kept, scanned.size - kept.size)
 
 /-- Refresh the index at `dbPath`, scanning `buildDir`. With `full := true`, discard the database first.
-    Returns (modules re-extracted, modules dropped, source-less artefacts skipped). -/
+    Returns (modules re-extracted, modules dropped, source-less artefacts skipped).
+
+    Each stale module also gets its `syntax_node` rows: the tree is a byproduct of the elaboration
+    that built the olean, so the same `(ilean_hash, olean_hash)` key keeps it in step, and the
+    DELETE-and-re-insert is the same `deletePartitions` path as every other per-module row. -/
 public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × Nat) := do
   if full then
     -- Drop the WAL and SHM too, so a stale write-ahead log cannot be replayed into the fresh file.
@@ -150,10 +157,26 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
     catch e => throw <| IO.userError s!"cannot import the modules to index: {e}\n\
       the build directory holds an artefact whose imports no longer resolve; \
       rebuild with `lake build`, or delete the stale artefacts under {buildDir}"
+  -- Each module's syntax tree is one full elaboration, so one process must not hold the
+  -- environments of many files — measured at 18.3 GB on this repository — and every tree is built
+  -- in a CHILD process that prints the flattened rows and exits.  The child is THIS binary, not
+  -- `lake exe`: the parent is by construction the up-to-date build.  A failed child prints its
+  -- stderr and the module still gets its rows — the semantic rows are the freshness authority, and
+  -- a module that `ofModules` just imported cleanly elaborates fine here, so a failure is a broken
+  -- build, not a reason to keep the module stale and retry every refresh.
+  let self := (← IO.appPath).toString
+  let outputs ← mapFilesParallel (← scanJobs) (stale.map (·.source)) fun path =>
+    IO.Process.output { cmd := self, args := #["syntax-rows", path] }
+  let mut syntaxRows := #[]
+  for output in outputs do
+    unless output.stdout.isEmpty do
+      syntaxRows := syntaxRows ++ (output.stdout.splitOn Db.recordSep).filter (· != "")
+    unless output.stderr.isEmpty do IO.eprint output.stderr
   Db.importRows dbPath "decl_range" declRanges
   Db.importRows dbPath "use_site" useSites
   Db.importRows dbPath "decl_info" oleanRows.declInfos
   Db.importRows dbPath "dep" oleanRows.deps
+  Db.importRows dbPath "syntax_node" syntaxRows
   Db.importRows dbPath "module" (stale.map fun m => Db.row #[m.name, m.source, m.ileanHash, m.oleanHash])
   return (stale.size, removed.size, orphaned)
 

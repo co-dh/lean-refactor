@@ -20,7 +20,7 @@ public def row (cells : Array String) : String :=
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
     the modules whose artefacts changed, so after a keying change the untouched modules would keep
     rows computed by the old algorithm and a grouping query would silently mix two generations. -/
-public def schemaVersion : String := "2"
+public def schemaVersion : String := "3"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
@@ -61,12 +61,24 @@ create table use_site (
 
 create table dep (src text, dst text, module text);
 
+-- The command-level syntax tree of every indexed module, flattened in preorder.  `id` is the
+-- node's index in that order, `parent` the id of the enclosing node (-1 for a root command), so a
+-- subtree is a contiguous id range and the innermost node covering byte P is one indexed query.
+-- `b0`/`b1` are the node's byte range in its source file; there is no `atom` column — a token's
+-- text is `source[b0:b1]`.  Validity is exactly the module's olean validity: the tree is a
+-- byproduct of the elaboration that produced the olean, so the same `(ilean_hash, olean_hash)`
+-- key and the same delete-and-reinsert path keep it in step with the rest of the index.
+create table syntax_node (
+  module text, id int, parent int, kind text, b0 int, b1 int
+);
+
 create index i_use_name   on use_site(name);
 create index i_use_module on use_site(use_module);
 create index i_dep_dst    on dep(dst);
 create index i_dep_src    on dep(src);
 create index i_decl_stmt  on decl_info(stmt_key);
 create index i_decl_proof on decl_info(proof_key);
+create index i_syn_module on syntax_node(module);
 "
 
 /-- Spawn `sqlite3` with `extraArgs`, feeding it `sql` from the temp file `tmp` via `.read`.
