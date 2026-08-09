@@ -130,6 +130,43 @@ public def statementGroups (dbPath : String) : IO (Array DupGroup) :=
 public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) :=
   groupsOn dbPath "proof_key" s!"and i.proof_nodes >= {minNodes}"
 
+/-- The public set of one module, as the three tables both queries below select from: what a public
+    body may not name (`tainted`), what is public for a reason of its own (`named`), and what those
+    drag in after them (`reachable`).  Shared, because a check that disagreed with the pass it
+    guards would be worse than no check at all. -/
+private def publicSetCTE (m onInstanceLine : String) : String :=
+  s!"with recursive tainted(n) as (
+  select d.src from dep d
+  where d.module = '{m}' and d.dst like '\\_private%' escape '\\'
+  union
+  select d.src from dep d join tainted on d.dst = tainted.n
+    join decl_info a on a.name = tainted.n and a.module = '{m}' and a.internal = 1
+  where d.module = '{m}'
+),
+named(n) as (
+  select i.name from decl_info i
+  where i.module = '{m}' and i.name not like '\\_private%' escape '\\'
+    and (exists (select 1 from dep d where d.dst = i.name and d.module != '{m}')
+         or exists (select 1 from use_site s where s.name = i.name and s.use_module != '{m}'
+                    and s.is_definition = 0)
+         or exists (select 1 from use_site s join dep p on p.src = s.parent
+                    where s.name = i.name and s.use_module = '{m}' and s.is_definition = 0
+                      and p.dst in ('Lean.ParserDescr', 'Lean.TrailingParserDescr', 'Lean.Macro',
+                                    'Lean.Elab.Tactic.Tactic'))
+         -- An instance whose body names a private constant is left where it is: publishing it
+         -- would demand the source drop that `private`, and nothing outside has asked for it.
+         or (i.name not in (select n from tainted)
+             and (exists (select 1 from decl_range r where r.name = i.name and r.module = '{m}'
+                          and r.sl1 in ({onInstanceLine}))
+                  or exists (select 1 from use_site s where s.name = i.name and s.use_module = '{m}'
+                             and s.is_definition = 1 and s.l1 in ({onInstanceLine})))))
+),
+reachable(n) as (
+  select n from named
+  union
+  select d.dst from dep d join reachable on d.src = reachable.n where d.module = '{m}'
+)"
+
 /-- Where in the source each declaration of `module` sits that the module system would have to mark
     `public`.  The position is the 0-based LSP start of the declaration's NAME, so marking a file
     needs no parse.
@@ -195,37 +232,7 @@ public def publicDeclSites (dbPath moduleName : String) (instanceLines : Array N
   let onInstanceLine :=
     if instanceLines.isEmpty then "-1"
     else String.intercalate ", " (instanceLines.toList.map toString)
-  let j ← Db.query dbPath s!"with recursive tainted(n) as (
-  select d.src from dep d
-  where d.module = '{m}' and d.dst like '\\_private%' escape '\\'
-  union
-  select d.src from dep d join tainted on d.dst = tainted.n
-    join decl_info a on a.name = tainted.n and a.module = '{m}' and a.internal = 1
-  where d.module = '{m}'
-),
-named(n) as (
-  select i.name from decl_info i
-  where i.module = '{m}' and i.name not like '\\_private%' escape '\\'
-    and (exists (select 1 from dep d where d.dst = i.name and d.module != '{m}')
-         or exists (select 1 from use_site s where s.name = i.name and s.use_module != '{m}'
-                    and s.is_definition = 0)
-         or exists (select 1 from use_site s join dep p on p.src = s.parent
-                    where s.name = i.name and s.use_module = '{m}' and s.is_definition = 0
-                      and p.dst in ('Lean.ParserDescr', 'Lean.TrailingParserDescr', 'Lean.Macro',
-                                    'Lean.Elab.Tactic.Tactic'))
-         -- An instance whose body names a private constant is left where it is: publishing it
-         -- would demand the source drop that `private`, and nothing outside has asked for it.
-         or (i.name not in (select n from tainted)
-             and (exists (select 1 from decl_range r where r.name = i.name and r.module = '{m}'
-                          and r.sl1 in ({onInstanceLine}))
-                  or exists (select 1 from use_site s where s.name = i.name and s.use_module = '{m}'
-                             and s.is_definition = 1 and s.l1 in ({onInstanceLine})))))
-),
-reachable(n) as (
-  select n from named
-  union
-  select d.dst from dep d join reachable on d.src = reachable.n where d.module = '{m}'
-)
+  let j ← Db.query dbPath <| publicSetCTE m onInstanceLine ++ "
 select i.user_name as n, coalesce(r.sl1, u.l1) as l, coalesce(r.sc1, u.c1) as c,
        case when t.n is null then 1 else 0 end as e
 from decl_info i
@@ -286,17 +293,17 @@ public def privateBlockers (dbPath moduleName : String) (instanceLines : Array N
   let onInstanceLine :=
     if instanceLines.isEmpty then "-1"
     else String.intercalate ", " (instanceLines.toList.map toString)
-  let j ← Db.query dbPath s!"with recursive seeded(n) as (
+  let j ← Db.query dbPath <| publicSetCTE m onInstanceLine ++ s!",
+-- The instances this pass will actually mark. Being on an instance line is not enough and neither
+-- is an outside dependency: `Freyd.functorCat_hasPullbacks` has no dependant outside its file and
+-- is still marked, because a public body in the file names it and the closure carries it along.
+seeded(n) as (
   select i.name from decl_info i
+  join reachable on reachable.n = i.name
   left join decl_range r on r.name = i.name and r.module = i.module
   left join use_site u on u.name = i.name and u.use_module = i.module and u.is_definition = 1
   where i.module = '{m}' and i.internal = 0 and i.name not like '\\_private%' escape '\\'
     and (r.sl1 in ({onInstanceLine}) or u.l1 in ({onInstanceLine}))
-    -- Only the instances that are public REGARDLESS: one that nothing outside names is left where
-    -- it is instead, so its `private` dependencies are not this conversion's business.
-    and (exists (select 1 from dep d where d.dst = i.name and d.module != '{m}')
-         or exists (select 1 from use_site s where s.name = i.name and s.use_module != '{m}'
-                    and s.is_definition = 0))
 ),
 published(root, n) as (
   select n, n from seeded
