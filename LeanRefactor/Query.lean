@@ -131,8 +131,24 @@ public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) 
   groupsOn dbPath "proof_key" s!"and i.proof_nodes >= {minNodes}"
 
 /-- Where in the source each declaration of `module` sits that the module system would have to mark
-    `public`: the ones something outside the module names.  The position is the 0-based LSP start of
-    the declaration's NAME, so marking a file needs no parse.
+    `public`.  The position is the 0-based LSP start of the declaration's NAME, so marking a file
+    needs no parse.
+
+    Three things make a declaration public, and the first alone is not enough — each of the other
+    two was a failed whole-repository build.
+
+    1. Something outside DEPENDS on it: a `dep` edge from another module.
+
+    2. Something outside NAMES it without depending on it.  `simp only [compFunctor_obj]` writes the
+       name in tactic syntax and the finished proof term does not mention it, so there is no edge —
+       and `Freyd.S1_14` and `Freyd.S1_74` stopped compiling for exactly that lemma.  The `.ilean`
+       reference half records the occurrence, so `use_site` sees what `dep` cannot.
+
+    3. A public declaration's BODY mentions it, transitively, inside this module.  Marking the file
+       `@[expose]` publishes the bodies, so everything a body names has to be reachable too.
+       `Freyd.Colim.setoid` is public; its `setoid._proof_1` names `rel_symm` and `rel_trans`, which
+       nothing outside depends on and which were therefore left private.  The closure follows the
+       compiler's own auxiliaries, which is how it gets from `setoid` to `rel_symm` at all.
 
     `decl_range` answers first, and the BINDING SITE in `use_site` fills its gaps, because the
     `.ilean`'s two halves disagree: its `decls` section drops declarations its `references` section
@@ -154,14 +170,25 @@ public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) 
     derived instance, which the source never writes and which inherits its parent's visibility. -/
 public def publicDeclSites (dbPath moduleName : String) : IO (Array (String × Nat × Nat)) := do
   let m := escaped moduleName
-  let j ← Db.query dbPath s!"select i.user_name as n, coalesce(r.sl1, u.l1) as l,
-       coalesce(r.sc1, u.c1) as c
+  let j ← Db.query dbPath s!"with recursive named(n) as (
+  select i.name from decl_info i
+  where i.module = '{m}' and i.name not like '\\_private%' escape '\\'
+    and (exists (select 1 from dep d where d.dst = i.name and d.module != '{m}')
+         or exists (select 1 from use_site s where s.name = i.name and s.use_module != '{m}'
+                    and s.is_definition = 0))
+),
+reachable(n) as (
+  select n from named
+  union
+  select d.dst from dep d join reachable on d.src = reachable.n where d.module = '{m}'
+)
+select i.user_name as n, coalesce(r.sl1, u.l1) as l, coalesce(r.sc1, u.c1) as c
 from decl_info i
+join reachable on reachable.n = i.name
 left join decl_range r on r.name = i.name and r.module = i.module
 left join use_site u on u.name = i.name and u.use_module = i.module and u.is_definition = 1
 where i.module = '{m}' and i.internal = 0 and i.name not like '\\_private%' escape '\\'
   and (r.name is not null or u.name is not null)
-  and exists (select 1 from dep d where d.dst = i.name and d.module != i.module)
 order by l, c"
   match j with
   | .arr rows =>
