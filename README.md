@@ -44,6 +44,35 @@ A group is a candidate, not a task — nothing here checks that its members can 
 the copy is not a deliberate weaker-hypothesis restatement. Members print in module order so a group
 with one obvious home reads apart from one spread over leaves that never import each other.
 
+## Putting a repository on the module system
+
+```sh
+lean-refactor modularize --glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean' [--apply]
+```
+
+Writes the `module` header, marks the imports `public`, and marks `public` — with `@[expose]` where
+the body is publishable — the declarations the repository actually needs outside their file. A batch
+must be closed under imports, since a `module` cannot import one that is not; the reverse is legal,
+so a leaf may stay behind and un-migrated libraries keep building against a migrated one. A leading
+`!` on a pattern subtracts it, which is how the exception says which file is special instead of being
+an enumeration of the other 223.
+
+The public set is the smallest one the compiler accepts, not everything: a declaration something
+outside depends on, an instance, a notation's target, and whatever their bodies reach. What it cannot
+compute is what only the compiler knows — a private constant in a public *statement* is illegal while
+the same constant in the *proof* is fine, and `dep` does not separate the two. So the pass reports
+and the build decides. On the repository this was written for, that was 140 `private` keywords over
+224 files, each one named by an error.
+
+Three dependencies exist that the index cannot see, each handled by rule rather than by edge:
+notation expands as syntax and leaves no `dep` edge to the function it names, instances are unfolded
+into terms by typeclass resolution and leave neither edge nor reference, and defeq unfolding is
+reported only at build time. The first two are covered — parser-descriptor targets, and a source scan
+for `instance` lines. The third is why `--apply` is transactional: it runs the whole target build and
+restores every source, then rebuilds, if that fails. The rebuild is not optional; the artefacts the
+rollback drops are the index's inputs, and a module missing from the index is one the next pass
+reports as never built and leaves alone.
+
 **Run it from the target repository's root.** Paths are CWD-relative: the tool loads
 `.lake/build/lib/lean/<Module>.ilean` and verifies with `./scripts/cap lake build`, both resolved against the
 current directory. `scripts/lean-refactor` deliberately does not `cd` anywhere — it builds the tool in its own
