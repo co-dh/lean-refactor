@@ -159,11 +159,15 @@ public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) 
     field's binder rather than on the type's own name, so it is the fallback and not the answer.
     No declaration in this repository has two binding sites, so the join cannot duplicate a row.
 
-    Notation is NOT among them and needs no marking: a `notation` command is exported across a
-    module boundary as it stands, and `public` is not even accepted before it — Lean's error names
-    the commands it does accept, and `notation` is not one.  (Measured, because the dependency edges
-    say nothing either way: downstream elaborated terms name the function the notation expands to,
-    never the parser constant.)
+    4. A notation NAMES it.  A `notation` command needs no marking of its own — it is exported
+       across a module boundary as it stands, and `public` is not even accepted before it — but that
+       is exactly why what it expands to has to be public: `infixr " ⊛ " => UnderHom.comp` in
+       `Freyd.S1_26` and `notation S " ∈ᶠ " F => Filter.Mem S F` in `Freyd.S1_646_Ultrafilter` both
+       failed on `Unknown constant _private.…`.  Only `use_site` knows the link — the expansion is
+       syntax, so the parser constant has no edge to the function, and the elaborated terms
+       downstream name the function and never the parser constant.  The declarations that carry
+       exported syntax are recognised by what they are built from: a `ParserDescr` (the notation
+       itself), a `Macro` (the rule that expands it) or a tactic elaborator.
 
     Declarations the source already marks `private` are excluded: they are mangled to `_private.…`
     and stay module-local either way.  So are the ones neither half places — a structure field or a
@@ -175,7 +179,11 @@ public def publicDeclSites (dbPath moduleName : String) : IO (Array (String × N
   where i.module = '{m}' and i.name not like '\\_private%' escape '\\'
     and (exists (select 1 from dep d where d.dst = i.name and d.module != '{m}')
          or exists (select 1 from use_site s where s.name = i.name and s.use_module != '{m}'
-                    and s.is_definition = 0))
+                    and s.is_definition = 0)
+         or exists (select 1 from use_site s join dep p on p.src = s.parent
+                    where s.name = i.name and s.use_module = '{m}' and s.is_definition = 0
+                      and p.dst in ('Lean.ParserDescr', 'Lean.TrailingParserDescr', 'Lean.Macro',
+                                    'Lean.Elab.Tactic.Tactic')))
 ),
 reachable(n) as (
   select n from named

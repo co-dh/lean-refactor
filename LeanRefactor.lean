@@ -1769,37 +1769,58 @@ private def commentRanges (source : String) : Array (Nat × Nat) := Id.run do
     and the scan reads back a prefix of the name it was pointed at. -/
 private def wordChar (c : Char) : Bool := isIdRest c
 
+/-- Just past the last character before `pos` that is neither whitespace nor inside a comment.
+    A comment is stepped over whole: scanning back into one would read its text as source. -/
+private def codeEndBefore (source : String) (comments : Array (Nat × Nat)) (pos : String.Pos.Raw) :
+    String.Pos.Raw := Id.run do
+  let skipBack (p : String.Pos.Raw) : String.Pos.Raw :=
+    match comments.find? fun (start, stop) => start < p.byteIdx && p.byteIdx <= stop with
+      | some (start, _) => ⟨start⟩
+      | none => p
+  let mut p := skipBack pos
+  while p.byteIdx > 0 &&
+      (String.Pos.Raw.get source (String.Pos.Raw.prev source p)).isWhitespace do
+    p := skipBack (String.Pos.Raw.prev source p)
+  return p
+
 /-- The word ending just before `pos`, and where it starts — `none` when the character before `pos`
-    is not part of a word.  Positions inside `comments` are skipped as if they were whitespace. -/
+    is not part of a word. -/
 private def wordBefore (source : String) (comments : Array (Nat × Nat)) (pos : String.Pos.Raw) :
     Option (String × String.Pos.Raw) := Id.run do
-  -- A comment is skipped whole: scanning back into one would read its last word as source text.
-  let skipBack (p : String.Pos.Raw) : String.Pos.Raw :=
-    match comments.find? fun (start, stop) => start < p.byteIdx && p.byteIdx <= stop with
-      | some (start, _) => ⟨start⟩
-      | none => p
   let before (p : String.Pos.Raw) : Char := String.Pos.Raw.get source (String.Pos.Raw.prev source p)
-  let back (p : String.Pos.Raw) : String.Pos.Raw := String.Pos.Raw.prev source p
-  let mut p := skipBack pos
-  while p.byteIdx > 0 && (before p).isWhitespace do p := skipBack (back p)
+  let mut p := codeEndBefore source comments pos
   if p.byteIdx == 0 || !wordChar (before p) then return none
   let stop := p
-  while p.byteIdx > 0 && wordChar (before p) do p := back p
+  while p.byteIdx > 0 && wordChar (before p) do p := String.Pos.Raw.prev source p
   return some (String.Pos.Raw.extract source p stop, p)
 
-/-- The `]` closing an attribute list written immediately before `pos`, or `none` when there is no
-    attribute list there.  `@[expose]` cannot be added as a second bracket — two in a row do not
-    parse — so an existing one has to be joined. -/
-private def closingBracketBefore (source : String) (comments : Array (Nat × Nat))
+/-- The `]` closing an ATTRIBUTE list written immediately before `pos`, or `none` when what stands
+    there is some other bracket.  `@[expose]` cannot be added as a second bracket — two in a row do
+    not parse — so an existing list has to be joined instead.  Which makes the test a real one: a
+    declaration is just as often preceded by the `]` of a `variable [Cat 𝒞]` binder or of the
+    `rw [h]` on the line above, and `, expose` written into either of those is a parse error or an
+    unknown identifier.  So the bracket is matched back to its `[` and that `[` required to carry
+    the `@`. -/
+private def attributeBracketBefore (source : String) (comments : Array (Nat × Nat))
     (pos : String.Pos.Raw) : Option String.Pos.Raw := Id.run do
-  let skipBack (p : String.Pos.Raw) : String.Pos.Raw :=
-    match comments.find? fun (start, stop) => start < p.byteIdx && p.byteIdx <= stop with
-      | some (start, _) => ⟨start⟩
-      | none => p
-  let before (p : String.Pos.Raw) : Char := String.Pos.Raw.get source (String.Pos.Raw.prev source p)
-  let mut p := skipBack pos
-  while p.byteIdx > 0 && (before p).isWhitespace do p := skipBack (String.Pos.Raw.prev source p)
-  if p.byteIdx > 0 && before p == ']' then some (String.Pos.Raw.prev source p) else none
+  let p := codeEndBefore source comments pos
+  if p.byteIdx == 0 then return none
+  let close := String.Pos.Raw.prev source p
+  if String.Pos.Raw.get source close != ']' then return none
+  let mut q := close
+  let mut depth := 1
+  while depth > 0 do
+    if q.byteIdx == 0 then return none
+    q := String.Pos.Raw.prev source q
+    -- A bracket inside a comment pairs with nothing in the code around it.
+    unless comments.any (fun (start, stop) => start <= q.byteIdx && q.byteIdx < stop) do
+      match String.Pos.Raw.get source q with
+        | ']' => depth := depth + 1
+        | '[' => depth := depth - 1
+        | _   => pure ()
+  if q.byteIdx > 0 && String.Pos.Raw.get source (String.Pos.Raw.prev source q) == '@' then
+    return some close
+  return none
 
 /-- The keywords that introduce a declaration, and the modifiers `Lean.Parser.Command.declModifiers`
     places AFTER visibility (`protected`, `meta`/`noncomputable`, `unsafe`, `partial`/`nonrec`),
@@ -1904,7 +1925,7 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
         let exposed := #["def", "abbrev", "instance"].contains keyword
         -- Two attribute brackets in a row do not parse, so an existing one is joined rather than
         -- preceded.  `@[simp, expose] public theorem` is the shape Lean accepts.
-        let existing := if exposed then closingBracketBefore source comments slot else none
+        let existing := if exposed then attributeBracketBefore source comments slot else none
         match existing with
         | some bracket =>
             edits := edits.push
