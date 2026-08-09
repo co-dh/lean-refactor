@@ -1534,9 +1534,19 @@ private def buildArtefacts (path : String) : Array String :=
     let base := ".lake/build/lib/lean/" ++ moduleName.replace "." "/"
     #[".olean", ".olean.hash", ".olean.server", ".olean.private", ".ilean", ".trace"].map (base ++ ·)
 
+/-- Delete the artefacts of every path the failed build actually compiled AS A MODULE, and only
+    those: the split parts are the evidence, and a module the build never reached still has the
+    one-file `.olean` its restored source produced.  The distinction is worth making because the
+    `.ilean` goes with the rest, and the index cannot place a declaration without it — deleting the
+    whole batch's artefacts costs a whole-repository rebuild before the next attempt can run. -/
 private def dropBuildArtefacts (paths : Array String) : IO Unit := do
   for path in paths do
-    for artefact in buildArtefacts path do
+    let artefacts := buildArtefacts path
+    let split ← artefacts.filterM fun artefact => do
+      pure ((artefact.endsWith ".olean.server" || artefact.endsWith ".olean.private") &&
+        (← System.FilePath.pathExists (System.FilePath.mk artefact)))
+    if split.isEmpty then continue
+    for artefact in artefacts do
       if ← System.FilePath.pathExists artefact then IO.FS.removeFile artefact
 
 /-- Refuse to work in a build tree that already holds the debris above: an `X.olean.server` whose
@@ -1777,6 +1787,20 @@ private def wordBefore (source : String) (comments : Array (Nat × Nat)) (pos : 
   while p.byteIdx > 0 && wordChar (before p) do p := back p
   return some (String.Pos.Raw.extract source p stop, p)
 
+/-- The `]` closing an attribute list written immediately before `pos`, or `none` when there is no
+    attribute list there.  `@[expose]` cannot be added as a second bracket — two in a row do not
+    parse — so an existing one has to be joined. -/
+private def closingBracketBefore (source : String) (comments : Array (Nat × Nat))
+    (pos : String.Pos.Raw) : Option String.Pos.Raw := Id.run do
+  let skipBack (p : String.Pos.Raw) : String.Pos.Raw :=
+    match comments.find? fun (start, stop) => start < p.byteIdx && p.byteIdx <= stop with
+      | some (start, _) => ⟨start⟩
+      | none => p
+  let before (p : String.Pos.Raw) : Char := String.Pos.Raw.get source (String.Pos.Raw.prev source p)
+  let mut p := skipBack pos
+  while p.byteIdx > 0 && (before p).isWhitespace do p := skipBack (String.Pos.Raw.prev source p)
+  if p.byteIdx > 0 && before p == ']' then some (String.Pos.Raw.prev source p) else none
+
 /-- The keywords that introduce a declaration, and the modifiers `Lean.Parser.Command.declModifiers`
     places AFTER visibility (`protected`, `meta`/`noncomputable`, `unsafe`, `partial`/`nonrec`),
     plus the `scoped`/`local` attribute kind that sits between the modifiers and `instance`.
@@ -1788,9 +1812,10 @@ private def afterVisibility : Array String :=
   #["protected", "meta", "noncomputable", "unsafe", "partial", "nonrec", "scoped", "local"]
 
 /-- Where `public` goes for the declaration `declName`, whose name the index recorded as starting at
-    `namePos`: at the start of the run of keywords and modifiers immediately before it.  `ok none`
-    when the source already fixes visibility, and when the run holds no declaration keyword at all —
-    the recorded position is then not a declaration this pass can mark.
+    `namePos`: at the start of the run of keywords and modifiers immediately before it, WITH the
+    declaration keyword found there, which decides whether `@[expose]` may join it.  `ok none` when
+    the source already fixes visibility, and when the run holds no declaration keyword at all — the
+    recorded position is then not a declaration this pass can mark.
 
     An anonymous `instance` has no name to precede, and the `.ilean` records the keyword itself as
     its position, so the run is allowed to start AT `namePos`.
@@ -1801,7 +1826,7 @@ private def afterVisibility : Array String :=
     would catch it.  Checking the text beats comparing timestamps, which report a file restored from
     version control as edited for as long as its content keeps `lake` from rebuilding it. -/
 private def visibilitySlot? (source declName : String) (comments : Array (Nat × Nat))
-    (namePos : String.Pos.Raw) : Except String (Option String.Pos.Raw) := Id.run do
+    (namePos : String.Pos.Raw) : Except String (Option (String.Pos.Raw × String)) := Id.run do
   let mut nameEnd := namePos
   while nameEnd < source.rawEndPos && wordChar (String.Pos.Raw.get source nameEnd) do
     nameEnd := String.Pos.Raw.next source nameEnd
@@ -1809,16 +1834,16 @@ private def visibilitySlot? (source declName : String) (comments : Array (Nat ×
   unless atName.isEmpty || declKeywords.contains atName || (declName.splitOn ".").contains atName do
     return .error s!"the index puts `{declName}` where the source has `{atName}`"
   let mut slot := if declKeywords.contains atName then some namePos else none
-  let mut keyword := slot.isSome
+  let mut keyword := if declKeywords.contains atName then atName else ""
   let mut pos := namePos
   repeat
     let some (word, start) := wordBefore source comments pos | break
     if word == "private" || word == "public" then return .ok none
-    if declKeywords.contains word then keyword := true
+    if declKeywords.contains word then keyword := word
     else unless afterVisibility.contains word do break
     slot := some start
     pos := start
-  return .ok (if keyword then slot else none)
+  return .ok (if keyword.isEmpty then none else slot.map (·, keyword))
 
 /-- The edits that put one file on the module system, as byte ranges into `source`, with the report
     line.  With `checkImports`, refuse an import that is not yet a module — right for one file,
@@ -1861,19 +1886,8 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
     offset := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
   -- A root module imports nothing, so there is no import line to hang the keyword on; it goes at the
   -- very start, above the banner comment, which is the only position that needs no parsing.
-  -- `public` and `@[expose]` are independent: the first says the NAME is visible downstream, the
-  -- second that the BODY is.  The index answers the first — something outside names it — and cannot
-  -- answer the second, because a `dep` edge records that a term mentions a constant, never that it
-  -- had to unfold it.  Without the module system every body is transparent, so exposing the whole
-  -- file preserves exactly today's meaning; narrowing it is a separate pass with the build as its
-  -- only oracle, since Lean reports a missing exposure as an ordinary elaboration failure
-  -- (`Function expected at`, `'show' tactic failed`) and never names what to expose.
-  -- A root module imports nothing, so there is no import line to hang either keyword on: both go at
-  -- the very start, as ONE edit. Two zero-width edits at one offset have no order — the mistake
-  -- that wrote `public module`, made a second time here and caught by the same symptom, a file that
-  -- built but was not a module, so everything importing it refused.
-  let header := if imports == 0 then "module\n\n@[expose] section\n\n" else "\n@[expose] section\n"
-  edits := edits.push { start := afterImports, stop := afterImports, line := 0, replacement := header }
+  if imports == 0 then
+    edits := edits.push { start := ⟨0⟩, stop := ⟨0⟩, line := 0, replacement := "module\n\n" }
   let fileMap := FileMap.ofString source
   let comments := commentRanges source
   let mut marked := 0
@@ -1881,8 +1895,26 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
     match visibilitySlot? source declName comments (fileMap.lspPosToUtf8Pos ⟨line, column⟩) with
     | .error message => return .error s!"{path}:{line + 1}: {message}; rebuild before marking it"
     | .ok none => pure ()
-    | .ok (some slot) =>
-        edits := edits.push { start := slot, stop := slot, line := 0, replacement := "public " }
+    | .ok (some (slot, keyword)) =>
+        -- `public` says the NAME is visible downstream, `@[expose]` that the BODY is, and the two
+        -- travel together here: the public set is closed under what a public body mentions, so
+        -- exposing exactly it leaves no exposed body naming an unexposed constant.  A `theorem` is
+        -- never exposed — proof irrelevance means no downstream elaboration needs its value — and
+        -- Lean refuses the attribute on anything but a `def`, which `abbrev` and `instance` are.
+        let exposed := #["def", "abbrev", "instance"].contains keyword
+        -- Two attribute brackets in a row do not parse, so an existing one is joined rather than
+        -- preceded.  `@[simp, expose] public theorem` is the shape Lean accepts.
+        let existing := if exposed then closingBracketBefore source comments slot else none
+        match existing with
+        | some bracket =>
+            edits := edits.push
+              { start := bracket, stop := bracket, line := 0, replacement := ", expose" }
+            edits := edits.push { start := slot, stop := slot, line := 0, replacement := "public " }
+        | none =>
+            -- ONE edit, not two at one offset: two zero-width edits there have no order, which is
+            -- the mistake that once wrote `public module`.
+            let header := if exposed then "@[expose] public " else "public "
+            edits := edits.push { start := slot, stop := slot, line := 0, replacement := header }
         marked := marked + 1
   return .ok (edits, s!"{path}: `module`, {imports} public import(s), {marked} public declaration(s)")
 
