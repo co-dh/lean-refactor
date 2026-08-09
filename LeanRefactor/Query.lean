@@ -232,7 +232,7 @@ public def publicDeclSites (dbPath moduleName : String) (instanceLines : Array N
   let onInstanceLine :=
     if instanceLines.isEmpty then "-1"
     else String.intercalate ", " (instanceLines.toList.map toString)
-  let j ← Db.query dbPath <| publicSetCTE m onInstanceLine ++ "
+  let j ← Db.query dbPath <| publicSetCTE m onInstanceLine ++ s!"
 select i.user_name as n, coalesce(r.sl1, u.l1) as l, coalesce(r.sc1, u.c1) as c,
        case when t.n is null then 1 else 0 end as e
 from decl_info i
