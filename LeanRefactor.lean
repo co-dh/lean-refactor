@@ -1754,9 +1754,10 @@ private def commentRanges (source : String) : Array (Nat × Nat) := Id.run do
       pos := next pos
   return out
 
-/-- What a name or a keyword is spelled with, for a scan that has no parser. -/
-private def wordChar (c : Char) : Bool :=
-  c.isAlphanum || c == '_' || c == '\'' || c == '!' || c == '?'
+/-- What a name or a keyword is spelled with, for a scan that has no parser.  Lean's own predicate,
+    not `isAlphanum`: that one is ASCII, so it ends a word at the `Ω` of `impΩ` and the `₁` of `kp₁`
+    and the scan reads back a prefix of the name it was pointed at. -/
+private def wordChar (c : Char) : Bool := isIdRest c
 
 /-- The word ending just before `pos`, and where it starts — `none` when the character before `pos`
     is not part of a word.  Positions inside `comments` are skipped as if they were whitespace. -/
