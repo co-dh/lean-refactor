@@ -1801,12 +1801,12 @@ private def wordBefore (source : String) (comments : Array (Nat × Nat)) (pos : 
     `rw [h]` on the line above, and `, expose` written into either of those is a parse error or an
     unknown identifier.  So the bracket is matched back to its `[` and that `[` required to carry
     the `@`. -/
-private def attributeBracketBefore (source : String) (comments : Array (Nat × Nat))
-    (pos : String.Pos.Raw) : Option String.Pos.Raw := Id.run do
+private def groupBefore (source : String) (comments : Array (Nat × Nat)) (opening closing : Char)
+    (pos : String.Pos.Raw) : Option (String.Pos.Raw × String.Pos.Raw) := Id.run do
   let p := codeEndBefore source comments pos
   if p.byteIdx == 0 then return none
   let close := String.Pos.Raw.prev source p
-  if String.Pos.Raw.get source close != ']' then return none
+  if String.Pos.Raw.get source close != closing then return none
   let mut q := close
   let mut depth := 1
   while depth > 0 do
@@ -1814,13 +1814,15 @@ private def attributeBracketBefore (source : String) (comments : Array (Nat × N
     q := String.Pos.Raw.prev source q
     -- A bracket inside a comment pairs with nothing in the code around it.
     unless comments.any (fun (start, stop) => start <= q.byteIdx && q.byteIdx < stop) do
-      match String.Pos.Raw.get source q with
-        | ']' => depth := depth + 1
-        | '[' => depth := depth - 1
-        | _   => pure ()
-  if q.byteIdx > 0 && String.Pos.Raw.get source (String.Pos.Raw.prev source q) == '@' then
-    return some close
-  return none
+      let c := String.Pos.Raw.get source q
+      if c == closing then depth := depth + 1 else if c == opening then depth := depth - 1
+  return some (q, close)
+
+private def attributeBracketBefore (source : String) (comments : Array (Nat × Nat))
+    (pos : String.Pos.Raw) : Option String.Pos.Raw := do
+  let (opened, close) ← groupBefore source comments '[' ']' pos
+  guard (opened.byteIdx > 0 && String.Pos.Raw.get source (String.Pos.Raw.prev source opened) == '@')
+  some close
 
 /-- The keywords that introduce a declaration, and the modifiers `Lean.Parser.Command.declModifiers`
     places AFTER visibility (`protected`, `meta`/`noncomputable`, `unsafe`, `partial`/`nonrec`),
@@ -1940,12 +1942,19 @@ private def visibilitySlot? (source declName : String) (comments : Array (Nat ×
   let mut keyword := if declKeywords.contains atName then atName else ""
   let mut pos := namePos
   repeat
-    let some (word, start) := wordBefore source comments pos | break
-    if word == "private" || word == "public" then return .ok none
-    if declKeywords.contains word then keyword := word
-    else unless afterVisibility.contains word do break
-    slot := some start
-    pos := start
+    match wordBefore source comments pos with
+    | some (word, start) =>
+        if word == "private" || word == "public" then return .ok none
+        if declKeywords.contains word then keyword := word
+        else unless afterVisibility.contains word do break
+        slot := some start
+        pos := start
+    | none =>
+        -- `instance (priority := 0) mapCat`: a clause may stand between the keyword and the name,
+        -- and stopping at it left `Freyd.Alg.mapCat` unmarked with 149 modules depending on it.
+        match groupBefore source comments '(' ')' pos with
+        | some (opened, _) => pos := opened
+        | none => break
   return .ok (if keyword.isEmpty then none else slot.map (·, keyword))
 
 /-- The edits that put one file on the module system, as byte ranges into `source`, with the report
