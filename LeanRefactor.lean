@@ -419,6 +419,22 @@ private partial def leanFilesUnder (dir : System.FilePath) : IO (Array String) :
       files := files.push entry.path.toString
   pure files
 
+/-- Paths under `dir` whose name ends in `suffix`.  Separate from `leanFilesUnder`, which skips
+    dot-directories on purpose: this one has to walk INSIDE `.lake` to see build artefacts. -/
+private partial def filesEndingIn (dir : System.FilePath) (suffix : String) : IO (Array String) := do
+  let mut out := #[]
+  for entry in ← dir.readDir do
+    if ← entry.path.isDir then out := out ++ (← filesEndingIn entry.path suffix)
+    else if entry.fileName.endsWith suffix then out := out.push entry.path.toString
+  return out
+
+/-- Whether a source is on the module system.  The keyword stands alone on its own line above the
+    imports, so the line test is exact — and it is the same question three callers ask: the pass
+    refusing a file it already converted, the same pass refusing to convert a file whose import is
+    not converted yet, and the artefact check deciding whether split `.olean` parts belong to it. -/
+private def sourceIsModule (source : String) : Bool :=
+  (source.splitOn "\n").any (·.trimAsciiStart.toString.startsWith "module")
+
 /-- Repository-relative `.lean` paths matching `pattern`.  Reports and returns empty if none match,
     so every `--glob` subcommand shares one selection rule and one message.
 
@@ -1501,6 +1517,53 @@ private def mapFilesParallel {α : Type} (jobs : Nat) (paths : Array String)
   for task in tasks do collected := collected ++ (← IO.ofExcept task.get)
   pure <| (collected.qsort fun left right => left.1 < right.1).map (·.2)
 
+/-- Everything `lake` writes for the module compiled from `path`.  A build under a rolled-back edit
+    leaves artefacts that match no source, and the `module` system makes that fatal rather than
+    merely stale: a file built as a `module` produces `X.olean` PLUS `X.olean.server` and
+    `X.olean.private`, and nothing deletes the parts when the source goes back to a plain module and
+    `X.olean` is rewritten in the one-file format.  Lean's loader then reads the parts as if they
+    described the new `X.olean`, walks the header as though it were objects, and the import NEVER
+    RETURNS — measured on this repository as a batch that ran for hours before it was killed.
+
+    So a restore deletes the WHOLE set, never a subset: an `.olean` in `module` format whose parts
+    are gone fails to load just as surely, with `missing data file for module X`. -/
+private def buildArtefacts (path : String) : Array String :=
+  match moduleNameOfPath path with
+  | .error _ => #[]
+  | .ok moduleName =>
+    let base := ".lake/build/lib/lean/" ++ moduleName.replace "." "/"
+    #[".olean", ".olean.hash", ".olean.server", ".olean.private", ".ilean", ".trace"].map (base ++ ·)
+
+private def dropBuildArtefacts (paths : Array String) : IO Unit := do
+  for path in paths do
+    for artefact in buildArtefacts path do
+      if ← System.FilePath.pathExists artefact then IO.FS.removeFile artefact
+
+/-- Refuse to work in a build tree that already holds the debris above: an `X.olean.server` whose
+    source is not a `module`.  Importing such a module never returns, so every operation that
+    elaborates would hang with no diagnostic — the check costs one directory walk and names the
+    files to delete.  A rolled-back batch cleans up after itself, but a run killed mid-build does
+    not, so the guard has to stand in front of the operations rather than only behind them. -/
+private def staleSplitParts : IO Bool := do
+  let buildDir : System.FilePath := ".lake/build/lib/lean"
+  unless ← buildDir.isDir do return false
+  let prefixLength := buildDir.toString.length + 1
+  let mut stale := #[]
+  for part in ← filesEndingIn buildDir ".olean.server" do
+    let source := (part.dropEnd ".olean.server".length |>.drop prefixLength).toString ++ ".lean"
+    let built ← if ← System.FilePath.pathExists source then
+        pure (sourceIsModule (← IO.FS.readFile source)) else pure false
+    unless built do stale := stale.push source
+  unless stale.isEmpty do
+    IO.eprintln <| s!"{stale.size} module(s) have `.olean.server`/`.olean.private` parts but a source \
+      that is not a `module`:\n" ++
+      String.intercalate "\n" (stale.toList.map ("  " ++ ·)) ++
+      "\nImporting one never returns — Lean reads the stale parts as if they described the current \
+      `.olean`.\nDelete each module's WHOLE artefact set (`.olean`, `.olean.hash`, `.olean.server`, \
+      `.olean.private`, `.ilean`, `.trace`) and rebuild; deleting only the parts leaves \
+      `missing data file for module X`."
+  return !stale.isEmpty
+
 /-- Run one `lean-refactor` subcommand per matching file, each in a CHILD process.
 
     Elaborating a file retains its whole `Environment`, so looping over a glob IN-PROCESS
@@ -1513,6 +1576,7 @@ private def mapFilesParallel {α : Type} (jobs : Nat) (paths : Array String)
     parent is by construction the up-to-date build that a `lake exe` would have selected. -/
 private def forkPerFile (pattern : String) (childArgs : String → Array String)
     (mentioning : Array String := #[]) : IO UInt32 := do
+  if ← staleSplitParts then return 1
   let selected ← globSelectedFiles pattern mentioning
   if selected.isEmpty then return 1
   let self := (← IO.appPath).toString
@@ -1651,30 +1715,119 @@ current meaning. Narrowing them is a separate pass, and once a repository is on 
 The edits cannot disturb each other, because none of them is a line number. Each is a byte range
 into the source as read; `independentEdits` refuses any pair that overlaps; and `applyEdits` sorts
 DESCENDING on `start` and folds, so every edit still to be applied points exactly where it did when
-it was computed. -/
+it was computed.
 
-/-- Where `public` goes in a declaration, or `none` when the source already says `private`/`public`.
-    `Lean.Parser.Command.declModifiers` fixes the order — docstring, attributes, VISIBILITY,
-    `protected`, `meta`/`noncomputable`, `unsafe`, `partial`/`nonrec` — so the slot is before the
-    first modifier that follows visibility, and before the declaration keyword when there is none. -/
-private def visibilityInsertion? (cmd : Syntax) : Option String.Pos.Raw := Id.run do
-  let some decl := cmd.find? (·.isOfKind ``Lean.Parser.Command.declaration) | return none
-  let mods := decl[0]
-  unless mods[2].getRange?.isNone do return none
-  for later in #[mods[3], mods[4], mods[5], mods[6], decl[1]] do
-    if let some range := later.getRange? then return some range.start
-  return none
+Nothing here is imported.  The one thing this pass cannot read off the text — where each declaration
+begins — the `.ilean` already recorded at build time and the index stores as `decl_range`, so the
+whole operation is a scan of the source plus one query.  That is the difference between 8 s and
+milliseconds on the largest file in a repository, and it is what keeps a 200-file batch off the
+import path entirely. -/
 
-/-- The edits that put one file on the module system, as byte ranges into `source`.  With
-    `checkImports`, refuse an import that is not yet a module — right for one file, wrong for a
-    batch, where the whole set becomes a module together and only the final build can judge.
-    `publics` are the declarations the index says something outside the file names; the CALLER
-    reads them from the index, so the batch's forked stage children never run sqlite: Db's
-    invocations share one temp file, and concurrent processes corrupt each other's reads. -/
-private def modularizeEdits (path source : String) (publics : Array String) (commands : Array Syntax)
-    (checkImports : Bool) : IO (Except String (Array Edit)) := do
+/-- Byte ranges the keyword scan must read as blank: line comments, and block comments and
+    docstrings with their nesting.  A `def` written inside a comment is not a declaration, and the
+    docstring above one is exactly where `public` must NOT go.
+
+    String literals are NOT masked, and need not be: the scan only ever walks backwards over word
+    characters, and a literal's closing quote stops it before its contents are read. -/
+private def commentRanges (source : String) : Array (Nat × Nat) := Id.run do
+  let stop := source.rawEndPos
+  let ch (p : String.Pos.Raw) : Char := if p < stop then String.Pos.Raw.get source p else ' '
+  let next (p : String.Pos.Raw) : String.Pos.Raw := String.Pos.Raw.next source p
+  let mut out := #[]
+  let mut pos : String.Pos.Raw := ⟨0⟩
+  while pos < stop do
+    if ch pos == '-' && ch (next pos) == '-' then
+      let mut p := next pos
+      while p < stop && ch p != '\n' do p := next p
+      out := out.push (pos.byteIdx, p.byteIdx)
+      pos := p
+    else if ch pos == '/' && ch (next pos) == '-' then
+      let mut p := next (next pos)
+      let mut depth := 1
+      while p < stop && depth > 0 do
+        if ch p == '/' && ch (next p) == '-' then depth := depth + 1; p := next (next p)
+        else if ch p == '-' && ch (next p) == '/' then depth := depth - 1; p := next (next p)
+        else p := next p
+      out := out.push (pos.byteIdx, p.byteIdx)
+      pos := p
+    else
+      pos := next pos
+  return out
+
+/-- What a name or a keyword is spelled with, for a scan that has no parser. -/
+private def wordChar (c : Char) : Bool :=
+  c.isAlphanum || c == '_' || c == '\'' || c == '!' || c == '?'
+
+/-- The word ending just before `pos`, and where it starts — `none` when the character before `pos`
+    is not part of a word.  Positions inside `comments` are skipped as if they were whitespace. -/
+private def wordBefore (source : String) (comments : Array (Nat × Nat)) (pos : String.Pos.Raw) :
+    Option (String × String.Pos.Raw) := Id.run do
+  -- A comment is skipped whole: scanning back into one would read its last word as source text.
+  let skipBack (p : String.Pos.Raw) : String.Pos.Raw :=
+    match comments.find? fun (start, stop) => start < p.byteIdx && p.byteIdx <= stop with
+      | some (start, _) => ⟨start⟩
+      | none => p
+  let before (p : String.Pos.Raw) : Char := String.Pos.Raw.get source (String.Pos.Raw.prev source p)
+  let back (p : String.Pos.Raw) : String.Pos.Raw := String.Pos.Raw.prev source p
+  let mut p := skipBack pos
+  while p.byteIdx > 0 && (before p).isWhitespace do p := skipBack (back p)
+  if p.byteIdx == 0 || !wordChar (before p) then return none
+  let stop := p
+  while p.byteIdx > 0 && wordChar (before p) do p := back p
+  return some (String.Pos.Raw.extract source p stop, p)
+
+/-- The keywords that introduce a declaration, and the modifiers `Lean.Parser.Command.declModifiers`
+    places AFTER visibility (`protected`, `meta`/`noncomputable`, `unsafe`, `partial`/`nonrec`),
+    plus the `scoped`/`local` attribute kind that sits between the modifiers and `instance`.
+    `public` goes before the whole run of them, never inside it. -/
+private def declKeywords : Array String :=
+  #["def", "theorem", "abbrev", "instance", "structure", "class", "inductive", "opaque", "axiom"]
+
+private def afterVisibility : Array String :=
+  #["protected", "meta", "noncomputable", "unsafe", "partial", "nonrec", "scoped", "local"]
+
+/-- Where `public` goes for the declaration `declName`, whose name the index recorded as starting at
+    `namePos`: at the start of the run of keywords and modifiers immediately before it.  `ok none`
+    when the source already fixes visibility, and when the run holds no declaration keyword at all —
+    the recorded position is then not a declaration this pass can mark.
+
+    An anonymous `instance` has no name to precede, and the `.ilean` records the keyword itself as
+    its position, so the run is allowed to start AT `namePos`.
+
+    `error` when the word at `namePos` is neither a component of `declName` nor a declaration
+    keyword: the index is describing a source that has since been edited, and `public ` written at a
+    position that has moved lands in front of the WRONG declaration — valid syntax, so no build
+    would catch it.  Checking the text beats comparing timestamps, which report a file restored from
+    version control as edited for as long as its content keeps `lake` from rebuilding it. -/
+private def visibilitySlot? (source declName : String) (comments : Array (Nat × Nat))
+    (namePos : String.Pos.Raw) : Except String (Option String.Pos.Raw) := Id.run do
+  let mut nameEnd := namePos
+  while nameEnd < source.rawEndPos && wordChar (String.Pos.Raw.get source nameEnd) do
+    nameEnd := String.Pos.Raw.next source nameEnd
+  let atName := String.Pos.Raw.extract source namePos nameEnd
+  unless atName.isEmpty || declKeywords.contains atName || (declName.splitOn ".").contains atName do
+    return .error s!"the index puts `{declName}` where the source has `{atName}`"
+  let mut slot := if declKeywords.contains atName then some namePos else none
+  let mut keyword := slot.isSome
+  let mut pos := namePos
+  repeat
+    let some (word, start) := wordBefore source comments pos | break
+    if word == "private" || word == "public" then return .ok none
+    if declKeywords.contains word then keyword := true
+    else unless afterVisibility.contains word do break
+    slot := some start
+    pos := start
+  return .ok (if keyword then slot else none)
+
+/-- The edits that put one file on the module system, as byte ranges into `source`, with the report
+    line.  With `checkImports`, refuse an import that is not yet a module — right for one file,
+    wrong for a batch, where the whole set becomes a module together and only the final build can
+    judge.  `sites` are the 0-based LSP positions of the declarations the index says something
+    outside the file names. -/
+private def modularizeEdits (path source : String) (sites : Array (String × Nat × Nat))
+    (checkImports : Bool) : IO (Except String (Array Edit × String)) := do
   let lines := source.splitOn "\n"
-  if lines.any (·.trimAsciiStart.toString.startsWith "module") then
+  if sourceIsModule source then
     return .error s!"{path}: already on the module system"
   let mut edits : Array Edit := #[]
   let mut offset : String.Pos.Raw := ⟨0⟩
@@ -1693,8 +1846,7 @@ private def modularizeEdits (path source : String) (publics : Array String) (com
       if checkImports then
         let importedPath := System.FilePath.mk (imported.replace "." "/" ++ ".lean")
         if ← System.FilePath.pathExists importedPath then
-          let importedSource ← IO.FS.readFile importedPath
-          unless (importedSource.splitOn "\n").any (·.trimAsciiStart.toString.startsWith "module") do
+          unless sourceIsModule (← IO.FS.readFile importedPath) do
             return .error s!"{path}: `{imported}` ({importedPath}) is not a `module` yet, and a module \
               cannot import one that is not; convert it first"
       -- The keyword and the first import's `public` are ONE edit, not two. Two zero-width edits at
@@ -1721,29 +1873,29 @@ private def modularizeEdits (path source : String) (publics : Array String) (com
   -- built but was not a module, so everything importing it refused.
   let header := if imports == 0 then "module\n\n@[expose] section\n\n" else "\n@[expose] section\n"
   edits := edits.push { start := afterImports, stop := afterImports, line := 0, replacement := header }
+  let fileMap := FileMap.ofString source
+  let comments := commentRanges source
   let mut marked := 0
-  for declName in publics do
-    -- A name the index has but the file does not write is a projection or a derived instance; it
-    -- inherits its parent's visibility, so there is nothing to edit.
-    if let .ok cmd := declarationSyntax commands declName then
-      if let some slot := visibilityInsertion? cmd then
+  for (declName, line, column) in sites do
+    match visibilitySlot? source declName comments (fileMap.lspPosToUtf8Pos ⟨line, column⟩) with
+    | .error message => return .error s!"{path}:{line + 1}: {message}; rebuild before marking it"
+    | .ok none => pure ()
+    | .ok (some slot) =>
         edits := edits.push { start := slot, stop := slot, line := 0, replacement := "public " }
         marked := marked + 1
-  IO.println s!"{path}: `module`, {imports} public import(s), {marked} public declaration(s)"
-  return .ok edits
+  return .ok (edits, s!"{path}: `module`, {imports} public import(s), {marked} public declaration(s)")
 
 /-- `lean-refactor modularize`: put one file on the module system, verifying that it still
     elaborates. Visibility is the only thing here the index decides, and it decides it from the
     dependency edges — a declaration is public exactly when something outside this file names it. -/
 private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   let some dbPath ← refreshedIndex? | return 1
-  initSearchPath (← findSysroot)
-  let (source, _, commands, _) ← elaborateFile path
+  let source ← IO.FS.readFile path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
-  let publics ← Query.publicDecls dbPath moduleName
-  let edits ← match ← modularizeEdits path source publics commands true with
+  let (edits, summary) ← match ← modularizeEdits path source (← Query.publicDeclSites dbPath moduleName) true with
     | .error message => IO.eprintln message; return 1
-    | .ok edits => pure edits
+    | .ok result => pure result
+  IO.println summary
   let (selected, deferred) := independentEdits edits
   if deferred != 0 then
     IO.eprintln s!"{path}: refusing {deferred} overlapping edit(s)"
@@ -1751,6 +1903,7 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   unless apply do IO.println "preview only; pass --apply to write"; return 0
   let updated := applyEdits source selected
   IO.FS.writeFile path updated
+  initSearchPath (← findSysroot)
   unless ← fileElaboratesCleanly path updated do
     IO.FS.writeFile path source
     IO.eprintln s!"{path}: the modularised source does not elaborate; restored"
@@ -1758,28 +1911,26 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   IO.println s!"applied {selected.size} edit(s) to {path}"
   return 0
 
-/-- Analyse one file for the batch driver and write the edits to `stagePath`, never to `path`.
-    `publics` come from the parent, which read the index before forking.  Exit 3 means the file is
-    already a module, which is not a failure for a batch.  There is no per-file verify here:
-    mid-batch a converted file's imports are not yet rebuilt, so the one repository build at the
-    end is the gate. -/
-private def modularizeStage (path stagePath : String) (publics : Array String) : IO UInt32 := do
-  initSearchPath (← findSysroot)
-  let (source, _, commands, _) ← elaborateFile path
-  let edits ← match ← modularizeEdits path source publics commands false with
-    | .error message =>
-        if message.endsWith "already on the module system" then
-          IO.println message
-          return 3
-        IO.eprintln message
-        return 1
-    | .ok edits => pure edits
-  let (selected, deferred) := independentEdits edits
-  if deferred != 0 then
-    IO.eprintln s!"{path}: refusing {deferred} overlapping edit(s)"
-    return 1
-  IO.FS.writeFile stagePath (applyEdits source selected)
-  return 0
+/-- Stage one file for the batch driver: the edits go to `stagePath`, never to `path`, and the
+    report comes back in the shape `stagedGlob` collects.  Exit 3 means the file is already a
+    module, which is not a failure for a batch.  There is no per-file verify: mid-batch a converted
+    file's imports are not yet rebuilt, so the one repository build at the end is the gate — and
+    since nothing here elaborates, there is no `Environment` to hand back and no child to fork. -/
+private def modularizeStage (path stagePath : String) (sites : Array (String × Nat × Nat)) :
+    IO IO.Process.Output := do
+  let source ← IO.FS.readFile path
+  match ← modularizeEdits path source sites false with
+  | .error message =>
+      if message.endsWith "already on the module system" then
+        return { stdout := message ++ "\n", stderr := "", exitCode := 3 }
+      return { stdout := "", stderr := message ++ "\n", exitCode := 1 }
+  | .ok (edits, summary) =>
+      let (selected, deferred) := independentEdits edits
+      if deferred != 0 then
+        return { stdout := "", stderr := s!"{path}: refusing {deferred} overlapping edit(s)\n",
+                 exitCode := 1 }
+      IO.FS.writeFile stagePath (applyEdits source selected)
+      return { stdout := summary ++ "\n", stderr := "", exitCode := 0 }
 
 /-- `lean-refactor dup`: declarations the index groups as saying, or proving, the same thing.
 
@@ -1881,13 +2032,13 @@ private def renameDeclStage (path stagePath : String) (renames : Array Rename) :
     repository build; any failure restores every file.  This is the shape a cross-file edit needs —
     no per-file check can pass while the change is half applied.  A child exits 3 to say its file is
     not affected, which is not a failure. -/
-private def stagedGlob (pattern description : String) (childArgs : String → String → Array String)
+private def stagedGlob (pattern description : String)
+    (stage : String → String → IO IO.Process.Output)
     (apply : Bool) (mentioning : Array String := #[]) : IO UInt32 := do
+  if ← staleSplitParts then return 1
   let selected ← globSelectedFiles pattern mentioning
   if selected.isEmpty then return 1
-  let self := (← IO.appPath).toString
-  let outputs ← mapFilesParallel (← scanJobs) selected fun path =>
-    IO.Process.output { cmd := self, args := childArgs path (stagePathFor path) }
+  let outputs ← mapFilesParallel (← scanJobs) selected fun path => stage path (stagePathFor path)
   let mut staged : Array String := #[]
   let mut failed := false
   for (path, output) in selected.zip outputs do
@@ -1918,6 +2069,7 @@ private def stagedGlob (pattern description : String) (childArgs : String → St
   unless build.stderr.isEmpty do IO.eprint build.stderr
   if build.exitCode != 0 then
     for (path, source) in restore do IO.FS.writeFile path source
+    dropBuildArtefacts stagedFiles
     IO.eprintln s!"whole-repository build failed ({description}); restored"
     return build.exitCode
   IO.println s!"{description}: {stagedFiles.size} file(s); build passed"
@@ -1925,8 +2077,10 @@ private def stagedGlob (pattern description : String) (childArgs : String → St
 
 private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : Bool) : IO UInt32 := do
   let dbPath? ← refreshedIndex?
+  let self := (← IO.appPath).toString
   let status ← stagedGlob pattern s!"renamed {renameList renames}"
-    (fun path stage => #["rename-decl-stage", path, stage] ++ renameArgs renames) apply
+    (fun path stage => IO.Process.output
+      { cmd := self, args := #["rename-decl-stage", path, stage] ++ renameArgs renames }) apply
     (mentioning := renames.map fun r => shortName r.declName)
   if let some dbPath := dbPath? then
     for r in renames do warnSilentDependents dbPath r.declName
@@ -1934,17 +2088,32 @@ private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : 
 
 /-- `lean-refactor modularize --glob`: put every file matching the pattern on the module system
     together, staging per file and swapping all in at once — the shape `rename-decl` uses for
-    exactly this situation.  The index is read HERE, in the parent, and each child receives its
-    declarations as arguments: Db's sqlite3 invocations share one temp file, so the forked stage
-    children must never run sqlite against it concurrently. -/
+    exactly this situation.  The whole batch runs in ONE process: the index is queried here, and
+    staging a file is a scan of its text, so there is no `Environment` to keep apart and no child
+    to fork. -/
 private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
   let some dbPath ← refreshedIndex? | return 1
-  let mut publics : Std.HashMap String (Array String) := {}
+  let indexed ← Query.moduleSources dbPath
+  let mut sites : Std.HashMap String (Array (String × Nat × Nat)) := {}
+  let mut unbuilt := #[]
   for path in ← globSelectedFiles pattern do
     let moduleName ← IO.ofExcept (moduleNameOfPath path)
-    publics := publics.insert path (← Query.publicDecls dbPath moduleName)
-  stagedGlob pattern "put on the module system"
-    (fun path stage => #["modularize-stage", path, stage] ++ publics.getD path #[]) apply
+    -- A module the index has never seen was never built, so nothing is known about what names it
+    -- from outside and converting it would mark nothing `public`.  It is left alone instead: a
+    -- module may not import a plain module, but a plain module may import a module, so a file
+    -- outside the build blocks nothing — and nothing imports it either, or it would be built.
+    if indexed.contains moduleName then
+      sites := sites.insert path (← Query.publicDeclSites dbPath moduleName)
+    else
+      unbuilt := unbuilt.push path
+  unless unbuilt.isEmpty do
+    IO.println <| s!"leaving {unbuilt.size} file(s) alone: never built, so the index knows nothing \
+      about what names them:\n" ++ String.intercalate "\n" (unbuilt.toList.map ("  " ++ ·))
+  -- Exit 3 is `stagedGlob`'s "this file is not affected", which is exactly an unbuilt one's case.
+  stagedGlob pattern "put on the module system" (fun path stage =>
+    match sites[path]? with
+    | some fileSites => modularizeStage path stage fileSites
+    | none => pure { stdout := "", stderr := "", exitCode := 3 }) apply
 
 /-! ## Token renaming (syntax-atom-anchored, for notation)
 
@@ -2059,9 +2228,11 @@ private def infixStage (path declName token stagePath : String) : IO UInt32 := d
   IO.FS.writeFile stagePath (applyEdits source selected)
   return 0
 
-private def infixGlob (pattern declName token : String) (apply : Bool) : IO UInt32 :=
+private def infixGlob (pattern declName token : String) (apply : Bool) : IO UInt32 := do
+  let self := (← IO.appPath).toString
   stagedGlob pattern s!"wrote `{declName}` infix as `{token}`"
-    (fun path stage => #["infix-stage", path, declName, token, stage]) apply
+    (fun path stage => IO.Process.output
+      { cmd := self, args := #["infix-stage", path, declName, token, stage] }) apply
     (mentioning := #[shortName declName])
 
 private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
@@ -2206,7 +2377,6 @@ def main (args : List String) : IO UInt32 := do
   | ["modularize", "--glob", pattern, "--apply"] => return ← modularizeGlob pattern true
   | ["modularize", path] => return ← modularize path false
   | ["modularize", path, "--apply"] => return ← modularize path true
-  | "modularize-stage" :: path :: stagePath :: publics => return ← modularizeStage path stagePath publics.toArray
   | ["dup"] => return ← dupReport false 0
   | ["dup", "--proof"] => return ← dupReport true 12
   | ["dup", "--proof", "--min-nodes", nodes] =>

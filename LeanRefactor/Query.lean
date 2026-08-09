@@ -130,25 +130,37 @@ public def statementGroups (dbPath : String) : IO (Array DupGroup) :=
 public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) :=
   groupsOn dbPath "proof_key" s!"and i.proof_nodes >= {minNodes}"
 
-/-- The declarations of `module` that the module system would have to mark `public`: the ones
-    something outside the module names, plus the notation and parser declarations.
+/-- Where in the source each declaration of `module` sits that the module system would have to mark
+    `public`: the ones something outside the module names.  The position is the 0-based LSP start of
+    the declaration's NAME, from `decl_range` — the `.ilean` half recorded it at build time, so
+    marking a file needs no parse.
 
-    A notation declaration has no incoming edge — downstream elaborated terms name the function the
-    notation expands to, never the parser constant — and the `.ilean` half records nothing for it
-    either, so the dependency rule alone would make it private and every downstream file would stop
-    parsing.  They are recognised instead by what they are: a declaration whose type mentions
-    `Lean.ParserDescr`.
+    Notation is NOT among them and needs no marking: a `notation` command is exported across a
+    module boundary as it stands, and `public` is not even accepted before it — Lean's error names
+    the commands it does accept, and `notation` is not one.  (Measured, because the dependency edges
+    say nothing either way: downstream elaborated terms name the function the notation expands to,
+    never the parser constant.)
 
     Declarations the source already marks `private` are excluded: they are mangled to `_private.…`
-    and stay module-local either way. -/
-public def publicDecls (dbPath moduleName : String) : IO (Array String) := do
+    and stay module-local either way.  So are the ones with no `decl_range` row — a structure field
+    or a derived instance, which the source never writes and which inherits its parent's
+    visibility; the join drops them. -/
+public def publicDeclSites (dbPath moduleName : String) : IO (Array (String × Nat × Nat)) := do
   let m := escaped moduleName
-  let j ← Db.query dbPath s!"select i.name as m from decl_info i
+  let j ← Db.query dbPath s!"select i.user_name as n, r.sl1 as l, r.sc1 as c from decl_info i
+join decl_range r on r.name = i.name and r.module = i.module
 where i.module = '{m}' and i.internal = 0 and i.name not like '\\_private%' escape '\\'
-  and (exists (select 1 from dep d where d.dst = i.name and d.module != i.module)
-       or exists (select 1 from dep p where p.src = i.name and p.dst like 'Lean.%ParserDescr%'))
-order by i.name"
-  return (namedModules j)
+  and exists (select 1 from dep d where d.dst = i.name and d.module != i.module)
+order by r.sl1, r.sc1"
+  match j with
+  | .arr rows =>
+      -- sqlite3 prints integer columns as JSON numbers; a row whose fields do not parse is skipped.
+      return rows.filterMap fun row => do
+        let n ← (row.getObjValAs? String "n").toOption
+        let l ← (row.getObjValAs? Nat "l").toOption
+        let c ← (row.getObjValAs? Nat "c").toOption
+        pure (n, l, c)
+  | _ => return #[]
 
 /-- The `module.source` path of every module, keyed by its `module.name` — the join the path-facing
     callers need when a query returns module names. -/
