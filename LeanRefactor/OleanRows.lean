@@ -47,7 +47,11 @@ private def generatedName (n : Name) : Bool :=
   n.isInternalDetail || n.components.any fun component =>
     let s := toString component
     numbered "match_" s || numbered "proof_" s || numbered "eq_" s ||
-      ["eq_def", "splitter", "mk", "inj", "injEq", "noConfusion", "noConfusionType", "sizeOf_spec",
+      -- No `mk`: a real constructor never reaches here, `kindOf` having dropped it, so the only
+      -- names the component matched were hand-written `def mk`s — and hiding one of those from
+      -- `modularize` left `Freyd.UF.Ultraproduct.mk` unmarked while the `sound` that names it was
+      -- public. The `X.mk.injEq` family is already caught by its own last component.
+      ["eq_def", "splitter", "inj", "injEq", "noConfusion", "noConfusionType", "sizeOf_spec",
        "casesOn", "recOn", "brecOn", "below", "ibelow", "binductionOn", "ndrec"].contains s
 
 /-- Drop `mdata` (source positions and elaborator residue): it hashes as a node of its own but says

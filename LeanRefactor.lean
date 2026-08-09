@@ -1832,6 +1832,42 @@ private def declKeywords : Array String :=
 private def afterVisibility : Array String :=
   #["protected", "meta", "noncomputable", "unsafe", "partial", "nonrec", "scoped", "local"]
 
+/-- Where an `instance` command's keyword starts within `line`, or `none` when the line starts no
+    such command.  A command begins at column zero and only an attribute list and the modifiers may
+    stand before the keyword, which is what keeps `attribute [instance] foo` out.
+
+    Instances are read off the SOURCE because the index cannot answer for them.  Typeclass
+    resolution consults every instance while elaborating a public signature and leaves no trace of
+    what it found: the coercion or the class field is unfolded into the term, so neither a
+    dependency edge nor a reference records the instance.  `Freyd.S2_20`'s `CoeFun` instance has
+    zero of both, and a `public theorem` whose statement applies `D` to an argument then fails with
+    `Function expected` — the instance is not in the scope that signature elaborates in.  So every
+    instance the source writes is marked, and exposed with it, since a class field like
+    `Freyd.S2_155_BiEntire`'s `instCatB.Hom` has to unfold for the compiler downstream. -/
+private def instanceKeywordInLine? (line : String) : Option Nat := Id.run do
+  let stop := line.rawEndPos
+  if stop.byteIdx == 0 || (String.Pos.Raw.get line ⟨0⟩).isWhitespace then return none
+  let mut p : String.Pos.Raw := ⟨0⟩
+  if line.startsWith "@[" then
+    let mut depth := 0
+    repeat
+      if !(p < stop) then return none
+      let c := String.Pos.Raw.get line p
+      p := String.Pos.Raw.next line p
+      if c == '[' then depth := depth + 1
+      else if c == ']' then
+        depth := depth - 1
+        if depth == 0 then break
+  repeat
+    while p < stop && (String.Pos.Raw.get line p).isWhitespace do p := String.Pos.Raw.next line p
+    let start := p
+    while p < stop && wordChar (String.Pos.Raw.get line p) do p := String.Pos.Raw.next line p
+    let word := String.Pos.Raw.extract line start p
+    if word == "instance" then return some start.byteIdx
+    -- An empty word is the end of the line, and `private`/`public` is a visibility the source fixes.
+    unless afterVisibility.contains word do return none
+  return none
+
 /-- Where `public` goes for the declaration `declName`, whose name the index recorded as starting at
     `namePos`: at the start of the run of keywords and modifiers immediately before it, WITH the
     declaration keyword found there, which decides whether `@[expose]` may join it.  `ok none` when
@@ -1876,10 +1912,12 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
   let lines := source.splitOn "\n"
   if sourceIsModule source then
     return .error s!"{path}: already on the module system"
+  let comments := commentRanges source
   let mut edits : Array Edit := #[]
   let mut offset : String.Pos.Raw := ⟨0⟩
   let mut imports := 0
   let mut afterImports : String.Pos.Raw := ⟨0⟩
+  let mut instanceSites : Array String.Pos.Raw := #[]
   for line in lines do
     -- Line-oriented and exact, as `rename-module`'s import edits are: only a module name follows the
     -- keyword, so no docstring or declaration can match.
@@ -1904,19 +1942,34 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
       edits := edits.push { start := offset, stop := offset, line := 0, replacement := header }
       imports := imports + 1
       afterImports := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
+    else if let some column := instanceKeywordInLine? line then
+      -- Commented-out code declares nothing.
+      let pos := offset.byteIdx + column
+      unless comments.any (fun (start, stop) => start <= pos && pos < stop) do
+        instanceSites := instanceSites.push ⟨pos⟩
     offset := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
   -- A root module imports nothing, so there is no import line to hang the keyword on; it goes at the
   -- very start, above the banner comment, which is the only position that needs no parsing.
   if imports == 0 then
     edits := edits.push { start := ⟨0⟩, stop := ⟨0⟩, line := 0, replacement := "module\n\n" }
   let fileMap := FileMap.ofString source
-  let comments := commentRanges source
   let mut marked := 0
-  for (declName, line, column) in sites do
-    match visibilitySlot? source declName comments (fileMap.lspPosToUtf8Pos ⟨line, column⟩) with
-    | .error message => return .error s!"{path}:{line + 1}: {message}; rebuild before marking it"
+  -- A named instance reaches the loop twice, once from the index and once from the source scan, and
+  -- both times through the same slot. Two zero-width edits at one offset do not overlap, so nothing
+  -- downstream would reject the pair — it would just write `public public instance`.
+  let mut slots : Std.HashSet Nat := {}
+  let targets := sites.map (fun (declName, line, column) =>
+      (declName, fileMap.lspPosToUtf8Pos ⟨line, column⟩)) ++
+    instanceSites.map (fun pos => ("instance", pos))
+  for (declName, namePos) in targets do
+    match visibilitySlot? source declName comments namePos with
+    | .error message =>
+        return .error s!"{path}:{(fileMap.toPosition namePos).line}: {message}; rebuild before \
+          marking it"
     | .ok none => pure ()
     | .ok (some (slot, keyword)) =>
+        if slots.contains slot.byteIdx then continue
+        slots := slots.insert slot.byteIdx
         -- `public` says the NAME is visible downstream, `@[expose]` that the BODY is, and the two
         -- travel together here: the public set is closed under what a public body mentions, so
         -- exposing exactly it leaves no exposed body naming an unexposed constant.  A `theorem` is
