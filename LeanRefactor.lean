@@ -1844,29 +1844,75 @@ private def afterVisibility : Array String :=
     `Function expected` — the instance is not in the scope that signature elaborates in.  So every
     instance the source writes is marked, and exposed with it, since a class field like
     `Freyd.S2_155_BiEntire`'s `instCatB.Hom` has to unfold for the compiler downstream. -/
-private def instanceKeywordInLine? (line : String) : Option Nat := Id.run do
+private def commandInLine? (line : String) : Option (Nat × String × String) := Id.run do
   let stop := line.rawEndPos
   if stop.byteIdx == 0 || (String.Pos.Raw.get line ⟨0⟩).isWhitespace then return none
+  let at? (p : String.Pos.Raw) : Char := if p < stop then String.Pos.Raw.get line p else ' '
   let mut p : String.Pos.Raw := ⟨0⟩
   if line.startsWith "@[" then
     let mut depth := 0
     repeat
       if !(p < stop) then return none
-      let c := String.Pos.Raw.get line p
+      let c := at? p
       p := String.Pos.Raw.next line p
       if c == '[' then depth := depth + 1
       else if c == ']' then
         depth := depth - 1
         if depth == 0 then break
   repeat
-    while p < stop && (String.Pos.Raw.get line p).isWhitespace do p := String.Pos.Raw.next line p
+    while p < stop && (at? p).isWhitespace do p := String.Pos.Raw.next line p
     let start := p
-    while p < stop && wordChar (String.Pos.Raw.get line p) do p := String.Pos.Raw.next line p
+    while p < stop && wordChar (at? p) do p := String.Pos.Raw.next line p
     let word := String.Pos.Raw.extract line start p
-    if word == "instance" then return some start.byteIdx
+    if declKeywords.contains word then
+      while p < stop && (at? p).isWhitespace do p := String.Pos.Raw.next line p
+      let nameStart := p
+      -- A dot belongs to the name only between components: `Cat.{w, z}` is `Cat` with its universes.
+      while p < stop &&
+          (wordChar (at? p) || (at? p == '.' && wordChar (at? (String.Pos.Raw.next line p)))) do
+        p := String.Pos.Raw.next line p
+      return some (start.byteIdx, word, String.Pos.Raw.extract line nameStart p)
     -- An empty word is the end of the line, and `private`/`public` is a visibility the source fixes.
     unless afterVisibility.contains word do return none
   return none
+
+/-- Every command the source starts, as (byte offset of its keyword, keyword, name as written).
+    Commented-out code declares nothing, so it is skipped. -/
+private def sourceCommands (source : String) (comments : Array (Nat × Nat)) :
+    Array (Nat × String × String) := Id.run do
+  let mut out := #[]
+  let mut offset := 0
+  for line in source.splitOn "\n" do
+    if let some (column, keyword, name) := commandInLine? line then
+      let pos := offset + column
+      unless comments.any (fun (start, stop) => start <= pos && pos < stop) do
+        out := out.push (pos, keyword, name)
+    offset := offset + line.utf8ByteSize + 1
+  return out
+
+/-- The 0-based lines that start an `instance` command — the seeds the public closure has to be run
+    from as well, since nothing in the olean says which definitions are instances.  Seeds, not marks:
+    `Freyd.S2_155_BiEntire`'s `instCatB` names `BObj` and `BHom` in its own signature, and making the
+    instance public without the closure only moved the error to `a private declaration exists but
+    would need to be public to access here`. -/
+private def instanceLines (source : String) : Array Nat := Id.run do
+  let fileMap := FileMap.ofString source
+  return (sourceCommands source (commentRanges source)).filterMap fun (pos, keyword, _) =>
+    if keyword == "instance" then some (fileMap.toPosition ⟨pos⟩).line.pred else none
+
+/-- Where `declName` is declared, found in the SOURCE by the name it is written under: the index
+    reports no range at all for one declaration in five, and the binding site it falls back on can
+    be a binder rather than the declaration — `Freyd.Alg.BObj`'s only site is the `A` of a
+    `{A B : Type u}` three declarations earlier.  A file writes the name without the namespace it
+    sits in, so a written name matches when the full name ends with it at a component boundary, and
+    the longest such match wins. -/
+private def declaredAt? (commands : Array (Nat × String × String)) (declName : String) :
+    Option Nat := Id.run do
+  let mut best : Option (Nat × String) := none
+  for (pos, _, name) in commands do
+    if !name.isEmpty && (declName == name || declName.endsWith ("." ++ name)) then
+      if best.all fun (_, chosen) => chosen.length < name.length then best := some (pos, name)
+  return best.map (·.1)
 
 /-- Where `public` goes for the declaration `declName`, whose name the index recorded as starting at
     `namePos`: at the start of the run of keywords and modifiers immediately before it, WITH the
@@ -1917,7 +1963,6 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
   let mut offset : String.Pos.Raw := ⟨0⟩
   let mut imports := 0
   let mut afterImports : String.Pos.Raw := ⟨0⟩
-  let mut instanceSites : Array String.Pos.Raw := #[]
   for line in lines do
     -- Line-oriented and exact, as `rename-module`'s import edits are: only a module name follows the
     -- keyword, so no docstring or declaration can match.
@@ -1942,34 +1987,25 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
       edits := edits.push { start := offset, stop := offset, line := 0, replacement := header }
       imports := imports + 1
       afterImports := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
-    else if let some column := instanceKeywordInLine? line then
-      -- Commented-out code declares nothing.
-      let pos := offset.byteIdx + column
-      unless comments.any (fun (start, stop) => start <= pos && pos < stop) do
-        instanceSites := instanceSites.push ⟨pos⟩
     offset := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
   -- A root module imports nothing, so there is no import line to hang the keyword on; it goes at the
   -- very start, above the banner comment, which is the only position that needs no parsing.
   if imports == 0 then
     edits := edits.push { start := ⟨0⟩, stop := ⟨0⟩, line := 0, replacement := "module\n\n" }
   let fileMap := FileMap.ofString source
+  let commands := sourceCommands source comments
   let mut marked := 0
-  -- A named instance reaches the loop twice, once from the index and once from the source scan, and
-  -- both times through the same slot. Two zero-width edits at one offset do not overlap, so nothing
-  -- downstream would reject the pair — it would just write `public public instance`.
-  let mut slots : Std.HashSet Nat := {}
-  let targets := sites.map (fun (declName, line, column) =>
-      (declName, fileMap.lspPosToUtf8Pos ⟨line, column⟩)) ++
-    instanceSites.map (fun pos => ("instance", pos))
-  for (declName, namePos) in targets do
-    match visibilitySlot? source declName comments namePos with
-    | .error message =>
-        return .error s!"{path}:{(fileMap.toPosition namePos).line}: {message}; rebuild before \
-          marking it"
+  for (declName, line, column) in sites do
+    let atIndex := visibilitySlot? source declName comments (fileMap.lspPosToUtf8Pos ⟨line, column⟩)
+    -- The text checks the index's position, and is also what a wrong one is corrected from; only a
+    -- position the source does not confirm EITHER way is reported.
+    let resolved := match atIndex, declaredAt? commands declName with
+      | .error _, some pos => visibilitySlot? source declName comments ⟨pos⟩
+      | result, _ => result
+    match resolved with
+    | .error message => return .error s!"{path}:{line + 1}: {message}; rebuild before marking it"
     | .ok none => pure ()
     | .ok (some (slot, keyword)) =>
-        if slots.contains slot.byteIdx then continue
-        slots := slots.insert slot.byteIdx
         -- `public` says the NAME is visible downstream, `@[expose]` that the BODY is, and the two
         -- travel together here: the public set is closed under what a public body mentions, so
         -- exposing exactly it leaves no exposed body naming an unexposed constant.  A `theorem` is
@@ -1999,7 +2035,8 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   let some dbPath ← refreshedIndex? | return 1
   let source ← IO.FS.readFile path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
-  let (edits, summary) ← match ← modularizeEdits path source (← Query.publicDeclSites dbPath moduleName) true with
+  let sites ← Query.publicDeclSites dbPath moduleName (instanceLines source)
+  let (edits, summary) ← match ← modularizeEdits path source sites true with
     | .error message => IO.eprintln message; return 1
     | .ok result => pure result
   IO.println summary
@@ -2210,7 +2247,8 @@ private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
     -- module may not import a plain module, but a plain module may import a module, so a file
     -- outside the build blocks nothing — and nothing imports it either, or it would be built.
     if indexed.contains moduleName then
-      sites := sites.insert path (← Query.publicDeclSites dbPath moduleName)
+      sites := sites.insert path
+        (← Query.publicDeclSites dbPath moduleName (instanceLines (← IO.FS.readFile path)))
     else
       unbuilt := unbuilt.push path
   unless unbuilt.isEmpty do

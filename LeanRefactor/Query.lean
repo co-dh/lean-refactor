@@ -169,11 +169,25 @@ public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) 
        exported syntax are recognised by what they are built from: a `ParserDescr` (the notation
        itself), a `Macro` (the rule that expands it) or a tactic elaborator.
 
+    5. It is an INSTANCE, or a public one's signature names it.  Typeclass resolution consults every
+       instance while elaborating a public signature and leaves no trace of what it found — the
+       coercion or the class field is unfolded into the term — so `Freyd.S2_20`'s `CoeFun` instance
+       has neither an edge nor a reference anywhere here, and the theorem whose statement applies
+       `D` to an argument failed with `Function expected`.  The caller reads the instance lines off
+       the source, which is the only place that says which definitions are instances; they enter as
+       SEEDS, so the closure below carries `Freyd.S2_155_BiEntire`'s `instCatB` on to the `BObj` and
+       `BHom` its own signature names.
+
     Declarations the source already marks `private` are excluded: they are mangled to `_private.…`
     and stay module-local either way.  So are the ones neither half places — a structure field or a
     derived instance, which the source never writes and which inherits its parent's visibility. -/
-public def publicDeclSites (dbPath moduleName : String) : IO (Array (String × Nat × Nat)) := do
+public def publicDeclSites (dbPath moduleName : String) (instanceLines : Array Nat) :
+    IO (Array (String × Nat × Nat)) := do
   let m := escaped moduleName
+  -- `in ()` is not SQL, and no line is negative.
+  let onInstanceLine :=
+    if instanceLines.isEmpty then "-1"
+    else String.intercalate ", " (instanceLines.toList.map toString)
   let j ← Db.query dbPath s!"with recursive named(n) as (
   select i.name from decl_info i
   where i.module = '{m}' and i.name not like '\\_private%' escape '\\'
@@ -183,7 +197,11 @@ public def publicDeclSites (dbPath moduleName : String) : IO (Array (String × N
          or exists (select 1 from use_site s join dep p on p.src = s.parent
                     where s.name = i.name and s.use_module = '{m}' and s.is_definition = 0
                       and p.dst in ('Lean.ParserDescr', 'Lean.TrailingParserDescr', 'Lean.Macro',
-                                    'Lean.Elab.Tactic.Tactic')))
+                                    'Lean.Elab.Tactic.Tactic'))
+         or exists (select 1 from decl_range r where r.name = i.name and r.module = '{m}'
+                    and r.sl1 in ({onInstanceLine}))
+         or exists (select 1 from use_site s where s.name = i.name and s.use_module = '{m}'
+                    and s.is_definition = 1 and s.l1 in ({onInstanceLine})))
 ),
 reachable(n) as (
   select n from named
