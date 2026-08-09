@@ -16,17 +16,13 @@ public structure Site where
   l2 : Nat
   c2 : Nat
 
-/-- Single quotes in `declName` are escaped by doubling, as SQL string literals require. -/
-private def escaped (declName : String) : String :=
-  declName.replace "'" "''"
-
 /-- Every USE site (never the binding site) of `declName`, grouped by the source path of the module it
     occurs in — `Freyd/S1_45.lean`, taken from the index's `module.source` column, so the caller can
     match it against the glob's paths directly. -/
 public def useSitesByFile (dbPath declName : String) : IO (Std.HashMap String (Array Site)) := do
   let sql := s!"select m.source as source, u.l1 as l1, u.c1 as c1, u.l2 as l2, u.c2 as c2
 from use_site u join module m on m.name = u.use_module
-where u.name = '{escaped declName}' and u.is_definition = 0"
+where u.name = '{Db.escaped declName}' and u.is_definition = 0"
   let j ← Db.query dbPath sql
   let mut map : Std.HashMap String (Array Site) := {}
   match j with
@@ -54,7 +50,7 @@ private def namedModules (j : Json) : Array String :=
 /-- Modules with at least one recorded USE site of `declName`, each with its site count, name-sorted. -/
 public def useModules (dbPath declName : String) : IO (Array (String × Nat)) := do
   let j ← Db.query dbPath s!"select use_module as m, count(*) as n from use_site
-where name = '{escaped declName}' and is_definition = 0 group by use_module order by use_module"
+where name = '{Db.escaped declName}' and is_definition = 0 group by use_module order by use_module"
   match j with
   | .arr rows =>
       -- sqlite3 prints integer columns as JSON numbers; a row whose fields do not parse is skipped.
@@ -70,15 +66,15 @@ where name = '{escaped declName}' and is_definition = 0 group by use_module orde
 
 /-- Modules whose declarations mention `declName` in a type or a proof term, name-sorted. -/
 public def dependentModules (dbPath declName : String) : IO (Array String) := do
-  let j ← Db.query dbPath s!"select distinct module as m from dep where dst = '{escaped declName}' order by module"
+  let j ← Db.query dbPath s!"select distinct module as m from dep where dst = '{Db.escaped declName}' order by module"
   return (namedModules j)
 
 /-- Modules that depend on `declName` without naming it anywhere the info trees recorded: they reach it
     through notation or macro expansion.  No edit is needed there — the notation is declared once — but
     they are exactly the modules a rename can break without touching. -/
 public def silentDependents (dbPath declName : String) : IO (Array String) := do
-  let j ← Db.query dbPath s!"select distinct module as m from dep where dst = '{escaped declName}'
-except select distinct use_module from use_site where name = '{escaped declName}' and is_definition = 0
+  let j ← Db.query dbPath s!"select distinct module as m from dep where dst = '{Db.escaped declName}'
+except select distinct use_module from use_site where name = '{Db.escaped declName}' and is_definition = 0
 order by 1"
   return (namedModules j)
 
@@ -227,7 +223,7 @@ reachable(n) as (
     are published on their own terms. -/
 public def publicDeclSites (dbPath moduleName : String) (instanceLines : Array Nat) :
     IO (Array (String × Nat × Nat × Bool)) := do
-  let m := escaped moduleName
+  let m := Db.escaped moduleName
   -- `in ()` is not SQL, and no line is negative.
   let onInstanceLine :=
     if instanceLines.isEmpty then "-1"
@@ -289,7 +285,7 @@ public def moduleSources (dbPath : String) : IO (Std.HashMap String String) := d
     stops at its public dependencies, which answer for their own bodies. -/
 public def privateBlockers (dbPath moduleName : String) (instanceLines : Array Nat) :
     IO (Array (String × String × Bool)) := do
-  let m := escaped moduleName
+  let m := Db.escaped moduleName
   let onInstanceLine :=
     if instanceLines.isEmpty then "-1"
     else String.intercalate ", " (instanceLines.toList.map toString)

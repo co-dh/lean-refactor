@@ -4,6 +4,7 @@ import Lean
 import LeanRefactor.Fork
 import LeanRefactor.Index
 import LeanRefactor.Query
+import LeanRefactor.SyntaxQuery
 import LeanRefactor.SyntaxRows
 
 /-!
@@ -17,7 +18,7 @@ the requested argument is absent, or an original source range is unavailable.  I
 fall back to textual matching.
 -/
 
-open Lean Lean.Parser Lean.Server LeanRefactor.Fork
+open Lean Lean.Parser Lean.Server LeanRefactor.Fork LeanRefactor.SyntaxQuery
 
 namespace LeanRefactor
 
@@ -1609,6 +1610,12 @@ private def refreshedIndex? : IO (Option String) := do
     IO.eprintln s!"refactor index unavailable: {buildDir} does not exist; \
       falling back to per-file elaboration"
     return none
+  -- BEFORE the refresh, which imports every stale module: an orphaned split part makes that import
+  -- spin in `compacted_region::read` and never return.  `stagedGlob` runs the same guard for its
+  -- verify build, but a driver consults the index FIRST, so the guard there is reached only after
+  -- the hang it was written to prevent — measured at 37 minutes of a `modularize --glob` that had
+  -- printed nothing.
+  if ← staleSplitParts then return none
   let dbPath := ".lake/build/refactor-index.db"
   try
     _ ← Index.refresh dbPath buildDir false
@@ -1693,256 +1700,36 @@ into the source as read; `independentEdits` refuses any pair that overlaps; and 
 DESCENDING on `start` and folds, so every edit still to be applied points exactly where it did when
 it was computed.
 
-Nothing here is imported.  The one thing this pass cannot read off the text — where each declaration
-begins — the `.ilean` already recorded at build time and the index stores as `decl_range`, so the
-whole operation is a scan of the source plus one query.  That is the difference between 8 s and
-milliseconds on the largest file in a repository, and it is what keeps a 200-file batch off the
-import path entirely. -/
-
-/-- Byte ranges the keyword scan must read as blank: line comments, and block comments and
-    docstrings with their nesting.  A `def` written inside a comment is not a declaration, and the
-    docstring above one is exactly where `public` must NOT go.
-
-    String literals are NOT masked, and need not be: the scan only ever walks backwards over word
-    characters, and a literal's closing quote stops it before its contents are read. -/
-private def commentRanges (source : String) : Array (Nat × Nat) := Id.run do
-  let stop := source.rawEndPos
-  let ch (p : String.Pos.Raw) : Char := if p < stop then String.Pos.Raw.get source p else ' '
-  let next (p : String.Pos.Raw) : String.Pos.Raw := String.Pos.Raw.next source p
-  let mut out := #[]
-  let mut pos : String.Pos.Raw := ⟨0⟩
-  while pos < stop do
-    if ch pos == '-' && ch (next pos) == '-' then
-      let mut p := next pos
-      while p < stop && ch p != '\n' do p := next p
-      out := out.push (pos.byteIdx, p.byteIdx)
-      pos := p
-    else if ch pos == '/' && ch (next pos) == '-' then
-      let mut p := next (next pos)
-      let mut depth := 1
-      while p < stop && depth > 0 do
-        if ch p == '/' && ch (next p) == '-' then depth := depth + 1; p := next (next p)
-        else if ch p == '-' && ch (next p) == '/' then depth := depth - 1; p := next (next p)
-        else p := next p
-      out := out.push (pos.byteIdx, p.byteIdx)
-      pos := p
-    else
-      pos := next pos
-  return out
-
-/-- What a name or a keyword is spelled with, for a scan that has no parser.  Lean's own predicate,
-    not `isAlphanum`: that one is ASCII, so it ends a word at the `Ω` of `impΩ` and the `₁` of `kp₁`
-    and the scan reads back a prefix of the name it was pointed at. -/
-private def wordChar (c : Char) : Bool := isIdRest c
-
-/-- Just past the last character before `pos` that is neither whitespace nor inside a comment.
-    A comment is stepped over whole: scanning back into one would read its text as source. -/
-private def codeEndBefore (source : String) (comments : Array (Nat × Nat)) (pos : String.Pos.Raw) :
-    String.Pos.Raw := Id.run do
-  let skipBack (p : String.Pos.Raw) : String.Pos.Raw :=
-    match comments.find? fun (start, stop) => start < p.byteIdx && p.byteIdx <= stop with
-      | some (start, _) => ⟨start⟩
-      | none => p
-  let mut p := skipBack pos
-  while p.byteIdx > 0 &&
-      (String.Pos.Raw.get source (String.Pos.Raw.prev source p)).isWhitespace do
-    p := skipBack (String.Pos.Raw.prev source p)
-  return p
-
-/-- The word ending just before `pos`, and where it starts — `none` when the character before `pos`
-    is not part of a word. -/
-private def wordBefore (source : String) (comments : Array (Nat × Nat)) (pos : String.Pos.Raw) :
-    Option (String × String.Pos.Raw) := Id.run do
-  let before (p : String.Pos.Raw) : Char := String.Pos.Raw.get source (String.Pos.Raw.prev source p)
-  let mut p := codeEndBefore source comments pos
-  if p.byteIdx == 0 || !wordChar (before p) then return none
-  let stop := p
-  while p.byteIdx > 0 && wordChar (before p) do p := String.Pos.Raw.prev source p
-  return some (String.Pos.Raw.extract source p stop, p)
-
-/-- The `]` closing an ATTRIBUTE list written immediately before `pos`, or `none` when what stands
-    there is some other bracket.  `@[expose]` cannot be added as a second bracket — two in a row do
-    not parse — so an existing list has to be joined instead.  Which makes the test a real one: a
-    declaration is just as often preceded by the `]` of a `variable [Cat 𝒞]` binder or of the
-    `rw [h]` on the line above, and `, expose` written into either of those is a parse error or an
-    unknown identifier.  So the bracket is matched back to its `[` and that `[` required to carry
-    the `@`. -/
-private def groupBefore (source : String) (comments : Array (Nat × Nat)) (opening closing : Char)
-    (pos : String.Pos.Raw) : Option (String.Pos.Raw × String.Pos.Raw) := Id.run do
-  let p := codeEndBefore source comments pos
-  if p.byteIdx == 0 then return none
-  let close := String.Pos.Raw.prev source p
-  if String.Pos.Raw.get source close != closing then return none
-  let mut q := close
-  let mut depth := 1
-  while depth > 0 do
-    if q.byteIdx == 0 then return none
-    q := String.Pos.Raw.prev source q
-    -- A bracket inside a comment pairs with nothing in the code around it.
-    unless comments.any (fun (start, stop) => start <= q.byteIdx && q.byteIdx < stop) do
-      let c := String.Pos.Raw.get source q
-      if c == closing then depth := depth + 1 else if c == opening then depth := depth - 1
-  return some (q, close)
-
-private def attributeBracketBefore (source : String) (comments : Array (Nat × Nat))
-    (pos : String.Pos.Raw) : Option String.Pos.Raw := do
-  let (opened, close) ← groupBefore source comments '[' ']' pos
-  guard (opened.byteIdx > 0 && String.Pos.Raw.get source (String.Pos.Raw.prev source opened) == '@')
-  some close
-
-/-- The keywords that introduce a declaration, and the modifiers `Lean.Parser.Command.declModifiers`
-    places AFTER visibility (`protected`, `meta`/`noncomputable`, `unsafe`, `partial`/`nonrec`),
-    plus the `scoped`/`local` attribute kind that sits between the modifiers and `instance`.
-    `public` goes before the whole run of them, never inside it. -/
-private def declKeywords : Array String :=
-  #["def", "theorem", "abbrev", "instance", "structure", "class", "inductive", "opaque", "axiom"]
-
-private def afterVisibility : Array String :=
-  #["protected", "meta", "noncomputable", "unsafe", "partial", "nonrec", "scoped", "local"]
-
-/-- Where an `instance` command's keyword starts within `line`, or `none` when the line starts no
-    such command.  A command begins at column zero and only an attribute list and the modifiers may
-    stand before the keyword, which is what keeps `attribute [instance] foo` out.
-
-    Instances are read off the SOURCE because the index cannot answer for them.  Typeclass
-    resolution consults every instance while elaborating a public signature and leaves no trace of
-    what it found: the coercion or the class field is unfolded into the term, so neither a
-    dependency edge nor a reference records the instance.  `Freyd.S2_20`'s `CoeFun` instance has
-    zero of both, and a `public theorem` whose statement applies `D` to an argument then fails with
-    `Function expected` — the instance is not in the scope that signature elaborates in.  So every
-    instance the source writes is marked, and exposed with it, since a class field like
-    `Freyd.S2_155_BiEntire`'s `instCatB.Hom` has to unfold for the compiler downstream. -/
-private def commandInLine? (line : String) : Option (Nat × String × String) := Id.run do
-  let stop := line.rawEndPos
-  if stop.byteIdx == 0 || (String.Pos.Raw.get line ⟨0⟩).isWhitespace then return none
-  let at? (p : String.Pos.Raw) : Char := if p < stop then String.Pos.Raw.get line p else ' '
-  let mut p : String.Pos.Raw := ⟨0⟩
-  if line.startsWith "@[" then
-    let mut depth := 0
-    repeat
-      if !(p < stop) then return none
-      let c := at? p
-      p := String.Pos.Raw.next line p
-      if c == '[' then depth := depth + 1
-      else if c == ']' then
-        depth := depth - 1
-        if depth == 0 then break
-  repeat
-    while p < stop && (at? p).isWhitespace do p := String.Pos.Raw.next line p
-    let start := p
-    while p < stop && wordChar (at? p) do p := String.Pos.Raw.next line p
-    let word := String.Pos.Raw.extract line start p
-    if declKeywords.contains word then
-      while p < stop && (at? p).isWhitespace do p := String.Pos.Raw.next line p
-      let nameStart := p
-      -- A dot belongs to the name only between components: `Cat.{w, z}` is `Cat` with its universes.
-      while p < stop &&
-          (wordChar (at? p) || (at? p == '.' && wordChar (at? (String.Pos.Raw.next line p)))) do
-        p := String.Pos.Raw.next line p
-      return some (start.byteIdx, word, String.Pos.Raw.extract line nameStart p)
-    -- An empty word is the end of the line, and `private`/`public` is a visibility the source fixes.
-    unless afterVisibility.contains word do return none
-  return none
-
-/-- Every command the source starts, as (byte offset of its keyword, keyword, name as written).
-    Commented-out code declares nothing, so it is skipped. -/
-private def sourceCommands (source : String) (comments : Array (Nat × Nat)) :
-    Array (Nat × String × String) := Id.run do
-  let mut out := #[]
-  let mut offset := 0
-  for line in source.splitOn "\n" do
-    if let some (column, keyword, name) := commandInLine? line then
-      let pos := offset + column
-      unless comments.any (fun (start, stop) => start <= pos && pos < stop) do
-        out := out.push (pos, keyword, name)
-    offset := offset + line.utf8ByteSize + 1
-  return out
-
-/-- The 0-based lines that start an `instance` command — the seeds the public closure has to be run
-    from as well, since nothing in the olean says which definitions are instances.  Seeds, not marks:
-    `Freyd.S2_155_BiEntire`'s `instCatB` names `BObj` and `BHom` in its own signature, and making the
-    instance public without the closure only moved the error to `a private declaration exists but
-    would need to be public to access here`. -/
-private def instanceLines (source : String) : Array Nat := Id.run do
-  let fileMap := FileMap.ofString source
-  return (sourceCommands source (commentRanges source)).filterMap fun (pos, keyword, _) =>
-    if keyword == "instance" then some (fileMap.toPosition ⟨pos⟩).line.pred else none
-
-/-- Where `declName` is declared, found in the SOURCE by the name it is written under: the index
-    reports no range at all for one declaration in five, and the binding site it falls back on can
-    be a binder rather than the declaration — `Freyd.Alg.BObj`'s only site is the `A` of a
-    `{A B : Type u}` three declarations earlier.  A file writes the name without the namespace it
-    sits in, so a written name matches when the full name ends with it at a component boundary, and
-    the longest such match wins. -/
-private def declaredAt? (commands : Array (Nat × String × String)) (declName : String) :
-    Option Nat := Id.run do
-  let mut best : Option (Nat × String) := none
-  for (pos, _, name) in commands do
-    if !name.isEmpty && (declName == name || declName.endsWith ("." ++ name)) then
-      if best.all fun (_, chosen) => chosen.length < name.length then best := some (pos, name)
-  return best.map (·.1)
-
-/-- Where `public` goes for the declaration `declName`, whose name the index recorded as starting at
-    `namePos`: at the start of the run of keywords and modifiers immediately before it, WITH the
-    declaration keyword found there, which decides whether `@[expose]` may join it.  `ok none` when
-    the source already fixes visibility, and when the run holds no declaration keyword at all — the
-    recorded position is then not a declaration this pass can mark.
-
-    An anonymous `instance` has no name to precede, and the `.ilean` records the keyword itself as
-    its position, so the run is allowed to start AT `namePos`.
-
-    `error` when the word at `namePos` is neither a component of `declName` nor a declaration
-    keyword: the index is describing a source that has since been edited, and `public ` written at a
-    position that has moved lands in front of the WRONG declaration — valid syntax, so no build
-    would catch it.  Checking the text beats comparing timestamps, which report a file restored from
-    version control as edited for as long as its content keeps `lake` from rebuilding it. -/
-private def visibilitySlot? (source declName : String) (comments : Array (Nat × Nat))
-    (namePos : String.Pos.Raw) : Except String (Option (String.Pos.Raw × String)) := Id.run do
-  let mut nameEnd := namePos
-  while nameEnd < source.rawEndPos && wordChar (String.Pos.Raw.get source nameEnd) do
-    nameEnd := String.Pos.Raw.next source nameEnd
-  let atName := String.Pos.Raw.extract source namePos nameEnd
-  unless atName.isEmpty || declKeywords.contains atName || (declName.splitOn ".").contains atName do
-    return .error s!"the index puts `{declName}` where the source has `{atName}`"
-  let mut slot := if declKeywords.contains atName then some namePos else none
-  let mut keyword := if declKeywords.contains atName then atName else ""
-  let mut pos := namePos
-  repeat
-    match wordBefore source comments pos with
-    | some (word, start) =>
-        if word == "private" || word == "public" then return .ok none
-        if declKeywords.contains word then keyword := word
-        else unless afterVisibility.contains word do break
-        slot := some start
-        pos := start
-    | none =>
-        -- `instance (priority := 0) mapCat`: a clause may stand between the keyword and the name,
-        -- and stopping at it left `Freyd.Alg.mapCat` unmarked with 149 modules depending on it.
-        match groupBefore source comments '(' ')' pos with
-        | some (opened, _) => pos := opened
-        | none => break
-  return .ok (if keyword.isEmpty then none else slot.map (·, keyword))
+Nothing here is imported.  Where each declaration begins — and where its attribute bracket and its
+modifiers end — the index answers from the `syntax_node` table, which the same build that produced
+the `.olean` also produced, so the whole operation is a scan of the source plus one query.  The
+only text scan left is the imports, which are line-oriented, and a file whose source is newer than
+its `.ilean` is elaborated instead of trusting a stale tree. -/
 
 /-- The edits that put one file on the module system, as byte ranges into `source`, with the report
     line.  With `checkImports`, refuse an import that is not yet a module — right for one file,
     wrong for a batch, where the whole set becomes a module together and only the final build can
     judge.  `sites` are the 0-based LSP positions of the declarations the index says something
-    outside the file names. -/
-private def modularizeEdits (path source : String) (sites : Array (String × Nat × Nat × Bool))
+    outside the file names; `decls` are the same file's declarations as its command tree reads
+    them, and every site is resolved against them by name. -/
+private def modularizeEdits (path source : String) (nodes : Array SyntaxRows.Node)
+    (sites : Array (String × Nat × Nat × Bool)) (decls : Array SyntaxQuery.Decl)
     (checkImports : Bool) : IO (Except String (Array Edit × String)) := do
   let lines := source.splitOn "\n"
   if sourceIsModule source then
     return .error s!"{path}: already on the module system"
-  let comments := commentRanges source
   let mut edits : Array Edit := #[]
   let mut offset : String.Pos.Raw := ⟨0⟩
   let mut imports := 0
-  let mut afterImports : String.Pos.Raw := ⟨0⟩
   for line in lines do
     -- Line-oriented and exact, as `rename-module`'s import edits are: only a module name follows the
     -- keyword, so no docstring or declaration can match.
     if line.trimAsciiStart.toString.startsWith "import " then
-      let imported := (line.trimAscii.toString.drop "import ".length).trimAscii.toString
+      -- A module name has no space, so the token is the whole name even when a trailing comment
+      -- follows it — `import AOP.A4_2  -- entire_id_le` names `AOP.A4_2`, and the old read kept
+      -- the comment, building a path that did not exist and letting the gate pass silently.
+      let imported := String.takeWhile
+        ((line.trimAscii.toString.drop "import ".length).trimAsciiStart.toString) (fun c => c != ' ')
       -- `cannot import non-`module` X from `module`` — the conversion is not per-file: a file can
       -- only become a module once everything it imports already is one, so the repository has to be
       -- walked bottom-up through the import graph.  An import whose source is not in this repository
@@ -1961,48 +1748,74 @@ private def modularizeEdits (path source : String) (sites : Array (String × Nat
       let header := if imports == 0 then "module\n\npublic " else "public "
       edits := edits.push { start := offset, stop := offset, line := 0, replacement := header }
       imports := imports + 1
-      afterImports := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
     offset := ⟨offset.byteIdx + line.utf8ByteSize + 1⟩
   -- A root module imports nothing, so there is no import line to hang the keyword on; it goes at the
   -- very start, above the banner comment, which is the only position that needs no parsing.
   if imports == 0 then
     edits := edits.push { start := ⟨0⟩, stop := ⟨0⟩, line := 0, replacement := "module\n\n" }
   let fileMap := FileMap.ofString source
-  let commands := sourceCommands source comments
-  let mut marked := 0
+  -- Sites are resolved to declarations FIRST, and a declaration reached twice is marked once.  The
+  -- index reports a site per NAME, and several names land on one declaration: every field, ctor and
+  -- recursor of a structure is its own row and `memberOf` sends them all to the structure.  Writing
+  -- one edit per site made `AOP/A5_1` report 11 marks for the 6 declarations it has, and — worse —
+  -- two sites disagreeing about exposure would emit two DIFFERENT edits at one offset, which
+  -- `independentEdits` refuses, failing the file for a disagreement that concerns two different
+  -- declarations.  Exposure is a union: a member's taint says nothing about its parent's body, so it
+  -- must not veto, and an exposure that turns out wrong fails the build loudly.
+  let mut resolved : Std.HashMap Nat (SyntaxQuery.Decl × Bool) := {}
   for (declName, line, column, exposable) in sites do
-    let atIndex := visibilitySlot? source declName comments (fileMap.lspPosToUtf8Pos ⟨line, column⟩)
-    -- The text checks the index's position, and is also what a wrong one is corrected from; only a
-    -- position the source does not confirm EITHER way is reported.
-    let resolved := match atIndex, declaredAt? commands declName with
-      | .error _, some pos => visibilitySlot? source declName comments ⟨pos⟩
-      | result, _ => result
-    match resolved with
-    | .error message => return .error s!"{path}:{line + 1}: {message}; rebuild before marking it"
-    | .ok none => pure ()
-    | .ok (some (slot, keyword)) =>
-        -- `public` says the NAME is visible downstream, `@[expose]` that the BODY is, and the two
-        -- travel together here: the public set is closed under what a public body mentions, so
-        -- exposing exactly it leaves no exposed body naming an unexposed constant.  A `theorem` is
-        -- never exposed — proof irrelevance means no downstream elaboration needs its value — and
-        -- Lean refuses the attribute on anything but a `def`, which `abbrev` and `instance` are.
-        -- A body that names a `private` constant cannot be published at all, so it stays unexposed.
-        let exposed := exposable && #["def", "abbrev", "instance"].contains keyword
-        -- Two attribute brackets in a row do not parse, so an existing one is joined rather than
-        -- preceded.  `@[simp, expose] public theorem` is the shape Lean accepts.
-        let existing := if exposed then attributeBracketBefore source comments slot else none
-        match existing with
-        | some bracket =>
-            edits := edits.push
-              { start := bracket, stop := bracket, line := 0, replacement := ", expose" }
-            edits := edits.push { start := slot, stop := slot, line := 0, replacement := "public " }
-        | none =>
-            -- ONE edit, not two at one offset: two zero-width edits there have no order, which is
-            -- the mistake that once wrote `public module`.
-            let header := if exposed then "@[expose] public " else "public "
-            edits := edits.push { start := slot, stop := slot, line := 0, replacement := header }
-        marked := marked + 1
-  return .ok (edits, s!"{path}: `module`, {imports} public import(s), {marked} public declaration(s)")
+    -- The tree is what the source actually writes, and the index's name is checked against it: a
+    -- name the tree does not know means the index describes a source edited since its build, and
+    -- `public ` written at a position that has moved lands in front of the WRONG declaration —
+    -- valid syntax, so no build would catch it.  The index's (line, column) is only the tiebreak
+    -- for a name written twice in one file.
+    -- `matchDecl` is name-primary; `memberOf` extends it to the fields, constructors, and
+    -- recursors the index names — sites whose parent declaration is the thing that must be
+    -- marked, since a public structure or inductive publishes its members.
+    let decl := match SyntaxQuery.matchDecl decls declName line column fileMap with
+      | some decl => some decl
+      | none => SyntaxQuery.memberOf decls declName
+    match decl with
+    | none =>
+        -- Neither a declaration of this file nor a member of one: either the index describes a
+        -- source that has since been edited, or the name the file no longer contains.  The old
+        -- pass tolerated the second when the word at the recorded position still belonged to the
+        -- name — a field of a structure the index has not caught up with — and a position that
+        -- says nothing about the name is exactly the stale index worth a rebuild.
+        let byte := (fileMap.lspPosToUtf8Pos ⟨line, column⟩).byteIdx
+        if (declName.splitOn ".").contains (SyntaxQuery.wordAt nodes source byte) then pure ()
+        else return .error s!"{path}:{line + 1}: the index puts `{declName}` where the source has \
+          no matching declaration; rebuild before marking it"
+    | some decl =>
+        -- The source fixes the visibility itself, and what it wrote wins.
+        unless decl.visibility != "" do
+          -- `public` says the NAME is visible downstream, `@[expose]` that the BODY is, and the two
+          -- travel together here: the public set is closed under what a public body mentions, so
+          -- exposing exactly it leaves no exposed body naming an unexposed constant.  A `theorem`
+          -- is never exposed — proof irrelevance means no downstream elaboration needs its value —
+          -- and Lean refuses the attribute on anything but a `def`, which `abbrev` and `instance`
+          -- are.  A body that names a `private` constant cannot be published at all, so it stays
+          -- unexposed.
+          let exposed := exposable && #["def", "abbrev", "instance"].contains decl.keyword
+          resolved := resolved.insert decl.kw
+            (decl, exposed || (resolved.get? decl.kw |>.any (·.2)))
+  for (_, decl, exposed) in resolved.toArray do
+    -- Two attribute brackets in a row do not parse, so an existing one is joined rather than
+    -- preceded.  `@[simp, expose] public theorem` is the shape Lean accepts.
+    match (if exposed then decl.attributes.map (·.2 - 1) else none) with
+    | some bracket =>
+        edits := edits.push
+          { start := ⟨bracket⟩, stop := ⟨bracket⟩, line := 0, replacement := ", expose" }
+        edits := edits.push
+          { start := ⟨decl.slot⟩, stop := ⟨decl.slot⟩, line := 0, replacement := "public " }
+    | none =>
+        -- ONE edit, not two at one offset: two zero-width edits there have no order, which is the
+        -- mistake that once wrote `public module`.
+        let header := if exposed then "@[expose] public " else "public "
+        edits := edits.push
+          { start := ⟨decl.slot⟩, stop := ⟨decl.slot⟩, line := 0, replacement := header }
+  return .ok (edits,
+    s!"{path}: `module`, {imports} public import(s), {resolved.size} public declaration(s)")
 
 /-- `lean-refactor modularize`: put one file on the module system, verifying that it still
     elaborates. Visibility is the only thing here the index decides, and it decides it from the
@@ -2011,8 +1824,14 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   let some dbPath ← refreshedIndex? | return 1
   let source ← IO.FS.readFile path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
-  let sites ← Query.publicDeclSites dbPath moduleName (instanceLines source)
-  let (edits, summary) ← match ← modularizeEdits path source sites true with
+  -- The tree the index holds is as new as the `.olean` it was built with, and the staleness guard
+  -- the rename fast path uses is the same here: a source edited since the last build is elaborated
+  -- in this process instead of being marked at positions that have moved.
+  let nodes ← if ← ileanAtLeastAsNew path then SyntaxQuery.nodesOfModule dbPath moduleName
+    else SyntaxQuery.nodesOfFile path moduleName
+  let decls := SyntaxQuery.declarationsOf nodes source
+  let sites ← Query.publicDeclSites dbPath moduleName (SyntaxQuery.instanceLinesOf decls source)
+  let (edits, summary) ← match ← modularizeEdits path source nodes sites decls true with
     | .error message => IO.eprintln message; return 1
     | .ok result => pure result
   IO.println summary
@@ -2034,12 +1853,14 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
 /-- Stage one file for the batch driver: the edits go to `stagePath`, never to `path`, and the
     report comes back in the shape `stagedGlob` collects.  Exit 3 means the file is already a
     module, which is not a failure for a batch.  There is no per-file verify: mid-batch a converted
-    file's imports are not yet rebuilt, so the one repository build at the end is the gate — and
-    since nothing here elaborates, there is no `Environment` to hand back and no child to fork. -/
-private def modularizeStage (path stagePath : String) (sites : Array (String × Nat × Nat × Bool)) :
+    file's imports are not yet rebuilt, so the one repository build at the end is the gate.
+    Staging itself elaborates nothing — the tree the edits read came from the index or a
+    `syntax-rows` child — so there is no `Environment` to hand back. -/
+private def modularizeStage (path stagePath : String) (nodes : Array SyntaxRows.Node)
+    (sites : Array (String × Nat × Nat × Bool)) (decls : Array SyntaxQuery.Decl) :
     IO IO.Process.Output := do
   let source ← IO.FS.readFile path
-  match ← modularizeEdits path source sites false with
+  match ← modularizeEdits path source nodes sites decls false with
   | .error message =>
       if message.endsWith "already on the module system" then
         return { stdout := message ++ "\n", stderr := "", exitCode := 3 }
@@ -2217,15 +2038,28 @@ private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : 
     for r in renames do warnSilentDependents dbPath r.declName
   return status
 
+/-- The command tree of a file the index cannot answer for, from a `syntax-rows` child — the same
+    one-file-per-process shape every elaboration takes here, since an `Environment` per file is
+    what reached 18.3 GB once.  The child's stdout is exactly the record stream the index driver
+    imports. -/
+private def nodesOfChild (path : String) : IO (Array SyntaxRows.Node) := do
+  let self := (← IO.appPath).toString
+  let child ← IO.Process.output { cmd := self, args := #["syntax-rows", path] }
+  if child.exitCode != 0 then
+    throw <| IO.userError s!"{path}: the `syntax-rows` child failed: {child.stderr}"
+  pure (SyntaxQuery.nodesOfRows ((child.stdout.splitOn Db.recordSep).toArray))
+
 /-- `lean-refactor modularize --glob`: put every file matching the pattern on the module system
     together, staging per file and swapping all in at once — the shape `rename-decl` uses for
-    exactly this situation.  The whole batch runs in ONE process: the index is queried here, and
-    staging a file is a scan of its text, so there is no `Environment` to keep apart and no child
-    to fork. -/
+    exactly this situation.  The batch keeps no `Environment`: the index answers where each
+    declaration is, and a file whose tree the index holds is trusted only as far as its `.olean`
+    reaches — a source edited since is elaborated by a `syntax-rows` child, one file per process. -/
 private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
   let some dbPath ← refreshedIndex? | return 1
   let indexed ← Query.moduleSources dbPath
   let mut sites : Std.HashMap String (Array (String × Nat × Nat × Bool)) := {}
+  let mut declsOf : Std.HashMap String (Array SyntaxQuery.Decl) := {}
+  let mut nodesOf : Std.HashMap String (Array SyntaxRows.Node) := {}
   let mut unbuilt := #[]
   let mut blockers : Array (String × String × String × Bool) := #[]
   for path in ← globSelectedFiles pattern do
@@ -2235,7 +2069,13 @@ private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
     -- module may not import a plain module, but a plain module may import a module, so a file
     -- outside the build blocks nothing — and nothing imports it either, or it would be built.
     if indexed.contains moduleName then
-      let lines := instanceLines (← IO.FS.readFile path)
+      let source ← IO.FS.readFile path
+      let nodes ← if ← ileanAtLeastAsNew path then SyntaxQuery.nodesOfModule dbPath moduleName
+        else nodesOfChild path
+      let decls := SyntaxQuery.declarationsOf nodes source
+      declsOf := declsOf.insert path decls
+      nodesOf := nodesOf.insert path nodes
+      let lines := SyntaxQuery.instanceLinesOf decls source
       sites := sites.insert path (← Query.publicDeclSites dbPath moduleName lines)
       for (instanceName, blocked, needed) in ← Query.privateBlockers dbPath moduleName lines do
         blockers := blockers.push (path, instanceName, blocked, needed)
@@ -2258,9 +2098,9 @@ private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
     return 1
   -- Exit 3 is `stagedGlob`'s "this file is not affected", which is exactly an unbuilt one's case.
   stagedGlob pattern "put on the module system" (fun path stage =>
-    match sites[path]? with
-    | some fileSites => modularizeStage path stage fileSites
-    | none => pure { stdout := "", stderr := "", exitCode := 3 }) apply
+    match sites[path]?, declsOf[path]?, nodesOf[path]? with
+    | some fileSites, some decls, some nodes => modularizeStage path stage nodes fileSites decls
+    | _, _, _ => pure { stdout := "", stderr := "", exitCode := 3 }) apply
 
 /-! ## Token renaming (syntax-atom-anchored, for notation)
 
@@ -2517,8 +2357,10 @@ private def usage : String :=
 
 def main (args : List String) : IO UInt32 := do
   match args with
-  | ["index"] => return ← Index.run false
-  | ["index", "--full"] => return ← Index.run true
+  -- The refresh imports every stale module, and `Index.run` reaches it without going through
+  -- `refreshedIndex?`, so the split-part guard has to be repeated here.
+  | ["index"] => return ← if ← staleSplitParts then pure 1 else Index.run false
+  | ["index", "--full"] => return ← if ← staleSplitParts then pure 1 else Index.run true
   -- The child half of the index's syntax-tree pass: elaborate `path`, print its command syntax
   -- tree as `syntax_node` records (cells joined by `fieldSep`, records by `recordSep`) on stdout,
   -- and exit.  Only the index driver calls this; a human running it gets the same records.
