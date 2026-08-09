@@ -2215,6 +2215,17 @@ private def stagedGlob (pattern description : String)
   if build.exitCode != 0 then
     for (path, source) in restore do IO.FS.writeFile path source
     dropBuildArtefacts stagedFiles
+    -- Restoring the sources is not restoring the repository: the artefacts just dropped are what
+    -- the index reads, and a module missing from the index is one this pass reports as never built
+    -- and leaves alone.  Skipping the rebuild once cost a whole attempt, whose only failures were
+    -- three modules importing two the batch had silently passed over.
+    let recover ← repositoryBuild
+    if recover.exitCode != 0 then
+      IO.eprint recover.stdout
+      IO.eprint recover.stderr
+      IO.eprintln s!"whole-repository build failed ({description}); sources restored, but the \
+        rebuild that puts the index back FAILED — run the repository build before trying again"
+      return recover.exitCode
     IO.eprintln s!"whole-repository build failed ({description}); restored"
     return build.exitCode
   IO.println s!"{description}: {stagedFiles.size} file(s); build passed"
