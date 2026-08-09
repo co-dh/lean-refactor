@@ -15,6 +15,10 @@ public def recordSep : String := "\x1e"
 public def row (cells : Array String) : String :=
   String.intercalate fieldSep cells.toList
 
+/-- Single quotes in a name are escaped by doubling, as SQL string literals require. -/
+public def escaped (name : String) : String :=
+  name.replace "'" "''"
+
 /-- The schema version stored in `meta`. Bump when `schemaSql` changes, and also whenever a stored
     column changes MEANING rather than shape.
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only

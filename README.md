@@ -64,11 +64,14 @@ the same constant in the *proof* is fine, and `dep` does not separate the two. S
 and the build decides. On the repository this was written for, that was 140 `private` keywords over
 224 files, each one named by an error.
 
-Three dependencies exist that the index cannot see, each handled by rule rather than by edge:
+Four dependencies exist that the index cannot see, each handled by rule rather than by edge:
 notation expands as syntax and leaves no `dep` edge to the function it names, instances are unfolded
-into terms by typeclass resolution and leave neither edge nor reference, and defeq unfolding is
-reported only at build time. The first two are covered — parser-descriptor targets, and a source scan
-for `instance` lines. The third is why `--apply` is transactional: it runs the whole target build and
+into terms by typeclass resolution and leave neither edge nor reference, defeq unfolding is
+reported only at build time, and a type-level definition the code generator has to reduce is named
+INSIDE A TYPE rather than across a module boundary, so no seed and no closure reaches it. The first
+two are covered — parser-descriptor targets, and the `instance` commands the syntax tree names. The
+fourth is not: a file that hits it is excluded until `dep` separates a constant named in a type from
+one named in a proof. The third is why `--apply` is transactional: it runs the whole target build and
 restores every source, then rebuilds, if that fails. The rebuild is not optional; the artefacts the
 rollback drops are the index's inputs, and a module missing from the index is one the next pass
 reports as never built and leaves alone.

@@ -22,6 +22,16 @@ namespace LeanRefactor.SyntaxRows
 public structure Rows where
   nodes : Array String
 
+/-- One node of the flattened tree. `id` is the node's index in preorder, `parent` the id of the
+    enclosing node (-1 for a root command), so a subtree is a contiguous id range and "the innermost
+    node covering byte P" is one indexed query rather than a descent. -/
+public structure Node where
+  id : Nat
+  parent : Int
+  kind : String
+  b0 : Nat
+  b1 : Nat
+
 /-- No `atom` column: a token's text is `source[b0:b1]`, and storing it again would roughly double
     the table for nothing. Readers slice the file they are already holding. -/
 private def kindOf (stx : Syntax) : String :=
@@ -35,14 +45,18 @@ private def kindOf (stx : Syntax) : String :=
     "the innermost node covering byte P" is one indexed query rather than a descent.  Each child's
     `parent` is this node's id — the `next` this invocation was given — and the id counter is
     threaded through the children with a fold, so no mutable state is needed. -/
-private partial def walk (module : String) (stx : Syntax) (parent : Int) (next : Nat)
-    (acc : Array String) : Nat × Array String :=
+private partial def walk (stx : Syntax) (parent : Int) (next : Nat) (acc : Array Node) :
+    Nat × Array Node :=
   let (b0, b1) := match stx.getRange? with
     | some r => (r.start.byteIdx, r.stop.byteIdx)
     | none   => (0, 0)
-  let acc := acc.push (Db.row
-    #[module, toString next, toString parent, kindOf stx, toString b0, toString b1])
-  stx.getArgs.foldl (fun (n, acc) child => walk module child next n acc) (next + 1, acc)
+  let acc := acc.push { id := next, parent, kind := kindOf stx, b0, b1 }
+  stx.getArgs.foldl (fun (n, acc) child => walk child next n acc) (next + 1, acc)
+
+/-- Flatten the commands of one elaborated file into the preorder node array. -/
+public def nodesOfCommands (commands : Array Syntax) : Array Node := Id.run do
+  let (_, nodes) := commands.foldl (fun (n, acc) cmd => walk cmd (-1) n acc) (0, #[])
+  nodes
 
 /-- Elaborate `path` against its imports and flatten every command it parsed.
 
@@ -62,11 +76,7 @@ public def ofFile (path moduleName : String) : IO Rows := do
   let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
   -- Elaboration errors are NOT fatal here. The tree is what the parser produced, and a file that
   -- fails to elaborate is exactly the file a refactor is about to be pointed at.
-  let mut nodes := #[]
-  let mut next := 0
-  for command in frontend.commands do
-    let (next', nodes') := walk moduleName command (-1) next nodes
-    next := next'; nodes := nodes'
-  return { nodes }
+  return { nodes := (nodesOfCommands frontend.commands).map (fun n =>
+    Db.row #[moduleName, toString n.id, toString n.parent, n.kind, toString n.b0, toString n.b1]) }
 
 end LeanRefactor.SyntaxRows
