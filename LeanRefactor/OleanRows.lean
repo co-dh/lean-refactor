@@ -226,7 +226,19 @@ public def ofModules (modules : Array Name) (buildDir : String := ".lake/build/l
       declInfos := declInfos.push (String.intercalate fieldSep
         [name, toString userName, toString mod, kind, cell (declKey consts ci), proof,
          toString nodes, if generatedName userName then "1" else "0"])
-      let used := (ci.type.getUsedConstants ++ (ci.value?.map (·.getUsedConstants)).getD #[]).toList.eraseDups
+      -- An inductive publishes its constructors' types: `structure LawfulPMC` names `pmcCone` in a
+      -- field, and `pmcCone` has to be public for the structure to be.  A constructor gets no row of
+      -- its own (`kindOf` drops it), and the inductive's own type is only its arity, so without this
+      -- the field types are in no dep edge at all and the closure walked straight past them.
+      let ctorTypes := match ci with
+        | .inductInfo v => v.ctors.foldl (init := #[]) fun acc c =>
+            match consts[c]? with
+              | some ctor => acc ++ ctor.type.getUsedConstants
+              | none => acc
+        | _ => #[]
+      let used :=
+        (ci.type.getUsedConstants ++ (ci.value?.map (·.getUsedConstants)).getD #[] ++
+          ctorTypes).toList.eraseDups
       for dst in used do
         if dst == ci.name then continue
         deps := deps.push s!"{name}{fieldSep}{toString dst}{fieldSep}{toString mod}"
