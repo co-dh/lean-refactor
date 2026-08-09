@@ -36,13 +36,20 @@ unused-`simp`-argument warnings.
 Finding what to collapse is part of the same job, so it is the same tool:
 
 ```sh
-lean-refactor dup                              # declarations that state the same thing
-lean-refactor dup --proof [--min-nodes 12]     # declarations that prove the same thing
+lean-refactor dup [--min-nodes 200]            # pieces of source written more than once
 ```
 
-A group is a candidate, not a task — nothing here checks that its members can see each other, or that
-the copy is not a deliberate weaker-hypothesis restatement. Members print in module order so a group
-with one obvious home reads apart from one spread over leaves that never import each other.
+The key is the syntax tree, which is the one thing an elaborated term cannot report: a `by` block
+reaches the `.olean` as the term its tactics produced, so two copies of one tactic script run
+against slightly different goals leave different terms behind and no term-keyed pass groups them.
+Identifiers are blanked, so a proof written for `≤` and its copy for `≥` are one group; every other
+token is kept, so `3` is not `5`. Groups are subtrees rather than whole declarations — the repeated
+fragment is what a reader can factor out — and only maximal ones are reported, or a 200-node
+duplicate would arrive with two hundred smaller copies of its own report.
+
+A group is a candidate, not a task — nothing here checks that its occurrences can see each other, or
+that the copy is not a deliberate weaker-hypothesis restatement. Each occurrence prints as
+`file:line` with its first line, so a group can be judged without opening anything.
 
 ## Putting a repository on the module system
 

@@ -31,6 +31,10 @@ public structure Node where
   kind : String
   b0 : Nat
   b1 : Nat
+  /-- Hash of the whole subtree, with every identifier blanked and every other token kept. -/
+  hash : UInt64
+  /-- Nodes in that subtree, itself included — the threshold the duplicate report cuts on. -/
+  nodes : Nat
 
 /-- No `atom` column: a token's text is `source[b0:b1]`, and storing it again would roughly double
     the table for nothing. Readers slice the file they are already holding. -/
@@ -41,21 +45,47 @@ private def kindOf (stx : Syntax) : String :=
   | .atom _ _   => "atom"
   | .ident ..   => "ident"
 
+/-- What a leaf contributes to its subtree hash.
+
+    An `ident` contributes NOTHING but its being an identifier: a proof written for `≤` and its copy
+    written for `≥` differ in the constants they name and in nothing else, and that copy is the
+    whole reason to look. Every other token contributes its text, so `3` and `5` are not the same
+    literal and `+` is not `*` — those are free, since only `ident` and the literal kinds carry text
+    a reader cannot recover from the node kind. -/
+private def leafHash (stx : Syntax) : UInt64 :=
+  match stx with
+  | .ident ..    => hash "ident"
+  | .atom _ val  => hash val
+  | .missing     => hash "missing"
+  | .node _ k _  => hash (toString k)
+
 /-- Preorder walk. `id` is the node's index in that order, so a subtree is a contiguous id range and
     "the innermost node covering byte P" is one indexed query rather than a descent.  Each child's
     `parent` is this node's id — the `next` this invocation was given — and the id counter is
-    threaded through the children with a fold, so no mutable state is needed. -/
+    threaded through the children with a fold, so no mutable state is needed.
+
+    An id is assigned on the way DOWN and the subtree hash finished on the way UP, so the node is
+    pushed before its children are walked and patched once they are done.  The hash and count come
+    back as results rather than being read out of `acc`: rescanning a node's children in the array
+    would make the walk quadratic, and one file here runs to ten thousand nodes. -/
 private partial def walk (stx : Syntax) (parent : Int) (next : Nat) (acc : Array Node) :
-    Nat × Array Node :=
+    Nat × Array Node × UInt64 × Nat :=
   let (b0, b1) := match stx.getRange? with
     | some r => (r.start.byteIdx, r.stop.byteIdx)
     | none   => (0, 0)
-  let acc := acc.push { id := next, parent, kind := kindOf stx, b0, b1 }
-  stx.getArgs.foldl (fun (n, acc) child => walk child next n acc) (next + 1, acc)
+  let kind := kindOf stx
+  let acc := acc.push { id := next, parent, kind, b0, b1, hash := leafHash stx, nodes := 1 }
+  let (after, acc, h, nodes) := stx.getArgs.foldl
+    (fun (n, acc, h, nodes) child =>
+      let (n, acc, kidHash, kidNodes) := walk child next n acc
+      (n, acc, mixHash h kidHash, nodes + kidNodes))
+    (next + 1, acc, leafHash stx, 1)
+  (after, acc.set! next { id := next, parent, kind, b0, b1, hash := h, nodes }, h, nodes)
 
 /-- Flatten the commands of one elaborated file into the preorder node array. -/
 public def nodesOfCommands (commands : Array Syntax) : Array Node := Id.run do
-  let (_, nodes) := commands.foldl (fun (n, acc) cmd => walk cmd (-1) n acc) (0, #[])
+  let (_, nodes) := commands.foldl
+    (fun (n, acc) cmd => let (n, acc, _, _) := walk cmd (-1) n acc; (n, acc)) (0, #[])
   nodes
 
 /-- Elaborate `path` against its imports and flatten every command it parsed.
@@ -77,6 +107,7 @@ public def ofFile (path moduleName : String) : IO Rows := do
   -- Elaboration errors are NOT fatal here. The tree is what the parser produced, and a file that
   -- fails to elaborate is exactly the file a refactor is about to be pointed at.
   return { nodes := (nodesOfCommands frontend.commands).map (fun n =>
-    Db.row #[moduleName, toString n.id, toString n.parent, n.kind, toString n.b0, toString n.b1]) }
+    Db.row #[moduleName, toString n.id, toString n.parent, n.kind, toString n.b0, toString n.b1,
+             Db.cell n.hash, toString n.nodes]) }
 
 end LeanRefactor.SyntaxRows

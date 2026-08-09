@@ -16,11 +16,11 @@ namespace LeanRefactor.SyntaxQuery
 public def nodesOfRows (rows : Array String) : Array SyntaxRows.Node :=
   rows.filterMap fun row =>
     match row.splitOn Db.fieldSep with
-    | [_module, id, parent, kind, b0, b1] =>
-        match id.toNat?, parent.toInt?, b0.toNat?, b1.toNat? with
-        | some id, some parent, some b0, some b1 =>
-            some (SyntaxRows.Node.mk id parent kind b0 b1)
-        | _, _, _, _ => none
+    | [_module, id, parent, kind, b0, b1, hash, nodes] =>
+        match id.toNat?, parent.toInt?, b0.toNat?, b1.toNat?, hash.toNat?, nodes.toNat? with
+        | some id, some parent, some b0, some b1, some hash, some nodes =>
+            some (SyntaxRows.Node.mk id parent kind b0 b1 hash.toUInt64 nodes)
+        | _, _, _, _, _, _ => none
     | _ => none
 
 /-- Every `syntax_node` row of `moduleName` from the index, in id order.  An empty result is a
@@ -28,7 +28,7 @@ public def nodesOfRows (rows : Array String) : Array SyntaxRows.Node :=
 public def nodesOfModule (dbPath moduleName : String) : IO (Array SyntaxRows.Node) := do
   let m := Db.escaped moduleName
   let j ← Db.query dbPath
-    s!"select id, parent, kind, b0, b1 from syntax_node where module = '{m}' order by id"
+    s!"select id, parent, kind, b0, b1, hash, nodes from syntax_node where module = '{m}' order by id"
   match j with
   | .arr rows =>
       return rows.filterMap fun row => do
@@ -37,7 +37,9 @@ public def nodesOfModule (dbPath moduleName : String) : IO (Array SyntaxRows.Nod
         let kind ← (row.getObjValAs? String "kind").toOption
         let b0 ← (row.getObjValAs? Nat "b0").toOption
         let b1 ← (row.getObjValAs? Nat "b1").toOption
-        pure (SyntaxRows.Node.mk id parent kind b0 b1)
+        let hash ← (row.getObjValAs? Nat "hash").toOption
+        let nodes ← (row.getObjValAs? Nat "nodes").toOption
+        pure (SyntaxRows.Node.mk id parent kind b0 b1 hash.toUInt64 nodes)
   | _ => return #[]
 
 /-- The tree of a module the index cannot answer for, by elaborating it in THIS process: the
