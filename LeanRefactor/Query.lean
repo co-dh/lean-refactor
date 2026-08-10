@@ -124,7 +124,7 @@ select b.nodes as nodes,
        group_concat(m.source, char(31)) as ss,
        group_concat(b.b0, char(31)) as b0s,
        group_concat(b.b1, char(31)) as b1s
-from big b join grp on grp.h = b.h join module m on m.name = b.md
+from big b join grp on grp.h = b.h join module m on m.id = b.md
 where b.h not in (select h from interior)
 group by b.h order by b.nodes desc, count(*) desc"
   let j ← Db.query dbPath sql
