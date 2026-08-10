@@ -48,6 +48,15 @@ structure HintWidgetProps where
     namespace is open, and so what every textual pass has to look for. -/
 private def shortName (declName : String) : String := (declName.splitOn ".").getLastD declName
 
+/-- Every spelling of `declName` a file may legally write, longest first: the full name and each of
+    its component-boundary suffixes.  Inside `namespace Freyd` the source writes `Alg.foo` for
+    `Freyd.Alg.foo`, and with `open Freyd.Alg` it writes `foo`; which of the three appears is a fact
+    about the file, not about the declaration, so a pass that looks for only the two ends misses the
+    middle. -/
+private def spellingsOf (declName : String) : List String :=
+  let parts := declName.splitOn "."
+  (List.range parts.length).map fun i => String.intercalate "." (parts.drop i)
+
 private def usageSitesIn (references : Lsp.ModuleRefs) (declModule declName : String) : Array ReferenceSite :=
   match references.get? (.const declModule declName) with
   | none => #[]
@@ -1187,12 +1196,12 @@ private partial def syntaxContainsIdent (wanted : String) (stx : Syntax) : Bool 
 private partial def identifierEditsNamed (source : String) (fileMap : FileMap)
     (declName replacement : String) (stx : Syntax) (dropAsDuplicate := false) : Array Edit := Id.run do
   let mut found := #[]
-  let short := shortName declName
   let identText := if stx.isIdent then stx.getId.toString else ""
-  let suffix? :=
-    if identText == declName || identText == short then some ""
-    else if identText.startsWith (declName ++ ".") then some (identText.drop declName.length).toString
-    else if identText.startsWith (short ++ ".") then some (identText.drop short.length).toString
+  -- Longest spelling first, so the `.suffix` is measured from the one the source actually wrote:
+  -- `Freyd.Alg.foo.bar` must drop thirteen characters, not the three of `foo`.
+  let suffix? := (spellingsOf declName).findSome? fun spelling =>
+    if identText == spelling then some ""
+    else if identText.startsWith (spelling ++ ".") then some (identText.drop spelling.length).toString
     else none
   if stx.isIdent && suffix?.isSome then
     if let some range := stx.getRange? then
