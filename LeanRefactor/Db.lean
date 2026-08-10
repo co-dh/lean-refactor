@@ -29,18 +29,27 @@ public def cell (h : UInt64) : String :=
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
     the modules whose artefacts changed, so after a keying change the untouched modules would keep
     rows computed by the old algorithm and a grouping query would silently mix two generations. -/
-public def schemaVersion : String := "6"
+public def schemaVersion : String := "7"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
 "create table meta (key text primary key, value text);
 
+-- `id` is what `syntax_node` stores instead of the name: four million rows carried 70 MB of repeated
+-- module names, and the name is 18 characters against an integer's two.  Assigned by the refresh
+-- from `max(id) + 1`, never `rowid` — `vacuum` renumbers rowids and would silently repoint every
+-- syntax node of every module the refresh did not touch.
 create table module (
+  id         integer,
   name       text primary key,
   source     text,
   ilean_hash text,
   olean_hash text
 );
+
+-- The 434 distinct node kinds, interned for the same reason: 42 MB of repeated `Lean.Parser.…`.
+-- Kept as a table rather than folded into a hash, so `select kind, count(*)` still reads.
+create table syntax_kind (id integer primary key, name text unique);
 
 create table decl_range (
   name text, module text,
@@ -87,14 +96,22 @@ create table dep (src text, dst text, module text, in_type int, in_value int);
 -- while the only query that groups on it also filters on `nodes`, which no index covers, so it scans
 -- the table either way.  Measured with the index and without: 0.6 s both times, 192 MB apart.
 create table syntax_node (
-  module text, id int, parent int, kind text, b0 int, b1 int, hash int, nodes int,
+  module int, id int, parent int, kind int, b0 int, b1 int, hash int, nodes int,
   primary key (module, id)
 ) without rowid;
+
+-- Where a `syntax-rows` child's output lands, module and kind still spelled out, before the refresh
+-- interns both into `syntax_node`.  Staging rather than a wider child protocol: the child prints one
+-- module in one process and knows nothing about the ids the database has handed out.
+create table syntax_node_in (
+  module text, id int, parent int, kind text, b0 int, b1 int, hash int, nodes int
+);
 
 create index i_use_name   on use_site(name);
 create index i_use_module on use_site(use_module);
 create index i_dep_dst    on dep(dst);
 create index i_dep_src    on dep(src);
+create unique index i_module_id on module(id);
 "
 
 /-- Spawn `sqlite3` with `extraArgs`, feeding it `sql` from the temp file `tmp` via `.read`.

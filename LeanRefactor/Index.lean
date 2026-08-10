@@ -99,9 +99,35 @@ private def deletePartitions (dbPath : String) (modules : Array String) : IO Uni
         s!"delete from decl_info where module = '{m}';\n" ++
         s!"delete from use_site where use_module = '{m}';\n" ++
         s!"delete from dep where module = '{m}';\n" ++
-        s!"delete from syntax_node where module = '{m}';\n" ++
+        -- Before the `module` row it points at, or the id is gone and the nodes are orphans.
+        s!"delete from syntax_node where module in (select id from module where name = '{m}');\n" ++
         s!"delete from module where name = '{m}';\n"
     Db.exec dbPath (sql ++ "commit;")
+
+/-- The largest module id the database has handed out, so the refresh can number what it inserts
+    from there.  An id never collides with a LIVE module's: a module deleted and re-inserted gets a
+    fresh one, which is what keeps the syntax nodes of every module the refresh did NOT touch
+    pointing where they did. -/
+private def maxModuleId (dbPath : String) : IO Nat := do
+  match ← Db.query dbPath "select coalesce(max(id), 0) as m from module;" with
+  | .arr rows =>
+      if let some row := rows[0]? then return (row.getObjValAs? Nat "m" |>.toOption |>.getD 0)
+      return 0
+  | _ => return 0
+
+/-- Move one refresh's staged syntax rows into `syntax_node`, interning the module name and the node
+    kind on the way.  Both are joins, not lookups the caller could have done: a `syntax-rows` child
+    prints one module in one process and knows nothing about the ids this database has handed out. -/
+private def internStagedNodes (dbPath : String) : IO Unit :=
+  Db.exec dbPath "begin;
+insert or ignore into syntax_kind (name) select distinct kind from syntax_node_in;
+insert into syntax_node (module, id, parent, kind, b0, b1, hash, nodes)
+  select m.id, i.id, i.parent, k.id, i.b0, i.b1, i.hash, i.nodes
+  from syntax_node_in i
+  join module m on m.name = i.module
+  join syntax_kind k on k.name = i.kind;
+delete from syntax_node_in;
+commit;"
 
 /-- How many modules the `module` table holds — exactly the set the scan found, because every
     stale row is deleted and re-inserted under the same name. -/
@@ -176,8 +202,17 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   Db.importRows dbPath "use_site" useSites
   Db.importRows dbPath "decl_info" oleanRows.declInfos
   Db.importRows dbPath "dep" oleanRows.deps
-  Db.importRows dbPath "syntax_node" syntaxRows
-  Db.importRows dbPath "module" (stale.map fun m => Db.row #[m.name, m.source, m.ileanHash, m.oleanHash])
+  -- The `module` rows go in BEFORE the syntax nodes that intern their names against them.
+  let firstId ← (· + 1) <$> maxModuleId dbPath
+  Db.importRows dbPath "module" (stale.mapIdx fun i m =>
+    Db.row #[toString (firstId + i), m.name, m.source, m.ileanHash, m.oleanHash])
+  Db.importRows dbPath "syntax_node_in" syntaxRows
+  internStagedNodes dbPath
+  -- A full extract stages every module's nodes and then deletes them, which leaves a quarter of a
+  -- gigabyte of freed pages the file never gives back on its own.  Only on `full`: an incremental
+  -- refresh's freelist is exactly what the NEXT refresh's staging writes into, so compacting it
+  -- would trade seconds for pages about to be reallocated.
+  if full then Db.exec dbPath "vacuum;"
   return (stale.size, removed.size, orphaned)
 
 /-- `lean-refactor index [--full]`: refresh and print a one-line summary. Returns the process exit code. -/
