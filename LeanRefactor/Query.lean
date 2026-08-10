@@ -78,53 +78,74 @@ except select distinct use_module from use_site where name = '{Db.escaped declNa
 order by 1"
   return (namedModules j)
 
-/-- One group of declarations that share a key: what they have in common, and each member as
-    `user-name`, source path and module. -/
-public structure DupGroup where
-  members : Array (String × String × String)
+/-- One occurrence of a repeated piece of source: its file and the byte range covering it. -/
+public structure CloneSite where
+  source : String
+  b0 : Nat
+  b1 : Nat
 
-/-- `select` over `decl_info` joined to its source path, collected into groups of two or more.
-    `keyColumn` is the column the group is formed on; `extra` narrows the rows first. -/
-private def groupsOn (dbPath keyColumn extra : String) : IO (Array DupGroup) := do
-  -- Notation and parser declarations (`«term_∩_»` and friends) share one elaborator skeleton by the
-  -- dozen and say nothing about duplication, so they never enter a group.
-  let sql := s!"with d as (
-  select i.user_name as u, m.source as s, i.module as md, i.{keyColumn} as k
-  from decl_info i join module m on m.name = i.module
-  where i.internal = 0 and i.{keyColumn} != '' and i.user_name not like '%.«term%'
-    and i.user_name not like '%.term\\_%' escape '\\' {extra}
+/-- One group of occurrences that are the same code, and the size of that code in tree nodes. -/
+public structure CloneGroup where
+  nodes : Nat
+  sites : Array CloneSite
+
+/-- Pieces of source written more than once, biggest first.
+
+    A group is a set of syntax subtrees with one hash — the same code up to the identifiers in it,
+    since `SyntaxRows` blanks every `ident` and keeps every other token. `minNodes` is the floor on
+    subtree size: below it every file agrees by accident.
+
+    Only MAXIMAL groups are reported. A clone's every subtree is a clone too, so a 200-node
+    duplicate would otherwise arrive with two hundred smaller copies of its own report. A group is
+    dropped when all of its occurrences sit inside one bigger repeated thing: no occurrence is a
+    root command, all their parents hash alike, and that parent hash repeats at least as often —
+    then the parent's group says everything this one would. A fragment that ALSO occurs somewhere
+    its parent does not repeat keeps its group, which is the case that matters: the shared step
+    inside two shared proofs is worth naming once. -/
+public def cloneGroups (dbPath : String) (minNodes : Nat) : IO (Array CloneGroup) := do
+  let sql := s!"with big as (
+  select n.hash as h, n.module as md, n.parent as pa, n.b0 as b0, n.b1 as b1, n.nodes as nodes
+  from syntax_node n where n.nodes >= {minNodes}
+),
+grp as (select h, count(*) as c from big group by h having count(*) > 1),
+parented as (
+  select b.h as h, p.hash as ph from big b join grp on grp.h = b.h
+  left join syntax_node p on p.module = b.md and p.id = b.pa
+),
+interior as (
+  select t.h from (
+    select h, count(*) as n, count(distinct ph) as kinds, min(ph) as ph,
+           sum(case when ph is null then 1 else 0 end) as roots
+    from parented group by h
+  ) t join grp g on g.h = t.ph
+  where t.roots = 0 and t.kinds = 1 and g.c >= t.n
 )
-select k, group_concat(u, char(31)) as us, group_concat(s, char(31)) as ss,
-       group_concat(md, char(31)) as ms
-from d group by k having count(*) > 1 order by count(*) desc, k"
+select b.nodes as nodes,
+       group_concat(m.source, char(31)) as ss,
+       group_concat(b.b0, char(31)) as b0s,
+       group_concat(b.b1, char(31)) as b1s
+from big b join grp on grp.h = b.h join module m on m.name = b.md
+where b.h not in (select h from interior)
+group by b.h order by b.nodes desc, count(*) desc"
   let j ← Db.query dbPath sql
   match j with
   | .arr rows =>
       let mut out := #[]
       for row in rows do
-        let us := (row.getObjValAs? String "us").toOption.getD ""
-        let ss := (row.getObjValAs? String "ss").toOption.getD ""
-        let ms := (row.getObjValAs? String "ms").toOption.getD ""
-        let names := us.splitOn "\x1f"
-        let sources := ss.splitOn "\x1f"
-        let modules := ms.splitOn "\x1f"
-        if names.length == sources.length && names.length == modules.length then
-          -- Module order, so "one canonical plus its stragglers" reads apart from "N independent leaves".
-          let members := (names.zip (sources.zip modules)).toArray
-          out := out.push { members := members.qsort fun a b => a.2.2 < b.2.2 }
+        let nodes := (row.getObjValAs? Nat "nodes").toOption.getD 0
+        let sources := ((row.getObjValAs? String "ss").toOption.getD "").splitOn "\x1f"
+        let b0s := ((row.getObjValAs? String "b0s").toOption.getD "").splitOn "\x1f"
+        let b1s := ((row.getObjValAs? String "b1s").toOption.getD "").splitOn "\x1f"
+        if sources.length == b0s.length && sources.length == b1s.length then
+          let sites := (sources.zip (b0s.zip b1s)).toArray.filterMap fun (s, b0, b1) =>
+            match b0.toNat?, b1.toNat? with
+            | some b0, some b1 => some { source := s, b0, b1 : CloneSite }
+            | _, _ => none
+          -- File order, so the occurrences of one clone read as a list a reader can walk down.
+          out := out.push { nodes, sites := sites.qsort fun a b =>
+            a.source < b.source || (a.source == b.source && a.b0 < b.b0) }
       return out
   | _ => return #[]
-
-/-- Declarations stating the same thing: equal `stmt_key` is the elaborated statement up to binder
-    and universe renaming, so for a theorem it is the same fact however it was proved, and for a
-    definition it is type AND body, i.e. a copy-paste. -/
-public def statementGroups (dbPath : String) : IO (Array DupGroup) :=
-  groupsOn dbPath "stmt_key" ""
-
-/-- Declarations with the same proof, whatever their statements say. Proofs below `minNodes` distinct
-    skeleton nodes are dropped: short ones collide en masse and carry no signal. -/
-public def proofGroups (dbPath : String) (minNodes : Nat) : IO (Array DupGroup) :=
-  groupsOn dbPath "proof_key" s!"and i.proof_nodes >= {minNodes}"
 
 /-- The public set of one module, as the three tables both queries below select from: what a public
     body may not name (`tainted`), what is public for a reason of its own (`named`), and what those
