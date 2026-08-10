@@ -117,12 +117,19 @@ public def ofModules (modules : Array Name) (buildDir : String := ".lake/build/l
               | some ctor => acc ++ ctor.type.getUsedConstants
               | none => acc
         | _ => #[]
-      let used :=
-        (ci.type.getUsedConstants ++ (ci.value?.map (·.getUsedConstants)).getD #[] ++
-          ctorTypes).toList.eraseDups
-      for dst in used do
+      -- WHERE a constant is named decides what has to be done about it, so the two faces are kept
+      -- apart.  A private constant in a public STATEMENT is illegal while the same constant in the
+      -- proof is fine; and a definition the code generator compiles must reduce its type the same
+      -- way on both sides of a module boundary, which is a demand on the constants in the TYPE and
+      -- on no others.  An inductive's constructor types are part of its type face: they are what a
+      -- structure publishes.
+      let inType := (ci.type.getUsedConstants ++ ctorTypes).toList.eraseDups
+      let inValue := ((ci.value?.map (·.getUsedConstants)).getD #[]).toList.eraseDups
+      for dst in (inType ++ inValue).eraseDups do
         if dst == ci.name then continue
-        deps := deps.push s!"{name}{fieldSep}{toString dst}{fieldSep}{toString mod}"
+        deps := deps.push s!"{name}{fieldSep}{toString dst}{fieldSep}{toString mod}\
+          {fieldSep}{if inType.contains dst then "1" else "0"}\
+          {fieldSep}{if inValue.contains dst then "1" else "0"}"
   return { declInfos, deps }
 
 end LeanRefactor.OleanRows
