@@ -1873,27 +1873,41 @@ private def modularizeStage (path stagePath : String) (nodes : Array SyntaxRows.
       IO.FS.writeFile stagePath (applyEdits source selected)
       return { stdout := summary ++ "\n", stderr := "", exitCode := 0 }
 
-/-- `lean-refactor dup`: declarations the index groups as saying, or proving, the same thing.
+/-- `lean-refactor dup`: pieces of source the repository writes more than once.
 
-    Two keys, because they miss opposite things.  The STATEMENT key is the elaborated type up to
-    binder and universe renaming (type and body for a definition): equal keys are the same fact,
-    however it was proved.  The PROOF key is the structural skeleton of the value — the application
-    tree and the constants it calls — which finds a copy-pasted-then-adapted proof whose statement
-    changed, and which no type-keyed pass can see.
+    The key is the SYNTAX TREE, which is the one thing an elaborated term cannot report.  A `by`
+    block reaches the `.olean` as the term its tactics produced, so two copies of one tactic script
+    run against slightly different goals leave different terms behind and no term-keyed pass groups
+    them — while the source is a copy-paste.  Identifiers are blanked in the key, so the same proof
+    written for `≤` and for `≥` is one group; every other token is kept, so `3` is not `5`.
 
-    A group is a candidate, not a task.  Members are printed in module order so a group with one
-    obvious home reads apart from one spread over leaves that never import each other, and nothing
-    here checks whether a member can even see the others. -/
-private def dupReport (proofs : Bool) (minNodes : Nat) : IO UInt32 := do
+    Subtrees, not declarations: the report is about the repeated FRAGMENT, which is what a reader
+    can factor out, and a repeated whole declaration is just the case where the fragment is the
+    whole thing.
+
+    A group is a candidate, not a task.  Nothing here checks that the occurrences can see one
+    another, and a shape that repeats because Lean's syntax gives it no other spelling is not a
+    duplicate — which is what `--min-nodes` is for. -/
+private def dupReport (minNodes : Nat) : IO UInt32 := do
   let some dbPath ← refreshedIndex? | return 1
-  let groups ← if proofs then Query.proofGroups dbPath minNodes else Query.statementGroups dbPath
-  let what := if proofs then s!"same proof (≥ {minNodes} skeleton nodes)" else "same statement"
-  IO.println s!"{groups.size} group(s) with the {what}"
+  let groups ← Query.cloneGroups dbPath minNodes
+  IO.println s!"{groups.size} repeated fragment(s) of ≥ {minNodes} node(s)"
+  -- One read per file however many occurrences it holds: a big clone group crosses few files and a
+  -- long report revisits them.
+  let mut sources : Std.HashMap String (String × FileMap) := {}
   for group in groups do
-    let modules := group.members.foldl (fun (s : Std.HashSet String) (_, _, m) => s.insert m) ∅
-    IO.println s!"  {group.members.size}× in {modules.size} module(s):"
-    for (name, source, _) in group.members do
-      IO.println s!"    {name}  ({source})"
+    let files := group.sites.foldl (fun (s : Std.HashSet String) site => s.insert site.source) ∅
+    IO.println s!"  {group.sites.size}× in {files.size} file(s), {group.nodes} nodes:"
+    for site in group.sites do
+      unless sources.contains site.source do
+        let text ← try IO.FS.readFile site.source catch _ => pure ""
+        sources := sources.insert site.source (text, FileMap.ofString text)
+      let (text, fileMap) := sources[site.source]!
+      let line := (fileMap.toPosition ⟨site.b0⟩).line
+      -- The first line of the occurrence, so a group can be judged without opening anything.
+      let head := (String.Pos.Raw.extract text ⟨site.b0⟩ ⟨min site.b1 text.rawEndPos.byteIdx⟩)
+        |>.splitOn "\n" |>.headD ""
+      IO.println s!"    {site.source}:{line}  {head.trimAscii}"
   return 0
 
 /-- The glob driver.  In preview the index answers where the references are without elaborating
@@ -2353,7 +2367,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor dup\n  lean-refactor dup --proof [--min-nodes <n>]\n  lean-refactor modularize <source.lean> [--apply]\n  lean-refactor modularize --glob '<pattern>' [--apply]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]\n\na glob pattern is a comma-separated list; a leading `!` subtracts:\n  --glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean'"
+  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor dup [--min-nodes <n>]\n  lean-refactor modularize <source.lean> [--apply]\n  lean-refactor modularize --glob '<pattern>' [--apply]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]\n\na glob pattern is a comma-separated list; a leading `!` subtracts:\n  --glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean'"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -2377,11 +2391,12 @@ def main (args : List String) : IO UInt32 := do
   | ["modularize", "--glob", pattern, "--apply"] => return ← modularizeGlob pattern true
   | ["modularize", path] => return ← modularize path false
   | ["modularize", path, "--apply"] => return ← modularize path true
-  | ["dup"] => return ← dupReport false 0
-  | ["dup", "--proof"] => return ← dupReport true 12
-  | ["dup", "--proof", "--min-nodes", nodes] =>
+  -- 200 nodes is about a ten-line proof block: 459 groups on this repository, against 8901 at 40,
+  -- where a report is mostly shapes Lean's syntax gives no other spelling.
+  | ["dup"] => return ← dupReport 200
+  | ["dup", "--min-nodes", nodes] =>
       let some n := nodes.toNat? | IO.eprintln s!"invalid --min-nodes value `{nodes}`"; return 2
-      return ← dupReport true n
+      return ← dupReport n
   | ["lint-book-file", path] =>
       return ← lintBookFile path
   | ["lint-book", "--glob", pattern] =>

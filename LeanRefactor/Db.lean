@@ -19,12 +19,17 @@ public def row (cells : Array String) : String :=
 public def escaped (name : String) : String :=
   name.replace "'" "''"
 
+/-- A hash as a cell.  The mask keeps it below 2^63: SQLite integers are signed 64-bit, and an
+    unmasked `UInt64` at or above 2^63 does not survive the import as an integer. -/
+public def cell (h : UInt64) : String :=
+  toString (h &&& 0x7fffffffffffffff)
+
 /-- The schema version stored in `meta`. Bump when `schemaSql` changes, and also whenever a stored
     column changes MEANING rather than shape.
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
     the modules whose artefacts changed, so after a keying change the untouched modules would keep
     rows computed by the old algorithm and a grouping query would silently mix two generations. -/
-public def schemaVersion : String := "3"
+public def schemaVersion : String := "5"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
@@ -47,9 +52,6 @@ create table decl_range (
 create table decl_info (
   name text, user_name text, module text,
   kind text,
-  stmt_key integer,
-  proof_key integer,
-  proof_nodes int,
   internal int,
   primary key (name, module)
 );
@@ -69,20 +71,26 @@ create table dep (src text, dst text, module text);
 -- node's index in that order, `parent` the id of the enclosing node (-1 for a root command), so a
 -- subtree is a contiguous id range and the innermost node covering byte P is one indexed query.
 -- `b0`/`b1` are the node's byte range in its source file; there is no `atom` column — a token's
--- text is `source[b0:b1]`.  Validity is exactly the module's olean validity: the tree is a
--- byproduct of the elaboration that produced the olean, so the same `(ilean_hash, olean_hash)`
--- key and the same delete-and-reinsert path keep it in step with the rest of the index.
+-- text is `source[b0:b1]`.  `hash` keys the subtree for the duplicate report and `nodes` counts it.
+-- Validity is exactly the module's olean validity: the tree is a byproduct of the elaboration that
+-- produced the olean, so the same `(ilean_hash, olean_hash)` key and the same delete-and-reinsert
+-- path keep it in step with the rest of the index.
+--
+-- WITHOUT ROWID, keyed by `(module, id)`: the table is then clustered by module, which is how every
+-- reader reads it, and the separate module index that cost 119 MB over 4.15 M rows disappears.
+-- `hash` gets NO index, deliberately.  A secondary index on a WITHOUT ROWID table repeats the whole
+-- primary key in every entry, so indexing `hash` measured 158 MB — more than the index it replaced —
+-- while the only query that groups on it also filters on `nodes`, which no index covers, so it scans
+-- the table either way.  Measured with the index and without: 0.6 s both times, 192 MB apart.
 create table syntax_node (
-  module text, id int, parent int, kind text, b0 int, b1 int
-);
+  module text, id int, parent int, kind text, b0 int, b1 int, hash int, nodes int,
+  primary key (module, id)
+) without rowid;
 
 create index i_use_name   on use_site(name);
 create index i_use_module on use_site(use_module);
 create index i_dep_dst    on dep(dst);
 create index i_dep_src    on dep(src);
-create index i_decl_stmt  on decl_info(stmt_key);
-create index i_decl_proof on decl_info(proof_key);
-create index i_syn_module on syntax_node(module);
 "
 
 /-- Spawn `sqlite3` with `extraArgs`, feeding it `sql` from the temp file `tmp` via `.read`.
