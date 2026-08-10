@@ -29,7 +29,7 @@ public def cell (h : UInt64) : String :=
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
     the modules whose artefacts changed, so after a keying change the untouched modules would keep
     rows computed by the old algorithm and a grouping query would silently mix two generations. -/
-public def schemaVersion : String := "5"
+public def schemaVersion : String := "6"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
@@ -65,7 +65,11 @@ create table use_site (
   is_definition int
 );
 
-create table dep (src text, dst text, module text);
+-- `src` names `dst`, and in which face: `in_type` is the declaration's statement — a public one
+-- publishes it, and the code generator has to reduce it identically downstream — while `in_value`
+-- is the body, which an unexposed declaration keeps to itself.  One row per pair; a constant named
+-- in both carries both flags.
+create table dep (src text, dst text, module text, in_type int, in_value int);
 
 -- The command-level syntax tree of every indexed module, flattened in preorder.  `id` is the
 -- node's index in that order, `parent` the id of the enclosing node (-1 for a root command), so a

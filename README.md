@@ -54,7 +54,7 @@ that the copy is not a deliberate weaker-hypothesis restatement. Each occurrence
 ## Putting a repository on the module system
 
 ```sh
-lean-refactor modularize --glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean' [--apply]
+lean-refactor modularize --glob 'Freyd/*.lean' [--apply]
 ```
 
 Writes the `module` header, marks the imports `public`, and marks `public` — with `@[expose]` where
@@ -65,20 +65,23 @@ so a leaf may stay behind and un-migrated libraries keep building against a migr
 an enumeration of the other 223.
 
 The public set is the smallest one the compiler accepts, not everything: a declaration something
-outside depends on, an instance, a notation's target, and whatever their bodies reach. What it cannot
-compute is what only the compiler knows — a private constant in a public *statement* is illegal while
-the same constant in the *proof* is fine, and `dep` does not separate the two. So the pass reports
-and the build decides. On the repository this was written for, that was 140 `private` keywords over
-224 files, each one named by an error.
+outside depends on, an instance, a notation's target, a definition this module's compiled code has to
+reduce a type through, and whatever their bodies reach. What it cannot compute is which `private`
+keyword has to go — that is a fact about the source, not about the index — so the pass reports and
+the build decides. On the repository this was written for, that was 140 `private` keywords over the
+first 224 files, each one named by an error, and none at all over the next 72.
 
-Four dependencies exist that the index cannot see, each handled by rule rather than by edge:
-notation expands as syntax and leaves no `dep` edge to the function it names, instances are unfolded
-into terms by typeclass resolution and leave neither edge nor reference, defeq unfolding is
-reported only at build time, and a type-level definition the code generator has to reduce is named
-INSIDE A TYPE rather than across a module boundary, so no seed and no closure reaches it. The first
-two are covered — parser-descriptor targets, and the `instance` commands the syntax tree names. The
-fourth is not: a file that hits it is excluded until `dep` separates a constant named in a type from
-one named in a proof. The third is why `--apply` is transactional: it runs the whole target build and
+Four dependencies exist that no `dep` edge states outright, each handled by a rule: notation expands
+as syntax and leaves no edge to the function it names, instances are unfolded into terms by typeclass
+resolution and leave neither edge nor reference, a definition the code generator compiles must reduce
+its type identically on both sides of the boundary — a demand on the constants in the TYPE, which
+`dep` records as `in_type` — and defeq unfolding is reported only at build time. The first three are
+covered: parser-descriptor targets, the `instance` commands the syntax tree names, and the type face
+of every `def` this module compiles. That last one is what an `abbrev dNat : RelSet := ⟨Nat⟩` needs —
+nothing outside its file names it, so no other clause reaches it, while
+`con_exp : (Fobj Unit Bit dNat).carrier → Nat` cannot compile without it.
+
+The fourth is why `--apply` is transactional: it runs the whole target build and
 restores every source, then rebuilds, if that fails. The rebuild is not optional; the artefacts the
 rollback drops are the index's inputs, and a module missing from the index is one the next pass
 reports as never built and leaves alone.

@@ -176,7 +176,17 @@ named(n) as (
              and (exists (select 1 from decl_range r where r.name = i.name and r.module = '{m}'
                           and r.sl1 in ({onInstanceLine}))
                   or exists (select 1 from use_site s where s.name = i.name and s.use_module = '{m}'
-                             and s.is_definition = 1 and s.l1 in ({onInstanceLine})))))
+                             and s.is_definition = 1 and s.l1 in ({onInstanceLine}))))
+         -- A definition of this module names it in its TYPE.  The code generator infers a
+         -- compilation type on both sides of the module boundary and demands they agree, so every
+         -- definition the type has to reduce through must be exposed — and exposure needs `public`.
+         -- `abbrev dNat : RelSet := ⟨Nat⟩` is named by nothing outside its file, so no other clause
+         -- reaches it, while `con_exp : (Fobj Unit Bit dNat).carrier → Nat` cannot compile without
+         -- it.  `def` on both sides: a theorem's statement is never compiled, and a structure or an
+         -- inductive publishes its own reduction.
+         or exists (select 1 from dep d join decl_info s on s.name = d.src and s.module = d.module
+                    where d.dst = i.name and d.module = '{m}' and d.in_type = 1
+                      and s.kind = 'def' and i.kind = 'def'))
 ),
 reachable(n) as (
   select n from named
