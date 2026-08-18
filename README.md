@@ -40,62 +40,63 @@ lean-refactor uses Foo.bar
 This is `lean-refactor` with no arguments:
 
 ```text
-usage: lean-refactor <command> [args...] [--apply]
+usage: lean-refactor command [args] [--apply]
 
   --apply writes the edit; without it a command only previews.  A repository-wide edit is
   verified by a build and restored if that build fails.
 
-  <file> source path            <decl> full declaration name    <n>     1-based index
-  <mod>  module name            <new>  replacement name         <term>  Lean term
-  <pat>  glob, comma-separated, a leading `!` subtracts: --glob 'Freyd/*.lean,!Freyd/S1_573.lean'
+  f  source file          d  declaration, full name    n  index, counting from 1
+  m  module of f          r  replacement               M  module that declares d
+  g  --glob pattern, comma-separated, a leading ! subtracts: 'Freyd/*.lean,!Freyd/S1_573.lean'
 
 find
-  index [--full]                                   build or refresh the index
-  uses <decl>                                      modules that use a declaration
-  stmt <frag>                                      signatures of declarations matching <frag>
-  dup [--min-nodes <n>]                            repeated source subtrees
-  inspect <file> <mod> <decl-mod> <decl>           call sites of a declaration
-  lint-book-file <file> | lint-book --glob <pat>   project book lints
+  index [--full]                          build or refresh the index
+  uses d                                  modules that use d
+  stmt frag                               signatures of declarations whose name has frag in it
+  dup [--min-nodes n]                     repeated source subtrees
+  inspect f m M d                         call sites of d
+  lint-book-file f | lint-book --glob g   project book lints
 
 rename
-  rename <file> <mod> (<decl> <new>)...            uses, in one file
-  rename-file <file> (<decl> <new>)...             uses, in one file, module taken from the path
-  rename --glob <pat> (<decl> <new>)...            uses, across files [--no-index]
-  rename-decl --glob <pat> (<decl> <new>)...       uses and binding sites, across files
-  rename-module <old> <new>                        a module, its file, and every import of it
-  rename-token <file> <old> <new>                  a notation token, in one file
-  rename-token --glob <pat> <old> <new>            a notation token, across files
-  infix --glob <pat> <decl> <token>                give a declaration infix notation
+  rename f m (d r)...                     uses, in one file
+  rename-file f (d r)...                  uses, in one file, m taken from the path
+  rename --glob g (d r)...                uses, across files [--no-index]
+  rename-decl --glob g (d r)...           uses and binding sites, across files
+  rename-module m r                       a module, its file, and every import of it
+  rename-token f old new                  a notation token, in one file
+  rename-token --glob g old new           a notation token, across files
+  infix --glob g d token                  give d infix notation
 
 move
-  move <file> <decl> <to.lean>                     move a declaration to another file
-  move-into <file> <decl> <to.lean> <ns>           ... into a namespace
-  move-omit <file> <decl> <to.lean> <binders>      ... omitting binders
-  relocate-before <file> <decl> <anchor>           move it before another declaration
-  relocate-before-section <file> <decl> <section>  move it before a section
+  move f d to.lean                        move d to another file
+  move-into f d to.lean ns                ... into namespace ns
+  move-omit f d to.lean binders           ... omitting binders
+  relocate-before f d anchor              move d before another declaration
+  relocate-before-section f d section     move d before a section
 
 replace
-  collapse <file> <decl> <new>                     replace a duplicate declaration by its survivor
-  collapse-drop-call-arg <file> <decl> <new> <n>   ... dropping argument <n> at every call
-  replace-body <file> <decl> <term>                replace a declaration body
-  replace-declaration <file> <decl> <text>         replace a whole declaration
-  remove-declaration <file> <decl>                 remove a declaration
+  collapse f d r                          replace duplicate d by its survivor r
+  collapse-drop-call-arg f d r n          ... dropping argument n at every call
+  replace-body f d term                   replace the body of d
+  replace-declaration f d text            replace d entirely
+  remove-declaration f d                  remove d
 
 arguments
-  remove-call-arg <file> <mod> <decl-mod> <decl> <n> [--syntax] [--token <token>]
-  insert-call-arg <file> <mod> <decl-mod> <decl> <n> <term>   insert before argument <n>
-  remove-parameter <file> <mod> <decl> <binder> <n>           remove a parameter Lean reports unused
+  remove-call-arg f m M d n               remove argument n at every call of d
+    --syntax                              match calls by name where elaboration cannot
+    --token tok                           also match calls written as the notation tok
+  insert-call-arg f m M d n term          insert term before argument n
+  remove-parameter f m d binder n         remove a parameter Lean reports unused
 
 cleanup
-  unused <file>:<line>:<col>                       remove one unused binder
-  unused --glob <pat>                              remove unused binders
-  unused-simp --glob <pat>                         remove unused `simp` arguments
-  modularize <file> | modularize --glob <pat>      convert to the Lean module system
+  unused f:line:col                       remove one unused binder
+  unused --glob g                         remove unused binders
+  unused-simp --glob g                    remove unused `simp` arguments
+  modularize f | modularize --glob g      convert to the Lean module system
 ```
 
-`<decl-mod>` is the module that *defines* the declaration, `<mod>` the module being edited; they differ only when the
-call sites are in another file. `--syntax` matches call sites by name where elaboration cannot resolve them, and
-`--token <token>` also matches its notation.
+`m` and `M` differ only when the call sites being edited sit in another file than the declaration: `m` is the module
+of the file being edited, `M` the one that declares `d`.
 
 ## How it works
 
