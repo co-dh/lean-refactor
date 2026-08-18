@@ -1,113 +1,95 @@
 # lean-refactor
 
-Conservative source refactoring for Lean 4 repositories, driven by Lean's own data rather than by text
-matching. Two inputs decide every edit:
+Conservative, semantic refactoring for Lean 4 repositories. Its main jobs are:
 
-* `.ilean` reference data — identifies the uses of a global declaration *semantically*;
-* the fully elaborated command syntax tree — identifies the enclosing application and its explicit arguments.
+- **Rename** declarations, uses, modules, files, and notation tokens.
+- **Deduplicate** repeated source subtrees with `dup`, then collapse a chosen copy onto its survivor.
+- **Query** a built repository: `stmt` answers what a declaration says; `uses` shows its dependents; `index` refreshes the local index.
 
-An edit is refused if a resolved reference is not an ordinary application, the requested argument is absent, or
-the original source range is unavailable. There is no textual fallback. Every operation previews by default and
-writes only with `--apply`; the transactional ones re-run the target repository's build afterwards and restore
-the original source if it fails.
+Edits are previews unless `--apply` is supplied. Applied repository-wide edits are verified by a build and restored if it fails.
 
-## Build
+## Build and run
 
 ```sh
 lake build
-```
-
-Lean core only — no `require`, no manifest entries, so a clone builds in seconds.
-
-## Use
-
-```sh
 cd /path/to/target-repo
-lake build                      # the tool reads .ilean, so the target must have been built once
-/path/to/lean-refactor/scripts/lean-refactor            # no arguments: list the operations
-/path/to/lean-refactor/scripts/lean-refactor rename-decl --glob 'src/*.lean' Foo.old_name new_name
+lake build                         # produces the .ilean data the tool reads
+/path/to/lean-refactor/scripts/lean-refactor <command>
 ```
 
-Operations cover renaming (uses, binding sites, modules, files, notation tokens), moving declarations between
-files and namespaces, relocating them within a file, collapsing a duplicate onto its survivor, replacing a body
-or a whole declaration, adding and removing call arguments and parameters, and clearing unused-variable and
-unused-`simp`-argument warnings.
+Run from the target repository root. The target and this tool must use the same Lean toolchain.
 
-Finding what to collapse is part of the same job, so it is the same tool:
+## Examples
 
 ```sh
-lean-refactor dup [--min-nodes 200]            # pieces of source written more than once
+# Rename a declaration and all its binding/use sites.
+lean-refactor rename-decl --glob 'src/*.lean' Foo.old_name new_name --apply
+
+# Find repeated source fragments, then inspect declaration statements.
+lean-refactor dup --min-nodes 200
+lean-refactor stmt name-fragment
+
+# See the modules that use a declaration.
+lean-refactor uses Foo.bar
 ```
 
-The key is the syntax tree, which is the one thing an elaborated term cannot report: a `by` block
-reaches the `.olean` as the term its tactics produced, so two copies of one tactic script run
-against slightly different goals leave different terms behind and no term-keyed pass groups them.
-Identifiers are blanked, so a proof written for `≤` and its copy for `≥` are one group; every other
-token is kept, so `3` is not `5`. Groups are subtrees rather than whole declarations — the repeated
-fragment is what a reader can factor out — and only maximal ones are reported, or a 200-node
-duplicate would arrive with two hundred smaller copies of its own report.
+## Commands
 
-A group is a candidate, not a task — nothing here checks that its occurrences can see each other, or
-that the copy is not a deliberate weaker-hypothesis restatement. Each occurrence prints as
-`file:line` with its first line, so a group can be judged without opening anything.
+Prefix each command below with `lean-refactor`.
 
-## Putting a repository on the module system
+```text
+# Build or refresh the repository index (`--full` rebuilds it).
+index [--full]
+# List modules that use a declaration.
+uses <full-declaration-name>
+# Show matching declaration signatures.
+stmt <name-fragment>
+# Report repeated source subtrees.
+dup [--min-nodes <n>]
+# Convert files to the Lean module system.
+modularize <source.lean> [--apply]
+modularize --glob '<pattern>' [--apply]
+# Run project-specific book lints.
+lint-book-file <source.lean>
+lint-book --glob '<pattern>'
+# Rename a module, its file, and imports.
+rename-module <old-module> <new-module> [--apply]
+# Move a declaration to another file or namespace.
+move <source.lean> <full-declaration-name> <target.lean> [--apply]
+move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]
+move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]
+# Reposition a declaration within its file.
+relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]
+relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]
+# Replace a duplicate declaration with its survivor.
+collapse <source.lean> <full-declaration-name> <replacement> [--apply]
+collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]
+# Replace or remove a declaration.
+replace-body <source.lean> <full-declaration-name> <term> [--apply]
+replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]
+remove-declaration <source.lean> <full-declaration-name> [--apply]
+# Rename uses only, or uses and the declaration binding site.
+rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]
+rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]
+rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]
+# Rename notation tokens or introduce infix notation for a declaration.
+rename-token <source.lean> <old-token> <new-token> [--apply]
+rename-token --glob '<pattern>' <old-token> <new-token> [--apply]
+infix --glob '<pattern>' <full-declaration-name> <token> [--apply]
+# Remove unused binders or unused `simp` arguments.
+unused <source.lean>:<line>:<column> [--apply]
+unused --glob '<pattern>' [--apply]
+unused-simp --glob '<pattern>' [--apply]
+# Inspect call sites, or remove/insert arguments and parameters.
+inspect <source.lean> <module> <declaration-module> <full-declaration-name>
+remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]
+insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]
+remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]
 
-```sh
-lean-refactor modularize --glob 'Freyd/*.lean' [--apply]
+# A glob is comma-separated; `!` excludes a pattern.
+--glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean'
 ```
 
-Writes the `module` header, marks the imports `public`, and marks `public` — with `@[expose]` where
-the body is publishable — the declarations the repository actually needs outside their file. A batch
-must be closed under imports, since a `module` cannot import one that is not; the reverse is legal,
-so a leaf may stay behind and un-migrated libraries keep building against a migrated one. A leading
-`!` on a pattern subtracts it, which is how the exception says which file is special instead of being
-an enumeration of the other 223.
+## How it works
 
-The public set is the smallest one the compiler accepts, not everything: a declaration something
-outside depends on, an instance, a notation's target, a definition this module's compiled code has to
-reduce a type through, and whatever their bodies reach. What it cannot compute is which `private`
-keyword has to go — that is a fact about the source, not about the index — so the pass reports and
-the build decides. On the repository this was written for, that was 140 `private` keywords over the
-first 224 files, each one named by an error, and none at all over the next 72.
-
-Four dependencies exist that no `dep` edge states outright, each handled by a rule: notation expands
-as syntax and leaves no edge to the function it names, instances are unfolded into terms by typeclass
-resolution and leave neither edge nor reference, a definition the code generator compiles must reduce
-its type identically on both sides of the boundary — a demand on the constants in the TYPE, which
-`dep` records as `in_type` — and defeq unfolding is reported only at build time. The first three are
-covered: parser-descriptor targets, the `instance` commands the syntax tree names, and the type face
-of every `def` this module compiles. That last one is what an `abbrev dNat : RelSet := ⟨Nat⟩` needs —
-nothing outside its file names it, so no other clause reaches it, while
-`con_exp : (Fobj Unit Bit dNat).carrier → Nat` cannot compile without it.
-
-The fourth is why `--apply` is transactional: it runs the whole target build and
-restores every source, then rebuilds, if that fails. The rebuild is not optional; the artefacts the
-rollback drops are the index's inputs, and a module missing from the index is one the next pass
-reports as never built and leaves alone.
-
-**Run it from the target repository's root.** Paths are CWD-relative: the tool loads
-`.lake/build/lib/lean/<Module>.ilean` and verifies with `./scripts/cap lake build`, both resolved against the
-current directory. `scripts/lean-refactor` deliberately does not `cd` anywhere — it builds the tool in its own
-root, then execs the binary under `lake env` in the directory you called it from, which is what supplies the
-target's `LEAN_PATH`. Target and tool must be on the same toolchain, or olean loading fails.
-
-Two couplings to the target repository remain, inherited from the repository this was extracted from:
-
-* the post-edit verification shells out to `./scripts/cap lake build`, so the target needs an executable
-  `scripts/cap` (a one-line `ulimit -v` wrapper — copy this repository's);
-* `lint-book` and `lint-book-file` are lints for a book formalization (`§`-citation ordering, `Freyd.Functor`
-  result types, functor-role name suffixes) and mean nothing outside it.
-
-## Why the address-space cap
-
-An unbounded Lean process does not fail politely, it gets OOM-killed, and it takes down whatever else is
-running: a `rename --glob` that elaborated file after file in one process reached 18.3 GB resident and killed a
-concurrent agent. Two controls came out of that, both kept here — `forkPerFile` gives each file its own child
-process, and `scripts/cap` converts a runaway into an immediate attributable failure. The measurements are in
-`scripts/cap`.
-
-## Provenance
-
-Extracted from the [freyd](https://github.com/co-dh/freyd) formalization repository, where the tool was written to perform
-its own de-duplication passes; the history here is the 32 commits that touched it.
+The tool combines Lean's `.ilean` reference data (which identifies declarations semantically) with the fully elaborated command syntax tree (which identifies the exact source range and arguments). Its SQLite index makes repository-wide renames and queries fast. It refuses edits it cannot establish safely; there is no text-search fallback.
