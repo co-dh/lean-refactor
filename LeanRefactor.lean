@@ -1322,11 +1322,11 @@ private def renameArgs (renames : Array Rename) : Array String := Id.run do
   for r in renames do args := args ++ #[r.declName, r.replacement]
   return args
 
-/-- Take a trailing `--apply` off a variadic argument tail; every refactor previews without it. -/
-private def stripApply (args : List String) : List String × Bool :=
-  match args.reverse with
-  | "--apply" :: rest => (rest.reverse, true)
-  | _ => (args, false)
+/-- Take `--token <token>` out of an argument list, leaving the positional arguments alone. -/
+private def stripToken : List String → List String × Option String
+  | "--token" :: token :: rest => (rest, some token)
+  | arg :: rest => let (rest, token?) := stripToken rest; (arg :: rest, token?)
+  | [] => ([], none)
 
 /-- Everything one elaboration of a file yields that a rename needs.  It is kept as a value so a
     BATCH of renames shares it: the elaboration costs seconds, deriving the sites costs nothing. -/
@@ -2389,11 +2389,68 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"{site.range.start.line + 1}:{site.range.start.character + 1}\t{site.parent?.getD "<command>"}"
   IO.println s!"  {String.intercalate " → " kinds}"
 
-private def usage : String :=
-  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor stmt <name-fragment>\n  lean-refactor dup [--min-nodes <n>]\n  lean-refactor modularize <source.lean> [--apply]\n  lean-refactor modularize --glob '<pattern>' [--apply]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]\n\na glob pattern is a comma-separated list; a leading `!` subtracts:\n  --glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean'"
+/-- One screen, one line per command.  Placeholders are the short names of the legend, so a command
+    line reads as a shape rather than as a sentence. -/
+private def usage : String := String.intercalate "\n" [
+  "usage: lean-refactor <command> [args...] [--apply]",
+  "",
+  "  --apply writes the edit; without it a command only previews.  A repository-wide edit is",
+  "  verified by a build and restored if that build fails.",
+  "",
+  "  <file> source path            <decl> full declaration name    <n>     1-based index",
+  "  <mod>  module name            <new>  replacement name         <term>  Lean term",
+  "  <pat>  glob, comma-separated, a leading `!` subtracts: --glob 'Freyd/*.lean,!Freyd/S1_573.lean'",
+  "",
+  "find",
+  "  index [--full]                                   build or refresh the index",
+  "  uses <decl>                                      modules that use a declaration",
+  "  stmt <frag>                                      signatures of declarations matching <frag>",
+  "  dup [--min-nodes <n>]                            repeated source subtrees",
+  "  inspect <file> <mod> <decl-mod> <decl>           call sites of a declaration",
+  "  lint-book-file <file> | lint-book --glob <pat>   project book lints",
+  "",
+  "rename",
+  "  rename <file> <mod> (<decl> <new>)...            uses, in one file",
+  "  rename-file <file> (<decl> <new>)...             uses, in one file, module taken from the path",
+  "  rename --glob <pat> (<decl> <new>)...            uses, across files [--no-index]",
+  "  rename-decl --glob <pat> (<decl> <new>)...       uses and binding sites, across files",
+  "  rename-module <old> <new>                        a module, its file, and every import of it",
+  "  rename-token <file> <old> <new>                  a notation token, in one file",
+  "  rename-token --glob <pat> <old> <new>            a notation token, across files",
+  "  infix --glob <pat> <decl> <token>                give a declaration infix notation",
+  "",
+  "move",
+  "  move <file> <decl> <to.lean>                     move a declaration to another file",
+  "  move-into <file> <decl> <to.lean> <ns>           ... into a namespace",
+  "  move-omit <file> <decl> <to.lean> <binders>      ... omitting binders",
+  "  relocate-before <file> <decl> <anchor>           move it before another declaration",
+  "  relocate-before-section <file> <decl> <section>  move it before a section",
+  "",
+  "replace",
+  "  collapse <file> <decl> <new>                     replace a duplicate declaration by its survivor",
+  "  collapse-drop-call-arg <file> <decl> <new> <n>   ... dropping argument <n> at every call",
+  "  replace-body <file> <decl> <term>                replace a declaration body",
+  "  replace-declaration <file> <decl> <text>         replace a whole declaration",
+  "  remove-declaration <file> <decl>                 remove a declaration",
+  "",
+  "arguments",
+  "  remove-call-arg <file> <mod> <decl-mod> <decl> <n> [--syntax] [--token <token>]",
+  "  insert-call-arg <file> <mod> <decl-mod> <decl> <n> <term>   insert before argument <n>",
+  "  remove-parameter <file> <mod> <decl> <binder> <n>           remove a parameter Lean reports unused",
+  "",
+  "cleanup",
+  "  unused <file>:<line>:<col>                       remove one unused binder",
+  "  unused --glob <pat>                              remove unused binders",
+  "  unused-simp --glob <pat>                         remove unused `simp` arguments",
+  "  modularize <file> | modularize --glob <pat>      convert to the Lean module system"]
 
 def main (args : List String) : IO UInt32 := do
+  -- `--apply` means the same thing for every editing command, so it is taken once here instead of
+  -- doubling every arm below; that also makes its position in the argument list free.
+  let apply := args.contains "--apply"
+  let args := args.filter (· != "--apply")
   match args with
+  | [] | ["--help"] | ["-h"] => IO.println usage; return 0
   -- The refresh imports every stale module, and `Index.run` reaches it without going through
   -- `refreshedIndex?`, so the split-part guard has to be repeated here.
   | ["index"] => return ← if ← staleSplitParts then pure 1 else Index.run false
@@ -2414,10 +2471,8 @@ def main (args : List String) : IO UInt32 := do
       return 0
   | ["uses", declName] => return ← usesReport declName
   | ["stmt", fragment] => return ← stmtReport fragment
-  | ["modularize", "--glob", pattern] => return ← modularizeGlob pattern false
-  | ["modularize", "--glob", pattern, "--apply"] => return ← modularizeGlob pattern true
-  | ["modularize", path] => return ← modularize path false
-  | ["modularize", path, "--apply"] => return ← modularize path true
+  | ["modularize", "--glob", pattern] => return ← modularizeGlob pattern apply
+  | ["modularize", path] => return ← modularize path apply
   -- 200 nodes is about a ten-line proof block: 459 groups on this repository, against 8901 at 40,
   -- where a report is mostly shapes Lean's syntax gives no other spelling.
   | ["dup"] => return ← dupReport 200
@@ -2429,59 +2484,34 @@ def main (args : List String) : IO UInt32 := do
   | ["lint-book", "--glob", pattern] =>
       return ← forkPerFile pattern fun path => #["lint-book-file", path]
   | ["rename-module", oldModule, newModule] =>
-      return ← renameModule oldModule newModule false
-  | ["rename-module", oldModule, newModule, "--apply"] =>
-      return ← renameModule oldModule newModule true
+      return ← renameModule oldModule newModule apply
   | ["move", sourcePath, declName, targetPath] =>
-      return ← moveDeclaration sourcePath declName targetPath false
-  | ["move", sourcePath, declName, targetPath, "--apply"] =>
-      return ← moveDeclaration sourcePath declName targetPath true
+      return ← moveDeclaration sourcePath declName targetPath apply
   | ["move-into", sourcePath, declName, targetPath, targetNamespace] =>
-      return ← moveDeclaration sourcePath declName targetPath false none (some targetNamespace)
-  | ["move-into", sourcePath, declName, targetPath, targetNamespace, "--apply"] =>
-      return ← moveDeclaration sourcePath declName targetPath true none (some targetNamespace)
+      return ← moveDeclaration sourcePath declName targetPath apply none (some targetNamespace)
   | ["move-omit", sourcePath, declName, targetPath, binders] =>
-      return ← moveDeclaration sourcePath declName targetPath false (some binders)
-  | ["move-omit", sourcePath, declName, targetPath, binders, "--apply"] =>
-      return ← moveDeclaration sourcePath declName targetPath true (some binders)
+      return ← moveDeclaration sourcePath declName targetPath apply (some binders)
   | ["relocate-before", sourcePath, declName, anchorName] =>
-      return ← relocateDeclarationBefore sourcePath declName anchorName false
-  | ["relocate-before", sourcePath, declName, anchorName, "--apply"] =>
-      return ← relocateDeclarationBefore sourcePath declName anchorName true
+      return ← relocateDeclarationBefore sourcePath declName anchorName apply
   | ["relocate-before-section", sourcePath, declName, sectionName] =>
-      return ← relocateDeclarationBeforeSection sourcePath declName sectionName false
-  | ["relocate-before-section", sourcePath, declName, sectionName, "--apply"] =>
-      return ← relocateDeclarationBeforeSection sourcePath declName sectionName true
+      return ← relocateDeclarationBeforeSection sourcePath declName sectionName apply
   | ["collapse", sourcePath, declName, replacement] =>
-      return ← collapseDeclaration sourcePath declName replacement false
-  | ["collapse", sourcePath, declName, replacement, "--apply"] =>
-      return ← collapseDeclaration sourcePath declName replacement true
+      return ← collapseDeclaration sourcePath declName replacement apply
   | ["collapse-drop-call-arg", sourcePath, declName, replacement, index] =>
       let some argIndex := index.toNat?
         | IO.eprintln s!"invalid argument index `{index}`"; return 2
-      return ← collapseDeclaration sourcePath declName replacement false (some argIndex)
-  | ["collapse-drop-call-arg", sourcePath, declName, replacement, index, "--apply"] =>
-      let some argIndex := index.toNat?
-        | IO.eprintln s!"invalid argument index `{index}`"; return 2
-      return ← collapseDeclaration sourcePath declName replacement true (some argIndex)
+      return ← collapseDeclaration sourcePath declName replacement apply (some argIndex)
   | ["replace-body", sourcePath, declName, replacement] =>
-      return ← replaceDeclarationBody sourcePath declName replacement false
-  | ["replace-body", sourcePath, declName, replacement, "--apply"] =>
-      return ← replaceDeclarationBody sourcePath declName replacement true
+      return ← replaceDeclarationBody sourcePath declName replacement apply
   | ["replace-declaration", sourcePath, declName, replacement] =>
-      return ← replaceDeclaration sourcePath declName replacement false
-  | ["replace-declaration", sourcePath, declName, replacement, "--apply"] =>
-      return ← replaceDeclaration sourcePath declName replacement true
+      return ← replaceDeclaration sourcePath declName replacement apply
   | ["remove-declaration", sourcePath, declName] =>
-      return ← removeDeclaration sourcePath declName false
-  | ["remove-declaration", sourcePath, declName, "--apply"] =>
-      return ← removeDeclaration sourcePath declName true
+      return ← removeDeclaration sourcePath declName apply
   | "rename-file" :: path :: rest =>
       let moduleName ← match moduleNameOfPath path with
         | .ok n => pure n
         | .error message => IO.eprintln message; return 2
-      let (pairs, apply) := stripApply rest
-      match parseRenames pairs with
+      match parseRenames rest with
       | .error message => IO.eprintln message; return 2
       | .ok renames => return ← renameReferences path moduleName renames apply
   | "rename" :: args =>
@@ -2491,19 +2521,16 @@ def main (args : List String) : IO UInt32 := do
       let args := args.filter (· != "--no-index")
       match args with
       | "--glob" :: pattern :: rest =>
-          let (pairs, apply) := stripApply rest
-          match parseRenames pairs with
+          match parseRenames rest with
           | .error message => IO.eprintln message; return 2
           | .ok renames => return ← renameGlob pattern renames apply noIndex
       | path :: moduleName :: rest =>
-          let (pairs, apply) := stripApply rest
-          match parseRenames pairs with
+          match parseRenames rest with
           | .error message => IO.eprintln message; return 2
           | .ok renames => return ← renameReferences path moduleName renames apply
       | _ => IO.eprintln usage; return 2
   | "rename-decl" :: "--glob" :: pattern :: rest =>
-      let (pairs, apply) := stripApply rest
-      match parseRenames pairs with
+      match parseRenames rest with
       | .error message => IO.eprintln message; return 2
       | .ok renames => return ← renameDeclGlob pattern renames apply
   | "rename-decl-stage" :: path :: stagePath :: pairs =>
@@ -2511,71 +2538,47 @@ def main (args : List String) : IO UInt32 := do
       | .error message => IO.eprintln message; return 2
       | .ok renames => return ← renameDeclStage path stagePath renames
   | ["infix", "--glob", pattern, declName, token] =>
-      return ← infixGlob pattern declName token false
-  | ["infix", "--glob", pattern, declName, token, "--apply"] =>
-      return ← infixGlob pattern declName token true
+      return ← infixGlob pattern declName token apply
   | ["infix-stage", path, declName, token, stagePath] =>
       return ← infixStage path declName token stagePath
   | ["rename-token", "--glob", pattern, oldToken, newToken] =>
-      return ← renameTokenGlob pattern oldToken newToken false
-  | ["rename-token", "--glob", pattern, oldToken, newToken, "--apply"] =>
-      return ← renameTokenGlob pattern oldToken newToken true
+      return ← renameTokenGlob pattern oldToken newToken apply
   | ["rename-token", path, oldToken, newToken] =>
-      return ← renameTokenFile path oldToken newToken false
-  | ["rename-token", path, oldToken, newToken, "--apply"] =>
-      return ← renameTokenFile path oldToken newToken true
-  | ["unused", selector] | ["unused", selector, "--apply"] =>
+      return ← renameTokenFile path oldToken newToken apply
+  | ["unused", selector] =>
       let parsed ← match parseWarningSelector selector with
         | .ok parsed => pure parsed
         | .error message => IO.eprintln message; return 2
-      if args.getLast? == some "--apply" then
-        return ← transactionalWarningRefactor parsed
+      if apply then return ← transactionalWarningRefactor parsed
       return ← refactorSuggestedWarnings parsed false
   | ["unused-file", path] =>
+      if apply then return ← refactorSuggestedWarningsUntilStable { path }
       return ← refactorSuggestedWarnings { path } false
-  | ["unused-file", path, "--apply"] =>
-      return ← refactorSuggestedWarningsUntilStable { path }
-  | ["unused", "--glob", pattern] | ["unused", "--glob", pattern, "--apply"] =>
+  | ["unused", "--glob", pattern] =>
       -- Forked, not looped: an in-process loop retained one `Environment` per file and so died on
       -- the third, on `claimElaboration`'s bound.  This subcommand was unusable above two files.
-      let apply := args.getLast? == some "--apply"
       return ← forkPerFile pattern fun path =>
         #["unused-file", path] ++ (if apply then #["--apply"] else #[])
-  | ["unused-simp-file", path] | ["unused-simp-file", path, "--apply"] =>
-      return ← refactorSuggestedWarnings { path } (args.getLast? == some "--apply")
-        (includeVariables := false)
-  | ["unused-simp", "--glob", pattern] | ["unused-simp", "--glob", pattern, "--apply"] =>
-      let apply := args.getLast? == some "--apply"
+  | ["unused-simp-file", path] =>
+      return ← refactorSuggestedWarnings { path } apply (includeVariables := false)
+  | ["unused-simp", "--glob", pattern] =>
       return ← forkPerFile pattern fun path =>
         #["unused-simp-file", path] ++ (if apply then #["--apply"] else #[])
   | _ => pure ()
-  let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, insertText?, token?, apply) ← match args with
+  -- `--syntax` and `--token` stay local to these commands, unlike `--apply`: `rename-token` and
+  -- `infix` take a notation token as a POSITIONAL argument, which a global sweep would eat.
+  let syntaxMatch := args.contains "--syntax"
+  let (args, token?) := stripToken (args.filter (· != "--syntax"))
+  let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, insertText?) ← match args with
     | ["inspect", sourcePath, moduleName, declModule, declName] =>
-        pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, none, none, false)
+        pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, none)
     | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, none, false)
-    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--apply"] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, none, true)
-    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--syntax"] =>
-        pure ("remove-syntax", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, none, false)
-    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--syntax", "--apply"] =>
-        pure ("remove-syntax", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, none, true)
-    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--syntax", "--token", token] =>
-        pure ("remove-syntax", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, some token, false)
-    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--syntax", "--token", token, "--apply"] =>
-        pure ("remove-syntax", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, some token, true)
-    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--token", token] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, some token, false)
-    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index, "--token", token, "--apply"] =>
-        pure ("remove", sourcePath, moduleName, declModule, declName, none, index.toNat?, none, some token, true)
+        pure (if syntaxMatch then "remove-syntax" else "remove",
+          sourcePath, moduleName, declModule, declName, none, index.toNat?, none)
     | ["insert-call-arg", sourcePath, moduleName, declModule, declName, index, term] =>
-        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term, none, false)
-    | ["insert-call-arg", sourcePath, moduleName, declModule, declName, index, term, "--apply"] =>
-        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term, none, true)
+        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term)
     | ["remove-parameter", sourcePath, moduleName, declName, binderName, index] =>
-        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, none, false)
-    | ["remove-parameter", sourcePath, moduleName, declName, binderName, index, "--apply"] =>
-        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none, none, true)
+        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none)
     | _ => IO.eprintln usage; return 2
   claimElaboration sourcePath
   let source ← IO.FS.readFile sourcePath

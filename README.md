@@ -4,9 +4,11 @@ Conservative, semantic refactoring for Lean 4 repositories. Its main jobs are:
 
 - **Rename** declarations, uses, modules, files, and notation tokens.
 - **Deduplicate** repeated source subtrees with `dup`, then collapse a chosen copy onto its survivor.
-- **Query** a built repository: `stmt` answers what a declaration says; `uses` shows its dependents; `index` refreshes the local index.
+- **Query** a built repository: `stmt` answers what a declaration says; `uses` shows its dependents; `index`
+  refreshes the local index.
 
-Edits are previews unless `--apply` is supplied. Applied repository-wide edits are verified by a build and restored if it fails.
+Every command previews. `--apply` is the one flag that writes, it means the same thing everywhere, and it may sit
+anywhere in the argument list. An applied repository-wide edit is verified by a build and restored if that build fails.
 
 ## Build and run
 
@@ -22,12 +24,12 @@ Run from the target repository root. The target and this tool must use the same 
 ## Examples
 
 ```sh
-# Rename a declaration and all its binding/use sites.
+# Rename a declaration and all its binding/use sites.  Drop --apply to see the edits first.
 lean-refactor rename-decl --glob 'src/*.lean' Foo.old_name new_name --apply
 
-# Find repeated source fragments, then inspect declaration statements.
+# Find repeated source fragments, then read what one of the declarations says.
 lean-refactor dup --min-nodes 200
-lean-refactor stmt name-fragment
+lean-refactor stmt old_name
 
 # See the modules that use a declaration.
 lean-refactor uses Foo.bar
@@ -35,58 +37,71 @@ lean-refactor uses Foo.bar
 
 ## Commands
 
-Prefix each with `lean-refactor`. `--apply` writes changes; otherwise edits are previews. A `--glob`
-is comma-separated, and a leading `!` excludes a pattern — for example,
-`--glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean'`.
+This is `lean-refactor` with no arguments:
 
-### Find
+```text
+usage: lean-refactor <command> [args...] [--apply]
 
-- `index [--full]` — Build or refresh the repository index.
-- `uses <full-declaration-name>` — List modules that use a declaration.
-- `stmt <name-fragment>` — Show matching declaration signatures.
-- `dup [--min-nodes <n>]` — Report repeated source subtrees.
+  --apply writes the edit; without it a command only previews.  A repository-wide edit is
+  verified by a build and restored if that build fails.
 
-### Rename
+  <file> source path            <decl> full declaration name    <n>     1-based index
+  <mod>  module name            <new>  replacement name         <term>  Lean term
+  <pat>  glob, comma-separated, a leading `!` subtracts: --glob 'Freyd/*.lean,!Freyd/S1_573.lean'
 
-- `rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]` — Rename uses in one file.
-- `rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]` — Rename uses across matching files.
-- `rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]` — Rename uses and declaration binding sites.
-- `rename-module <old-module> <new-module> [--apply]` — Rename a module, its file, and imports.
-- `rename-token <source.lean> <old-token> <new-token> [--apply]` — Rename a notation token in one file.
-- `rename-token --glob '<pattern>' <old-token> <new-token> [--apply]` — Rename a notation token across matching files.
-- `infix --glob '<pattern>' <full-declaration-name> <token> [--apply]` — Introduce infix notation for a declaration.
+find
+  index [--full]                                   build or refresh the index
+  uses <decl>                                      modules that use a declaration
+  stmt <frag>                                      signatures of declarations matching <frag>
+  dup [--min-nodes <n>]                            repeated source subtrees
+  inspect <file> <mod> <decl-mod> <decl>           call sites of a declaration
+  lint-book-file <file> | lint-book --glob <pat>   project book lints
 
-### Move and replace
+rename
+  rename <file> <mod> (<decl> <new>)...            uses, in one file
+  rename-file <file> (<decl> <new>)...             uses, in one file, module taken from the path
+  rename --glob <pat> (<decl> <new>)...            uses, across files [--no-index]
+  rename-decl --glob <pat> (<decl> <new>)...       uses and binding sites, across files
+  rename-module <old> <new>                        a module, its file, and every import of it
+  rename-token <file> <old> <new>                  a notation token, in one file
+  rename-token --glob <pat> <old> <new>            a notation token, across files
+  infix --glob <pat> <decl> <token>                give a declaration infix notation
 
-- `move <source.lean> <full-declaration-name> <target.lean> [--apply]` — Move a declaration to another file.
-- `move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]` — Move it into a namespace.
-- `move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]` — Move it while omitting binders.
-- `relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]` — Move it before another declaration.
-- `relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]` — Move it before a section.
-- `collapse <source.lean> <full-declaration-name> <replacement> [--apply]` — Replace a duplicate declaration with its survivor.
-- `collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]` — Collapse while dropping an argument.
-- `replace-body <source.lean> <full-declaration-name> <term> [--apply]` — Replace a declaration body.
-- `replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]` — Replace a whole declaration.
-- `remove-declaration <source.lean> <full-declaration-name> [--apply]` — Remove a declaration.
+move
+  move <file> <decl> <to.lean>                     move a declaration to another file
+  move-into <file> <decl> <to.lean> <ns>           ... into a namespace
+  move-omit <file> <decl> <to.lean> <binders>      ... omitting binders
+  relocate-before <file> <decl> <anchor>           move it before another declaration
+  relocate-before-section <file> <decl> <section>  move it before a section
 
-### Arguments and cleanup
+replace
+  collapse <file> <decl> <new>                     replace a duplicate declaration by its survivor
+  collapse-drop-call-arg <file> <decl> <new> <n>   ... dropping argument <n> at every call
+  replace-body <file> <decl> <term>                replace a declaration body
+  replace-declaration <file> <decl> <text>         replace a whole declaration
+  remove-declaration <file> <decl>                 remove a declaration
 
-- `inspect <source.lean> <module> <declaration-module> <full-declaration-name>` — Inspect a declaration's call sites.
-- `remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]` — Remove a call argument.
-- `insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]` — Insert a call argument.
-- `remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]` — Remove a declaration parameter.
-- `unused <source.lean>:<line>:<column> [--apply]` — Remove one unused binder.
-- `unused --glob '<pattern>' [--apply]` — Remove unused binders across matching files.
-- `unused-simp --glob '<pattern>' [--apply]` — Remove unused `simp` arguments.
+arguments
+  remove-call-arg <file> <mod> <decl-mod> <decl> <n> [--syntax] [--token <token>]
+  insert-call-arg <file> <mod> <decl-mod> <decl> <n> <term>   insert before argument <n>
+  remove-parameter <file> <mod> <decl> <binder> <n>           remove a parameter Lean reports unused
 
-### Modules and project lints
+cleanup
+  unused <file>:<line>:<col>                       remove one unused binder
+  unused --glob <pat>                              remove unused binders
+  unused-simp --glob <pat>                         remove unused `simp` arguments
+  modularize <file> | modularize --glob <pat>      convert to the Lean module system
+```
 
-- `modularize <source.lean> [--apply]` or `modularize --glob '<pattern>' [--apply]` — Convert files to the Lean module system.
-- `lint-book-file <source.lean>` or `lint-book --glob '<pattern>'` — Run the project-specific book lints.
+`<decl-mod>` is the module that *defines* the declaration, `<mod>` the module being edited; they differ only when the
+call sites are in another file. `--syntax` matches call sites by name where elaboration cannot resolve them, and
+`--token <token>` also matches its notation.
 
 ## How it works
 
-The tool combines Lean's `.ilean` reference data (which identifies declarations semantically) with the fully elaborated command syntax tree (which identifies the exact source range and arguments). Its SQLite index makes repository-wide renames and queries fast. It refuses edits it cannot establish safely; there is no text-search fallback.
+The tool combines Lean's `.ilean` reference data (which identifies declarations semantically) with the fully elaborated
+command syntax tree (which identifies the exact source range and arguments). Its SQLite index makes repository-wide
+renames and queries fast. It refuses edits it cannot establish safely; there is no text-search fallback.
 
 ## SQLite index
 
