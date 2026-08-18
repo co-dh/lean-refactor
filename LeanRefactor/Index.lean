@@ -129,6 +129,18 @@ insert into syntax_node (module, id, parent, kind, b0, b1, hash, nodes)
 delete from syntax_node_in;
 commit;"
 
+/-- Move one refresh's staged statements onto `decl_info`.  Also a join, and for the same reason:
+    the child read the source, so it knows a position, never the `_private.`-mangled name the row
+    is keyed by — `decl_range`, keyed by both, is what turns the one into the other. -/
+private def attachStatements (dbPath : String) : IO Unit :=
+  Db.exec dbPath "begin;
+update decl_info set stmt = s.stmt
+  from decl_stmt_in s
+  join decl_range r on r.module = s.module and r.sl1 = s.sl1 and r.sc1 = s.sc1
+  where decl_info.name = r.name and decl_info.module = r.module;
+delete from decl_stmt_in;
+commit;"
+
 /-- How many modules the `module` table holds — exactly the set the scan found, because every
     stale row is deleted and re-inserted under the same name. -/
 private def moduleCount (dbPath : String) : IO Nat := do
@@ -194,9 +206,11 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   let outputs ← mapFilesParallel (← scanJobs) (stale.map (·.source)) fun path =>
     IO.Process.output { cmd := self, args := #["syntax-rows", path] }
   let mut syntaxRows := #[]
+  let mut stmtRows := #[]
   for output in outputs do
-    unless output.stdout.isEmpty do
-      syntaxRows := syntaxRows ++ (output.stdout.splitOn Db.recordSep).filter (· != "")
+    let (nodes, stmts) := Db.childGroups output.stdout
+    syntaxRows := syntaxRows ++ nodes
+    stmtRows := stmtRows ++ stmts
     unless output.stderr.isEmpty do IO.eprint output.stderr
   Db.importRows dbPath "decl_range" declRanges
   Db.importRows dbPath "use_site" useSites
@@ -207,7 +221,9 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   Db.importRows dbPath "module" (stale.mapIdx fun i m =>
     Db.row #[toString (firstId + i), m.name, m.source, m.ileanHash, m.oleanHash])
   Db.importRows dbPath "syntax_node_in" syntaxRows
+  Db.importRows dbPath "decl_stmt_in" stmtRows
   internStagedNodes dbPath
+  attachStatements dbPath
   -- A full extract stages every module's nodes and then deletes them, which leaves a quarter of a
   -- gigabyte of freed pages the file never gives back on its own.  Only on `full`: an incremental
   -- refresh's freelist is exactly what the NEXT refresh's staging writes into, so compacting it

@@ -104,9 +104,11 @@ public def ofModules (modules : Array Name) (buildDir : String := ".lake/build/l
       -- see; the de-mangled name is what makes the two comparable, and what says which rows are the
       -- compiler's own (`.eq_1`, `.match_1`, `._simp_1_1`) rather than something anyone wrote.
       let userName := (privateToUserName? ci.name).getD ci.name
+      -- The empty sixth cell is `stmt`: a signature is the SOURCE's, so the syntax pass fills it in
+      -- by position afterwards, and `.import` needs the record as wide as the table meanwhile.
       declInfos := declInfos.push (String.intercalate fieldSep
         [name, toString userName, toString mod, kind,
-         if generatedName userName then "1" else "0"])
+         if generatedName userName then "1" else "0", ""])
       -- An inductive publishes its constructors' types: `structure LawfulPMC` names `pmcCone` in a
       -- field, and `pmcCone` has to be public for the structure to be.  A constructor gets no row of
       -- its own (`kindOf` drops it), and the inductive's own type is only its arity, so without this

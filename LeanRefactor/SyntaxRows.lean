@@ -18,9 +18,13 @@ namespace LeanRefactor.SyntaxRows
     Producing it costs a full elaboration: Lean's parser is environment-dependent (this repository
     defines 42 notations, so `a ⊚ b` cannot be parsed without the module that declares `⊚`), so
     there is no cheap parse-only path and the tree is priced like the semantic rows. That is the
-    whole argument for storing it. -/
+    whole argument for storing it.
+
+    `stmts` is one record per declaration signature: the tree is what says where a signature ends,
+    and this process is the only one holding both the tree and the source. -/
 public structure Rows where
   nodes : Array String
+  stmts : Array String
 
 /-- One node of the flattened tree. `id` is the node's index in preorder, `parent` the id of the
     enclosing node (-1 for a root command), so a subtree is a contiguous id range and "the innermost
@@ -88,6 +92,42 @@ public def nodesOfCommands (commands : Array Syntax) : Array Node := Id.run do
     (fun (n, acc) cmd => let (n, acc, _, _) := walk cmd (-1) n acc; (n, acc)) (0, #[])
   nodes
 
+/-- One declaration's signature as the tree gives it: where its NAME token starts, and the byte
+    range of the `declSig`/`optDeclSig` beside it. -/
+private structure Sig where
+  name : String.Pos.Raw
+  b0 : String.Pos.Raw
+  b1 : String.Pos.Raw
+
+/-- The direct children with `optional`'s `null` wrapper looked through: an instance's name is
+    `optional declId`, so it sits one level below every other declaration form's. -/
+private def parts (stx : Syntax) : Array Syntax :=
+  stx.getArgs.foldl (fun acc a => if a.isOfKind nullKind then acc ++ a.getArgs else acc.push a) #[]
+
+/-- The signature beside a declaration's name, when this node is a declaration form at all.  Name
+    and signature are SIBLINGS, which reads the pair off without knowing how each form is spelled. -/
+private def sigOf (stx : Syntax) : Option Sig := do
+  let args := parts stx
+  let name ← match args.find? (·.isOfKind ``Lean.Parser.Command.declId) with
+    | some declId => declId.getPos?
+    -- An anonymous instance has no name token, and `.ilean` puts its selection range on the
+    -- `instance` keyword, so that keyword is the position this has to report.
+    | none => args.findSome? fun a => match a with
+        | .atom _ "instance" => a.getPos?
+        | _ => none
+  let sig ← args.find? fun a =>
+    a.isOfKind ``Lean.Parser.Command.declSig || a.isOfKind ``Lean.Parser.Command.optDeclSig
+  let range ← sig.getRange?
+  -- `def f := e` has an EMPTY `optDeclSig`, and an empty range says nothing.
+  guard (range.start.byteIdx < range.stop.byteIdx)
+  return { name, b0 := range.start, b1 := range.stop }
+
+/-- Every declaration signature under `stx`.  Recursive because declarations nest: a `mutual` block
+    and a `declaration`'s modifiers both stand between a command and the form that carries a name. -/
+private partial def sigs (stx : Syntax) : Array Sig :=
+  let here := match sigOf stx with | some s => #[s] | none => #[]
+  stx.getArgs.foldl (fun acc child => acc ++ sigs child) here
+
 /-- Elaborate `path` against its imports and flatten every command it parsed.
 
     One file, one process: the caller forks. Elaborating in a loop retains an `Environment` per file
@@ -106,7 +146,13 @@ public def ofFile (path moduleName : String) : IO Rows := do
   let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
   -- Elaboration errors are NOT fatal here. The tree is what the parser produced, and a file that
   -- fails to elaborate is exactly the file a refactor is about to be pointed at.
-  return { nodes := (nodesOfCommands frontend.commands).map (fun n =>
+  -- The name position is in the 0-based UTF-16 coordinates `.ilean` records, because `decl_range`
+  -- is what the index joins these statements against and that is the only key both sides share.
+  let stmts := (frontend.commands.foldl (fun acc cmd => acc ++ sigs cmd) #[]).map fun s =>
+    let pos := inputCtx.fileMap.utf8PosToLspPos s.name
+    Db.row #[moduleName, toString pos.line, toString pos.character,
+             String.Pos.Raw.extract source s.b0 s.b1]
+  return { stmts, nodes := (nodesOfCommands frontend.commands).map (fun n =>
     Db.row #[moduleName, toString n.id, toString n.parent, n.kind, toString n.b0, toString n.b1,
              Db.cell n.hash, toString n.nodes]) }
 

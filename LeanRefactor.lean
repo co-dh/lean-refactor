@@ -1692,6 +1692,20 @@ private def usesReport (declName : String) : IO UInt32 := do
     for path in namedPaths do IO.println s!"    {path}"
   return 0
 
+/-- `lean-refactor stmt`: what every declaration whose name contains `fragment` says, as the source
+    spells it.  A read-only report answered entirely from the index — the point of storing the
+    signature is that no file has to be opened to read one back. -/
+private def stmtReport (fragment : String) : IO UInt32 := do
+  let some dbPath ← refreshedIndex? | return 1
+  let matched ← Query.declStatements dbPath fragment
+  if matched.isEmpty then
+    IO.println s!"no indexed declaration's name contains `{fragment}`"
+  for (name, source, line, stmt) in matched do
+    IO.println s!"{source}:{line}  {name}"
+    -- A signature is written over as many lines as its author chose, and they are kept.
+    for text in stmt.splitOn "\n" do IO.println s!"  {text}"
+  return 0
+
 /-! ## Adopting the module system
 
 `module` is opt-in per file, and adopting it takes three edits at once: the `module` keyword, every
@@ -2070,7 +2084,7 @@ private def nodesOfChild (path : String) : IO (Array SyntaxRows.Node) := do
   let child ← IO.Process.output { cmd := self, args := #["syntax-rows", path] }
   if child.exitCode != 0 then
     throw <| IO.userError s!"{path}: the `syntax-rows` child failed: {child.stderr}"
-  pure (SyntaxQuery.nodesOfRows ((child.stdout.splitOn Db.recordSep).toArray))
+  pure (SyntaxQuery.nodesOfRows (Db.childGroups child.stdout).1)
 
 /-- `lean-refactor modularize --glob`: put every file matching the pattern on the module system
     together, staging per file and swapping all in at once — the shape `rename-decl` uses for
@@ -2376,7 +2390,7 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"  {String.intercalate " → " kinds}"
 
 private def usage : String :=
-  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor dup [--min-nodes <n>]\n  lean-refactor modularize <source.lean> [--apply]\n  lean-refactor modularize --glob '<pattern>' [--apply]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]\n\na glob pattern is a comma-separated list; a leading `!` subtracts:\n  --glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean'"
+  "usage:\n  lean-refactor index [--full]\n  lean-refactor uses <full-declaration-name>\n  lean-refactor stmt <name-fragment>\n  lean-refactor dup [--min-nodes <n>]\n  lean-refactor modularize <source.lean> [--apply]\n  lean-refactor modularize --glob '<pattern>' [--apply]\n  lean-refactor lint-book-file <source.lean>\n  lean-refactor lint-book --glob '<pattern>'\n  lean-refactor rename-module <old-module> <new-module> [--apply]\n  lean-refactor move <source.lean> <full-declaration-name> <target.lean> [--apply]\n  lean-refactor move-into <source.lean> <full-declaration-name> <target.lean> <target-namespace> [--apply]\n  lean-refactor move-omit <source.lean> <full-declaration-name> <target.lean> <binders> [--apply]\n  lean-refactor relocate-before <source.lean> <full-declaration-name> <anchor-declaration> [--apply]\n  lean-refactor relocate-before-section <source.lean> <full-declaration-name> <section-name> [--apply]\n  lean-refactor collapse <source.lean> <full-declaration-name> <replacement> [--apply]\n  lean-refactor collapse-drop-call-arg <source.lean> <full-declaration-name> <replacement> <1-based-index> [--apply]\n  lean-refactor replace-body <source.lean> <full-declaration-name> <term> [--apply]\n  lean-refactor replace-declaration <source.lean> <full-declaration-name> <declaration> [--apply]\n  lean-refactor remove-declaration <source.lean> <full-declaration-name> [--apply]\n  lean-refactor rename <source.lean> <module> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply] [--no-index]\n  lean-refactor rename-decl --glob '<pattern>' (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-file <source.lean> (<full-declaration-name> <replacement>)... [--apply]\n  lean-refactor rename-token <source.lean> <old-token> <new-token> [--apply]\n  lean-refactor rename-token --glob '<pattern>' <old-token> <new-token> [--apply]\n  lean-refactor infix --glob '<pattern>' <full-declaration-name> <token> [--apply]\n  lean-refactor unused <source.lean>:<line>:<column> [--apply]\n  lean-refactor unused --glob '<pattern>' [--apply]\n  lean-refactor unused-simp --glob '<pattern>' [--apply]\n  lean-refactor inspect <source.lean> <module> <declaration-module> <full-declaration-name>\n  lean-refactor remove-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <1-based-index> [--syntax] [--token <notation-token>] [--apply]\n  lean-refactor insert-call-arg <source.lean> <module> <declaration-module> <full-declaration-name> <before-1-based-index> <term> [--apply]\n  lean-refactor remove-parameter <source.lean> <module> <full-declaration-name> <binder-name> <1-based-index> [--apply]\n\na glob pattern is a comma-separated list; a leading `!` subtracts:\n  --glob 'Freyd/*.lean,!Freyd/S1_573_PrimRec.lean'"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -2384,18 +2398,22 @@ def main (args : List String) : IO UInt32 := do
   -- `refreshedIndex?`, so the split-part guard has to be repeated here.
   | ["index"] => return ← if ← staleSplitParts then pure 1 else Index.run false
   | ["index", "--full"] => return ← if ← staleSplitParts then pure 1 else Index.run true
-  -- The child half of the index's syntax-tree pass: elaborate `path`, print its command syntax
-  -- tree as `syntax_node` records (cells joined by `fieldSep`, records by `recordSep`) on stdout,
-  -- and exit.  Only the index driver calls this; a human running it gets the same records.
+  -- The child half of the index's syntax-tree pass: elaborate `path`, print its `syntax_node`
+  -- records and then its `decl_stmt_in` records (cells joined by `fieldSep`, records by
+  -- `recordSep`, the two groups by `groupSep`) on stdout, and exit.  Only the index driver calls
+  -- this; a human running it gets the same records.
   | "syntax-rows" :: path :: _ =>
       let moduleName ← match moduleNameOfPath path with
         | .ok n => pure n
         | .error message => IO.eprintln message; return 2
       let rows ← SyntaxRows.ofFile path (toString moduleName)
-      if !rows.nodes.isEmpty then
-        IO.print (String.intercalate Db.recordSep rows.nodes.toList)
+      -- `groupSep` unconditionally, so a reader always sees exactly two groups; a child that failed
+      -- prints nothing at all, and that is the case `Db.childGroups` tells apart.
+      IO.print (String.intercalate Db.recordSep rows.nodes.toList ++ Db.groupSep ++
+        String.intercalate Db.recordSep rows.stmts.toList)
       return 0
   | ["uses", declName] => return ← usesReport declName
+  | ["stmt", fragment] => return ← stmtReport fragment
   | ["modularize", "--glob", pattern] => return ← modularizeGlob pattern false
   | ["modularize", "--glob", pattern, "--apply"] => return ← modularizeGlob pattern true
   | ["modularize", path] => return ← modularize path false

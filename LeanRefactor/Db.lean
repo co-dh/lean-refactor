@@ -11,6 +11,18 @@ namespace LeanRefactor.Db
 public def fieldSep : String := "\x1f"
 public def recordSep : String := "\x1e"
 
+/-- 0x1D between the two record groups a `syntax-rows` child prints — its syntax nodes, then its
+    declaration statements.  One stream and one fork: a second run would re-elaborate the file. -/
+public def groupSep : String := "\x1d"
+
+/-- The records of each group a `syntax-rows` child printed.  A child that failed prints nothing,
+    and both groups then come back empty rather than as one malformed group. -/
+public def childGroups (stdout : String) : Array String × Array String :=
+  let records (s : String) : Array String := ((s.splitOn recordSep).filter (· != "")).toArray
+  match stdout.splitOn groupSep with
+  | [nodes, stmts] => (records nodes, records stmts)
+  | _ => (#[], #[])
+
 /-- One row: the cell values joined by `fieldSep`. -/
 public def row (cells : Array String) : String :=
   String.intercalate fieldSep cells.toList
@@ -29,7 +41,7 @@ public def cell (h : UInt64) : String :=
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
     the modules whose artefacts changed, so after a keying change the untouched modules would keep
     rows computed by the old algorithm and a grouping query would silently mix two generations. -/
-public def schemaVersion : String := "7"
+public def schemaVersion : String := "8"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
@@ -58,10 +70,13 @@ create table decl_range (
   primary key (name, module)
 );
 
+-- `stmt` is the signature as the source spells it, so \"what does this say\" is one query.  The
+-- no-token-text rule below is `syntax_node`'s 4.15 M rows; 12 k signatures cost 2 MB against 322.
 create table decl_info (
   name text, user_name text, module text,
   kind text,
   internal int,
+  stmt text,
   primary key (name, module)
 );
 
@@ -107,11 +122,18 @@ create table syntax_node_in (
   module text, id int, parent int, kind text, b0 int, b1 int, hash int, nodes int
 );
 
+-- Where the same child's statements land, keyed by the start of the declaration's name token, until
+-- the refresh joins them through `decl_range` onto the mangled name `decl_info` goes by.
+create table decl_stmt_in (module text, sl1 int, sc1 int, stmt text);
+
 create index i_use_name   on use_site(name);
 create index i_use_module on use_site(use_module);
 create index i_dep_dst    on dep(dst);
 create index i_dep_src    on dep(src);
 create unique index i_module_id on module(id);
+-- The statement join's key: a `syntax-rows` child reports positions, and this is what turns one
+-- into the name `decl_info` is keyed by.
+create index i_decl_range_pos on decl_range(module, sl1, sc1);
 "
 
 /-- Spawn `sqlite3` with `extraArgs`, feeding it `sql` from the temp file `tmp` via `.read`.

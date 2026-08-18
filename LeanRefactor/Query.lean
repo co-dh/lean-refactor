@@ -64,6 +64,29 @@ where name = '{Db.escaped declName}' and is_definition = 0 group by use_module o
       return out
   | _ => return #[]
 
+/-- What each declaration whose user-facing name contains `fragment` SAYS: its name, the source path
+    and 1-based line of that name, and the signature as the source spells it.
+
+    On `user_name`, not `name`: a fragment cannot match through the `_private.…` mangling.  The
+    compiler's own declarations are dropped — an equation lemma repeats its parent's signature. -/
+public def declStatements (dbPath fragment : String) :
+    IO (Array (String × String × Nat × String)) := do
+  let j ← Db.query dbPath s!"select i.user_name as n, m.source as s, r.sl1 + 1 as l, i.stmt as t
+from decl_info i
+join module m on m.name = i.module
+join decl_range r on r.name = i.name and r.module = i.module
+where i.user_name like '%{Db.escaped fragment}%' and i.internal = 0 and i.stmt != ''
+order by m.source, r.sl1"
+  match j with
+  | .arr rows =>
+      return rows.filterMap fun row => do
+        let n ← (row.getObjValAs? String "n").toOption
+        let s ← (row.getObjValAs? String "s").toOption
+        let l ← (row.getObjValAs? Nat "l").toOption
+        let t ← (row.getObjValAs? String "t").toOption
+        pure (n, s, l, t)
+  | _ => return #[]
+
 /-- Modules whose declarations mention `declName` in a type or a proof term, name-sorted. -/
 public def dependentModules (dbPath declName : String) : IO (Array String) := do
   let j ← Db.query dbPath s!"select distinct module as m from dep where dst = '{Db.escaped declName}' order by module"
