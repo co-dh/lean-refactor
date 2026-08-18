@@ -2,7 +2,7 @@
 
 Conservative, semantic refactoring for Lean 4 repositories. Its main jobs are:
 
-- **Rename** declarations, uses, modules, files, and notation tokens.
+- **Rename** a declaration everywhere it is mentioned, and modules, files, and notation tokens with it.
 - **Deduplicate** repeated source subtrees with `dup`, then collapse a chosen copy onto its survivor.
 - **Query** a built repository: `stmt` answers what a declaration says; `uses` shows its dependents; `index`
   refreshes the local index.
@@ -16,7 +16,7 @@ anywhere in the argument list. An applied repository-wide edit is verified by a 
 lake build
 cd /path/to/target-repo
 lake build                         # produces the .ilean data the tool reads
-/path/to/lean-refactor/scripts/lean-refactor <command>
+/path/to/lean-refactor/scripts/lean-refactor command [args]
 ```
 
 Run from the target repository root. The target and this tool must use the same Lean toolchain.
@@ -49,7 +49,7 @@ usage: lean-refactor command [args] [--apply]
   m  module of f          r  replacement               M  module that declares d
   g  --glob pattern, comma-separated, a leading ! subtracts: 'Freyd/*.lean,!Freyd/S1_573.lean'
 
-find
+query
   index [--full]                          build or refresh the index
   uses d                                  modules that use d
   stmt frag                               signatures of declarations whose name has frag in it
@@ -58,14 +58,15 @@ find
   lint-book-file f | lint-book --glob g   project book lints
 
 rename
-  rename f m (d r)...                     uses, in one file
-  rename-file f (d r)...                  uses, in one file, m taken from the path
-  rename --glob g (d r)...                uses, across files [--no-index]
-  rename-decl --glob g (d r)...           uses and binding sites, across files
-  rename-module m r                       a module, its file, and every import of it
-  rename-token f old new                  a notation token, in one file
-  rename-token --glob g old new           a notation token, across files
-  infix --glob g d token                  give d infix notation
+  rename f m (d r)...                     write r where f mentions d, but not where d is declared
+  rename-file f (d r)...                  the same, with m read from the path of f
+  rename --glob g (d r)...                write r where any file matching g mentions d
+    --no-index                            find those files by elaborating them, not from the index
+  rename-decl --glob g (d r)...           the same, and rename d where it is declared
+  rename-module m r                       rename module m to r: its file, and every import of it
+  rename-token f old new                  write the notation token new where f writes old
+  rename-token --glob g old new           the same, in every file matching g
+  infix --glob g d token                  give d the infix notation token
 
 move
   move f d to.lean                        move d to another file
