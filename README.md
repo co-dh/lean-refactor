@@ -55,7 +55,6 @@ query
   stmt frag                               signatures of declarations whose name has frag in it
   dup [--min-nodes n]                     repeated source subtrees
   inspect f m M d                         call sites of d
-  lint-book-file f | lint-book --glob g   project book lints
 
 rename
   rename f m (d r)...                     write r where f mentions d, but not where d is declared

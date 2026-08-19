@@ -255,5 +255,5 @@ about to disturb, not telling the build what to do.
 * Retiring freyd's `scripts/ExtractGraph.lean` and its `graph/*.tsv` (118,231 edges, 8,604 decls). Its consumers
   (`dep_dup.py`, `community.py`, `concept.py`) want columns this schema does not yet carry. Revisit once `type_key`
   and the decl metadata are in place; not part of this work.
-* Any target-specific naming. Nothing in the schema, the code, or the CLI may mention a particular library — the
-  `lint-book` precedent, in reverse.
+* Any target-specific naming. Nothing in the schema, the code, or the CLI may mention a particular library. The
+  `lint-book` subcommand did, hard-coding `Freyd.Functor`, and was removed for it.
