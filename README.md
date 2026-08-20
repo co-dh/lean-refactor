@@ -1,48 +1,33 @@
 # lean-refactor
 
-Conservative, semantic refactoring for Lean 4 repositories. Its main jobs are:
+Conservative, semantic refactoring for Lean 4 repositories. It renames declarations, modules, files
+and notation tokens; finds and collapses duplicated source; and answers what a built repository
+contains. A **notation token** is the symbol a `notation` or `infixl` command introduces — `≫`, `⊆ₛ`
+— as the source literally writes it; it is not a declaration, so nothing in the index knows it by
+name.
 
-- **Rename** a declaration everywhere it is mentioned, and modules, files, and notation tokens with it.
-- **Deduplicate** repeated source subtrees with `dup`, then collapse a chosen copy onto its survivor.
-- **Query** a built repository: `stmt` answers what a declaration says; `uses` shows its dependents; `index`
-  refreshes the local index.
+Every command previews. `--apply` is the one flag that writes; it may sit anywhere in the argument
+list. An applied repository-wide edit is verified by a build and restored if that build fails.
 
-Every command previews. `--apply` is the one flag that writes, it means the same thing everywhere, and it may sit
-anywhere in the argument list. An applied repository-wide edit is verified by a build and restored if that build fails.
+Edits come from Lean's own data — `.ilean` reference data says which occurrence is semantically the
+declaration, the elaborated syntax tree says its exact range — so an edit the tool cannot establish
+is refused rather than guessed at. There is no text-search fallback.
 
 ## Build and run
 
 ```sh
-lake build
+lake build                                   # once, in this repository
 cd /path/to/target-repo
-lake build                         # produces the .ilean data the tool reads
-/path/to/lean-refactor/scripts/lean-refactor command [args]
+lake build                                   # produces the .ilean data the tool reads
+/path/to/lean-refactor/scripts/lean-refactor rename Foo.old new_name
 ```
 
-Run from the target repository root. The target and this tool must use the same Lean toolchain.
-
-## Examples
-
-```sh
-# Rename a declaration and every use of it.  Drop --apply to see the edits first.
-lean-refactor rename Foo.old_name new_name --apply
-
-# The same command renames a module, a file, or a notation token — the index says which it is.
-lean-refactor rename Foo.Bar Foo.Baz            # a module: its file, and every import of it
-lean-refactor rename '⊆c' '⊆ₛ'                  # a notation token
-
-# Find repeated source fragments, then read what one of the declarations says.
-lean-refactor dup --min-nodes 200
-lean-refactor stmt old_name
-
-# See the modules that use a declaration.
-lean-refactor uses Foo.bar
-```
+Run from the target repository root. The target and this tool must be on the same Lean toolchain.
 
 ## Commands
 
-This is `lean-refactor -h`, inserted verbatim by `scripts/sync-readme` — run it after changing the
-usage text, so this block and the binary cannot drift apart.
+`lean-refactor -h`, inserted verbatim by `scripts/sync-readme` — run it after changing the usage
+text so the two cannot drift apart.
 
 <!-- usage:begin -->
 
@@ -58,6 +43,8 @@ usage: lean-refactor command [args] [--in g] [--apply]
           (rename, infix, unused, unused-simp, modularize).
 
   d  declaration, full name      r  replacement      n  index, counting from 1
+  tok  a notation token: the symbol a `notation`/`infixl` command introduces, as the source
+       literally writes it — `≫`, `⊆ₛ`.  Not a declaration, so the index has no row for it.
 
 query
   index [--full]                          build or refresh the index
@@ -99,56 +86,30 @@ cleanup
 
 <!-- usage:end -->
 
-A command takes the thing it edits and works the rest out. Which file declares a declaration comes
-from the index; whether a name is a declaration, a module, a file, or a notation token is decided the
-same way, and the decision is printed before any edit. A name that is both a module and a declaration
-is refused rather than guessed — write the module as its path to say which you meant.
+A command takes the thing it edits and works the rest out: the index says which file declares a
+declaration, and whether a name is a declaration, a module, a file or a notation token. The decision
+is printed before any edit. A name that is both a module and a declaration is refused rather than
+guessed — write the module as its path to say which you meant.
 
-`--in` is the only file selector, and it only ever narrows: it picks which files a repository-wide
-command touches, and it resolves the ambiguity when one name is declared in two files.
+`--in` is the only file selector, and it only narrows.
 
-## Refactoring with an agent
+## Driving it from an agent
 
-The tool is built for a coding agent to drive: every command previews by default, states what it
-decided before it writes, and refuses rather than guesses. That makes a safe loop:
-
-1. **Ask before editing.** `stmt <fragment>` gives the signature and location of every declaration
-   whose name matches; `uses <d>` gives the modules that use it, the modules that depend on it
-   without naming it (notation, macro expansion — no edit needed there, but they must still
-   compile), and the modules that name it without depending on it. Read both before choosing a name.
-2. **Preview.** Run the command with no `--apply`. Check the first line: it says which kind the tool
-   decided the name is, and which file it resolved to. A wrong kind or a wrong file is visible here,
-   for free.
-3. **Apply.** Add `--apply`. A single-file edit is gated on that file elaborating; a repository-wide
-   edit stages every file, swaps them in at once, and runs one build — any failure restores every
-   source. Report the tool's own verdict line rather than re-deriving it.
-4. **Read the warnings.** A rename prints leftover textual mentions the info trees never recorded
-   (`unfold` arguments, docstrings) and the count of modules that depend without naming. Neither is
-   an error; both are places a human should look.
-
-Rules worth encoding in a skill:
+Every command previews by default, says what it decided before writing, and refuses rather than
+guesses — so the loop is: **ask** (`stmt` for signatures, `uses` for dependents), **preview** (check
+the first line: which kind, which file), **apply**, **read the warnings** (leftover textual mentions
+the info trees never recorded, and modules that depend through notation without naming anything).
 
 - **Never grep for a declaration.** A private copy's real name is mangled (`_private.Mod.0.Foo`), so
-  grep misses it and reports a name as unique when it is not. Query the index instead —
-  `select user_name, module from decl_info where user_name like '%.<shortname>'` — or use `stmt`.
-- **Pass a short replacement, not a qualified one.** Use sites inside a file that already opened the
-  namespace would otherwise be rewritten to `Ns.Ns.name`.
-- **Do not name a file unless the tool asks.** The index places the declaration. `--in` is for
-  narrowing a sweep, and for the one case the tool reports as ambiguous.
-- **A command printing nothing for minutes is hung, not slow.** The usual cause is orphaned
-  `.olean.server`/`.olean.private` parts from a rolled-back build; the tool guards against this
-  before every index refresh and names the files to delete.
-- **Batch renames of one kind.** Scanning is the whole cost of a repository-wide pass, so
-  `rename a b c d e f` costs one pass where three commands cost three. Mixed kinds are refused.
-- **Rebuild after reverting.** Reverting a source by hand leaves the `.olean`/`.ilean` describing
-  the edit, and the index then answers for a file that no longer exists that way.
-
-## How the tool decides
-
-The tool combines Lean's `.ilean` reference data (which identifies declarations semantically) with
-the fully elaborated command syntax tree (which identifies the exact source range and arguments). Its
-SQLite index makes repository-wide renames and queries fast. It refuses edits it cannot establish
-safely; there is no text-search fallback.
+  grep reports a name as unique when it is not. Use `stmt`, or query `decl_info.user_name`.
+- **Pass a short replacement, not a qualified one**, or uses inside a file that already opened the
+  namespace become `Ns.Ns.name`.
+- **Do not name a file** unless the tool reports the name as ambiguous.
+- **Batch renames of one kind.** Scanning is the whole cost of a sweep, so `rename a b c d` costs one
+  pass where two commands cost two. Mixed kinds are refused.
+- **Rebuild after reverting a source by hand**, or the index keeps answering for the edit you undid.
+- **No output for minutes means a hung import**, not a slow one — usually orphaned
+  `.olean.server`/`.olean.private` parts from a rolled-back build. The tool names the files to delete.
 
 ## SQLite index
 
@@ -179,8 +140,7 @@ module is `delete where module = 'M'` and re-insert, with no cross-module invali
 | `ilean_hash` | text    | Hash of the module's `.ilean`, for detecting stale rows.     | `52deb1f0…`            |
 | `olean_hash` | text    | Hash of its `.olean`, likewise.                              | `872f1ebc…`            |
 
-The ID is assigned from `max(id) + 1`, never from `rowid`: `vacuum` renumbers rowids and would
-silently repoint every syntax node of every module the refresh did not touch.
+`id` is assigned from `max(id) + 1`, never from `rowid`, which `vacuum` renumbers.
 
 ### `syntax_kind` — interned parser node kinds
 
@@ -189,8 +149,7 @@ silently repoint every syntax node of every module the refresh did not touch.
 | `id`   | integer | Interned ID, primary key. | `1`                             |
 | `name` | text    | Lean syntax kind, unique. | `Lean.Parser.Command.namespace` |
 
-434 distinct kinds against 4.15 M nodes: interning them saved 42 MB of repeated `Lean.Parser.…`.
-Kept as a table rather than folded into a hash so `select kind, count(*)` still reads.
+434 kinds against 4.15 M nodes; interning them saved 42 MB of repeated `Lean.Parser.…`.
 
 ### `decl_range` — where each declaration sits
 
@@ -218,8 +177,7 @@ Kept as a table rather than folded into a hash so `select kind, count(*)` still 
 | `internal`  | int  | `1` for a compiler-written name (`eq_1`, `injEq`).  | `0`                                |
 | `stmt`      | text | The signature as the source spells it.              | `{X Y Z : 𝒞} {m : X ⟶ Y} …`        |
 
-De-mangling matters: a private copy re-proving a public lemma is a duplicate no name-grep can see,
-and `user_name` is what makes the two comparable.
+Query `user_name`: a private copy re-proving a public lemma is invisible under its mangled `name`.
 
 ### `use_site` — every recorded occurrence
 
@@ -247,11 +205,9 @@ Indexed on `name` and on `use_module`.
 | `in_type`  | int  | `1` if named in `src`'s statement.       | `0`                        |
 | `in_value` | int  | `1` if named in `src`'s body.            | `1`                        |
 
-The two faces are kept apart because where a constant is named decides what has to be done about it:
-a private constant in a public *statement* is illegal while the same constant in the *proof* is fine,
-and a definition the code generator compiles must reduce its type identically on both sides of a
-module boundary — a demand on the type and on nothing else. One row per pair; a constant named in
-both faces carries both flags. Indexed on `src` and on `dst`.
+The two faces decide what an edit must do: a private constant in a public *statement* is illegal
+where the same constant in the *proof* is fine. One row per pair, both flags set if named in both.
+Indexed on `src` and `dst`.
 
 ### `syntax_node` — the command syntax tree, flattened
 
@@ -266,12 +222,8 @@ both faces carries both flags. Indexed on `src` and on `dst`.
 | `hash`   | int  | Subtree hash, identifiers blanked — the `dup` key.             | `422061742356922016` |
 | `nodes`  | int  | Subtree size in nodes.                                         | `3`                  |
 
-`WITHOUT ROWID`, so the table is clustered by module — which is how every reader reads it — and the
-separate module index that cost 119 MB over 4.15 M rows disappears. `hash` gets no index
-deliberately: on a `WITHOUT ROWID` table a secondary index repeats the whole primary key in every
-entry, so indexing it measured 158 MB for no gain — the only query that groups on `hash` also filters
-on `nodes`, which no index covers, so it scans either way. Measured with and without: 0.6 s both
-times, 192 MB apart.
+`WITHOUT ROWID`, clustering by module. `hash` has no index deliberately — adding one measured
+158 MB for no speedup, since the query that groups on it also filters on `nodes` and scans anyway.
 
 ### `syntax_node_in` — staging for `syntax_node`
 
@@ -286,8 +238,8 @@ times, 192 MB apart.
 | `hash`   | int  | As in `syntax_node`.                    | `422061742356922016`   |
 | `nodes`  | int  | As in `syntax_node`.                    | `3`                    |
 
-A `syntax-rows` child elaborates one module in one process and knows nothing about the IDs the
-database has handed out, so it writes names and the refresh interns them.
+A `syntax-rows` child knows nothing about the IDs the database has handed out, so it writes names
+and the refresh interns them.
 
 ### `decl_stmt_in` — staging for `decl_info.stmt`
 
@@ -299,4 +251,4 @@ database has handed out, so it writes names and the refresh interns them.
 | `stmt`   | text | The signature as the source spells it.      | `{X Y Z : 𝒞} {m : X ⟶ Y} …` |
 
 Keyed by position because the child reports positions; the refresh joins through `decl_range` onto
-the mangled name `decl_info` goes by. Indexed for that join as `decl_range(module, sl1, sc1)`.
+the mangled name. Indexed for that join as `decl_range(module, sl1, sc1)`.

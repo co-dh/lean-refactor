@@ -2415,6 +2415,8 @@ private def usage : String := String.intercalate "\n" [
   "          (rename, infix, unused, unused-simp, modularize).",
   "",
   "  d  declaration, full name      r  replacement      n  index, counting from 1",
+  "  tok  a notation token: the symbol a `notation`/`infixl` command introduces, as the source",
+  "       literally writes it — `≫`, `⊆ₛ`.  Not a declaration, so the index has no row for it.",
   "",
   "query",
   row "index [--full]" "build or refresh the index",
