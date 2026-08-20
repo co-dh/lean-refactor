@@ -101,24 +101,81 @@ guessed — write the module as its path to say which you meant.
 
 The eight tables below are the whole readable schema. (Two more, `syntax_node_in` and
 `decl_stmt_in`, exist only inside a refresh: it fills them, interns their names into IDs, and empties
-them again.)
+them again.) **Bold** columns form the primary key; `use_site` and `dep` have none — they are fact
+tables, and the same pair legitimately occurs many times.
 
 Every row is owned by exactly one module — the one whose artefact produced it — so refreshing a
 module is `delete where module = 'M'` and re-insert, with no cross-module invalidation.
 
+```mermaid
+erDiagram
+  module ||--o{ decl_info : declares
+  module ||--o{ decl_range : declares
+  module ||--o{ use_site : contains
+  module ||--o{ dep : owns
+  module ||--o{ syntax_node : "parses to"
+  syntax_kind ||--o{ syntax_node : types
+  decl_info ||--|| decl_range : "says vs sits"
+  decl_info ||--o{ use_site : "occurs at"
+  decl_info ||--o{ dep : "names or is named"
+
+  module {
+    text name PK
+    integer id UK "what syntax_node stores"
+    text source "path"
+  }
+  decl_info {
+    text name PK "mangled if private"
+    text module PK
+    text user_name "de-mangled"
+    text stmt "signature as written"
+  }
+  decl_range {
+    text name PK
+    text module PK
+    int sl1 "line of the name token"
+  }
+  use_site {
+    text name FK "the declaration referred to"
+    text use_module FK "where the occurrence is"
+    int is_definition "1 = binding site"
+  }
+  dep {
+    text src FK "names dst"
+    text dst FK
+    int in_type "1 = in src statement"
+  }
+  syntax_node {
+    int module PK "module.id"
+    int id PK "preorder index"
+    int kind FK "syntax_kind.id"
+    int hash "the dup key"
+  }
+  syntax_kind {
+    integer id PK
+    text name UK "Lean.Parser…"
+  }
+```
+
+
+`decl_range` and `decl_info` share a key, one row each per declaration — where it sits on one side,
+what it says on the other. The `FK` marks are conventions, not constraints: SQLite enforces none
+here, and `dep.dst` deliberately dangles for every constant that lives in Lean core rather than in
+this repository — a dangling target is a true fact about the dependency, not a defect.
+
 ### `meta` — schema metadata
 
-| Column  | Type | Meaning                     | Example          |
-| ------- | ---- | --------------------------- | ---------------- |
-| `key`   | text | Metadata name, primary key. | `schema_version` |
-| `value` | text | Its value.                  | `8`              |
+| Column    | Type | Meaning        | Example          |
+| --------- | ---- | -------------- | ---------------- |
+| **`key`** | text | Metadata name. | `schema_version` |
+| `value`   | text | Its value.     | `8`              |
 
 ### `module` — one row per indexed module
 
 | Column       | Type    | Meaning                                                      | Example                |
 | ------------ | ------- | ------------------------------------------------------------ | ---------------------- |
 | `id`         | integer | Stable internal ID; `syntax_node` stores this, not the name. | `1`                    |
-| `name`       | text    | Lean module name, primary key.                               | `AOP.A6_1_Digits`      |
+| **`name`**   | text    | Lean module name.                                            | `AOP.A6_1_Digits`      |
 | `source`     | text    | Repository-relative source path.                             | `AOP/A6_1_Digits.lean` |
 | `ilean_hash` | text    | Hash of the module's `.ilean`, for detecting stale rows.     | `52deb1f0…`            |
 | `olean_hash` | text    | Hash of its `.olean`, likewise.                              | `872f1ebc…`            |
@@ -127,38 +184,38 @@ module is `delete where module = 'M'` and re-insert, with no cross-module invali
 
 ### `syntax_kind` — interned parser node kinds
 
-| Column | Type    | Meaning                   | Example                         |
-| ------ | ------- | ------------------------- | ------------------------------- |
-| `id`   | integer | Interned ID, primary key. | `1`                             |
-| `name` | text    | Lean syntax kind, unique. | `Lean.Parser.Command.namespace` |
+| Column   | Type    | Meaning                   | Example                         |
+| -------- | ------- | ------------------------- | ------------------------------- |
+| **`id`** | integer | Interned ID.              | `1`                             |
+| `name`   | text    | Lean syntax kind, unique. | `Lean.Parser.Command.namespace` |
 
 434 kinds against 4.15 M nodes; interning them saved 42 MB of repeated `Lean.Parser.…`.
 
 ### `decl_range` — where each declaration sits
 
-| Column   | Type | Meaning                                       | Example                             |
-| -------- | ---- | --------------------------------------------- | ----------------------------------- |
-| `name`   | text | Declaration name; with `module`, primary key. | `Freyd.effective_of_quotient_cover` |
-| `module` | text | Declaring module.                             | `Freyd.S1_95`                       |
-| `l1`     | int  | Start line of the whole declaration.          | `53`                                |
-| `c1`     | int  | Start column of it.                           | `0`                                 |
-| `l2`     | int  | End line of it.                               | `67`                                |
-| `c2`     | int  | End column of it.                             | `53`                                |
-| `sl1`    | int  | Start line of its name token.                 | `61`                                |
-| `sc1`    | int  | Start column of its name token.               | `15`                                |
-| `sl2`    | int  | End line of its name token.                   | `61`                                |
-| `sc2`    | int  | End column of its name token.                 | `42`                                |
+| Column       | Type | Meaning                              | Example                             |
+| ------------ | ---- | ------------------------------------ | ----------------------------------- |
+| **`name`**   | text | Declaration name.                    | `Freyd.effective_of_quotient_cover` |
+| **`module`** | text | Declaring module.                    | `Freyd.S1_95`                       |
+| `l1`         | int  | Start line of the whole declaration. | `53`                                |
+| `c1`         | int  | Start column of it.                  | `0`                                 |
+| `l2`         | int  | End line of it.                      | `67`                                |
+| `c2`         | int  | End column of it.                    | `53`                                |
+| `sl1`        | int  | Start line of its name token.        | `61`                                |
+| `sc1`        | int  | Start column of its name token.      | `15`                                |
+| `sl2`        | int  | End line of its name token.          | `61`                                |
+| `sc2`        | int  | End column of its name token.        | `42`                                |
 
 ### `decl_info` — what each declaration is and says
 
-| Column      | Type | Meaning                                             | Example                            |
-| ----------- | ---- | --------------------------------------------------- | ---------------------------------- |
-| `name`      | text | Compiler name, mangled if private; +`module` = key. | `_private.S1_95.0.Freyd.mono_comp` |
-| `user_name` | text | De-mangled name — what a person writes.             | `Freyd.mono_comp`                  |
-| `module`    | text | Declaring module.                                   | `Freyd.S1_95`                      |
-| `kind`      | text | `thm`, `def`, `axiom`, `ind`, or `opaque`.          | `thm`                              |
-| `internal`  | int  | `1` for a compiler-written name (`eq_1`, `injEq`).  | `0`                                |
-| `stmt`      | text | The signature as the source spells it.              | `{X Y Z : 𝒞} {m : X ⟶ Y} …`        |
+| Column       | Type | Meaning                                            | Example                            |
+| ------------ | ---- | -------------------------------------------------- | ---------------------------------- |
+| **`name`**   | text | Compiler name, mangled if private.                 | `_private.S1_95.0.Freyd.mono_comp` |
+| `user_name`  | text | De-mangled name — what a person writes.            | `Freyd.mono_comp`                  |
+| **`module`** | text | Declaring module.                                  | `Freyd.S1_95`                      |
+| `kind`       | text | `thm`, `def`, `axiom`, `ind`, or `opaque`.         | `thm`                              |
+| `internal`   | int  | `1` for a compiler-written name (`eq_1`, `injEq`). | `0`                                |
+| `stmt`       | text | The signature as the source spells it.             | `{X Y Z : 𝒞} {m : X ⟶ Y} …`        |
 
 Query `user_name`: a private copy re-proving a public lemma is invisible under its mangled `name`.
 
@@ -194,16 +251,16 @@ Indexed on `src` and `dst`.
 
 ### `syntax_node` — the command syntax tree, flattened
 
-| Column   | Type | Meaning                                                        | Example              |
-| -------- | ---- | -------------------------------------------------------------- | -------------------- |
-| `module` | int  | `module.id`; with `id`, primary key.                           | `1`                  |
-| `id`     | int  | Preorder index in the module; a subtree is a contiguous range. | `0`                  |
-| `parent` | int  | Enclosing node's `id`, `-1` for a root command.                | `-1`                 |
-| `kind`   | int  | `syntax_kind.id`.                                              | `1`                  |
-| `b0`     | int  | Start byte offset in the source file.                          | `1572`               |
-| `b1`     | int  | End byte offset; a token's text is `source[b0:b1]`.            | `1605`               |
-| `hash`   | int  | Subtree hash, identifiers blanked — the `dup` key.             | `422061742356922016` |
-| `nodes`  | int  | Subtree size in nodes.                                         | `3`                  |
+| Column       | Type | Meaning                                                        | Example              |
+| ------------ | ---- | -------------------------------------------------------------- | -------------------- |
+| **`module`** | int  | `module.id`.                                                   | `1`                  |
+| **`id`**     | int  | Preorder index in the module; a subtree is a contiguous range. | `0`                  |
+| `parent`     | int  | Enclosing node's `id`, `-1` for a root command.                | `-1`                 |
+| `kind`       | int  | `syntax_kind.id`.                                              | `1`                  |
+| `b0`         | int  | Start byte offset in the source file.                          | `1572`               |
+| `b1`         | int  | End byte offset; a token's text is `source[b0:b1]`.            | `1605`               |
+| `hash`       | int  | Subtree hash, identifiers blanked — the `dup` key.             | `422061742356922016` |
+| `nodes`      | int  | Subtree size in nodes.                                         | `3`                  |
 
 `WITHOUT ROWID`, clustering by module. `hash` has no index deliberately — adding one measured
 158 MB for no speedup, since the query that groups on it also filters on `nodes` and scans anyway.
