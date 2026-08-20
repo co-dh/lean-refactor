@@ -123,6 +123,69 @@ except select distinct use_module from use_site where name = '{Db.escaped declNa
 order by 1"
   return (namedModules j)
 
+/-- One member of a duplicate group: what it is called, where it is, and how big it is. -/
+public structure DupMember where
+  name : String
+  module : String
+  source : String
+  line : Nat
+  size : Nat
+
+/-- Declarations that share a duplicate key, as groups of two or more.
+
+    `column` picks which key: `stmt_key` groups declarations that STATE the same thing however they
+    were proved, `skel` groups those whose proof term has the same shape however they are stated.
+    Neither is the syntax key `cloneGroups` uses, and none of the three subsumes another.
+
+    `minSize` is a floor on the skeleton's node count, which is 0 for a statement-keyed row and so
+    does not filter one.  Compiler-written declarations are dropped: an equation lemma repeats its
+    parent's statement, and there are thousands of them. -/
+public def dupGroups (dbPath column : String) (minSize : Nat) : IO (Array (Array DupMember)) := do
+  let j ← Db.query dbPath s!"select i.{column} as k, i.user_name as n, i.module as md, m.source as s,
+       coalesce(r.sl1 + 1, 0) as l, i.skel_size as z
+from decl_info i
+join module m on m.name = i.module
+left join decl_range r on r.name = i.name and r.module = i.module
+where i.internal = 0 and i.{column} is not null and i.{column} != 0 and i.skel_size >= {minSize}
+  and i.{column} in (
+    select {column} from decl_info
+     where internal = 0 and {column} is not null and {column} != 0 and skel_size >= {minSize}
+     group by {column} having count(distinct user_name) > 1)
+order by k, m.source, l"
+  let mut byKey : Std.HashMap String (Array DupMember) := {}
+  let mut order : Array String := #[]
+  match j with
+  | .arr rows =>
+      for row in rows do
+        let get (f : String) := (row.getObjValAs? String f).toOption
+        let getN (f : String) := (row.getObjValAs? Nat f).toOption
+        -- sqlite3 prints the key as a number; it is only ever a grouping token here.
+        let k := (get "k").getD (toString ((getN "k").getD 0))
+        match get "n", get "md", get "s", getN "l", getN "z" with
+        | some name, some module, some source, some line, some size =>
+            unless byKey.contains k do order := order.push k
+            byKey := byKey.insert k ((byKey.getD k #[]).push { name, module, source, line, size })
+        | _, _, _, _, _ => pure ()
+  | _ => pure ()
+  -- Biggest first, as `dup` orders its groups: the head of the report is the work.
+  let groups := order.filterMap (byKey[·]?) |>.filter (·.size > 1)
+  return groups.qsort fun a b =>
+    let sz (g : Array DupMember) := g.foldl (fun m d => max m d.size) 0
+    sz a > sz b || (sz a == sz b && a.size > b.size)
+
+/-- The direct import edges, as `module → the modules it imports`. -/
+public def importEdges (dbPath : String) : IO (Std.HashMap String (Array String)) := do
+  let j ← Db.query dbPath "select src as a, dst as b from import_edge"
+  let mut direct : Std.HashMap String (Array String) := {}
+  match j with
+  | .arr rows =>
+      for row in rows do
+        match (row.getObjValAs? String "a").toOption, (row.getObjValAs? String "b").toOption with
+        | some a, some b => direct := direct.insert a ((direct.getD a #[]).push b)
+        | _, _ => pure ()
+  | _ => pure ()
+  return direct
+
 /-- One occurrence of a repeated piece of source: its file and the byte range covering it. -/
 public structure CloneSite where
   source : String

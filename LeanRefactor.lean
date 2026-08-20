@@ -1874,6 +1874,53 @@ private def dupReport (minNodes : Nat) : IO UInt32 := do
       IO.println s!"    {site.source}:{line}  {head.trimAscii}"
   return 0
 
+/-- Every module reachable from `start` through imports.  A duplicate can only be collapsed onto a
+    member the others can already SEE, and seeing is an import fact — a dependency edge says what a
+    module used, which is a subset. -/
+private partial def importClosure (direct : Std.HashMap String (Array String)) (start : String) :
+    Std.HashSet String := Id.run do
+  let mut seen : Std.HashSet String := ∅
+  let mut todo := #[start]
+  while h : todo.size > 0 do
+    let m := todo[todo.size - 1]
+    todo := todo.pop
+    unless seen.contains m do
+      seen := seen.insert m
+      todo := todo ++ direct.getD m #[]
+  return seen
+
+/-- The member of a duplicate group every other member can already import, and so the one the others
+    can collapse onto.  `none` when no member is visible to all — the group then needs its survivor
+    MOVED to a module they share, which is the edit `move` exists for. -/
+private def collapseTarget? (direct : Std.HashMap String (Array String))
+    (group : Array Query.DupMember) : Option Query.DupMember :=
+  group.find? fun candidate =>
+    group.all fun other =>
+      other.module == candidate.module || (importClosure direct other.module).contains candidate.module
+
+/-- `dup --same-statement` and `dup --same-proof`: declarations the index says are duplicates by one
+    of the two semantic keys, as opposed to `dup`'s repeated source text.
+
+    Each group names the member the rest can collapse onto, or says that none is visible to all —
+    which is the triage a reader would otherwise do by hand, and the reason a group is a candidate
+    rather than a task. -/
+private def semanticDupReport (column what : String) (minSize : Nat) : IO UInt32 := do
+  let some dbPath ← refreshedIndex? | return 1
+  let groups ← Query.dupGroups dbPath column minSize
+  let direct ← Query.importEdges dbPath
+  IO.println s!"{groups.size} group(s) of declarations with the same {what}"
+  for group in groups do
+    let target? := collapseTarget? direct group
+    let size := group.foldl (fun m d => max m d.size) 0
+    let sized := if size == 0 then "" else s!", {size} nodes"
+    IO.println s!"  {group.size}×{sized}:"
+    for member in group do
+      let mark := if (target?.map (·.name == member.name)).getD false then " ← collapse onto this" else ""
+      IO.println s!"    {member.source}:{member.line}  {member.name}{mark}"
+    if target?.isNone then
+      IO.println "    no member is visible to all the others; the survivor has to `move` first"
+  return 0
+
 /-- The glob driver.  In preview the index answers where the references are without elaborating
     the files — a repository-wide rename spends its minutes recomputing what `lake build` already
     wrote to `.ilean`, and the index holds exactly those positions.  A file takes the fast path
@@ -2423,6 +2470,8 @@ private def usage : String := String.intercalate "\n" [
   row "uses d" "modules that use d",
   row "stmt frag" "signatures of declarations whose name has frag in it",
   row "dup [--min-nodes n]" "repeated source subtrees",
+  row "  --same-statement" "... declarations stating the same thing, however proved",
+  row "  --same-proof" "... declarations whose proof term has the same shape",
   row "inspect d" "call sites of d",
   "",
   "rename",
@@ -2459,12 +2508,15 @@ def main (args : List String) : IO UInt32 := do
   -- Flags mean the same thing for every command that takes them, so they are read once here rather
   -- than in each arm; that also makes their position in the argument list free.
   let apply := args.contains "--apply"
+  let sameStatement := args.contains "--same-statement"
+  let sameProof := args.contains "--same-proof"
   let usesOnly := args.contains "--uses-only"
   let noIndex := args.contains "--no-index"
   let body := args.contains "--body"
   let syntaxMatch := args.contains "--syntax"
   let args := args.filter fun a =>
-    !["--apply", "--uses-only", "--no-index", "--body", "--syntax"].contains a
+    !["--apply", "--uses-only", "--no-index", "--body", "--syntax",
+      "--same-statement", "--same-proof"].contains a
   let (args, selector?) := stripFlag "--in" args
   let (args, token?) := stripFlag "--token" args
   let (args, into?) := stripFlag "--into" args
@@ -2509,7 +2561,15 @@ def main (args : List String) : IO UInt32 := do
   | ["stmt", fragment] => return ← stmtReport fragment
   -- 200 nodes is about a ten-line proof block: 459 groups on this repository, against 8901 at 40,
   -- where a report is mostly shapes Lean's syntax gives no other spelling.
-  | ["dup"] => return ← dupReport (minNodes?.getD 200)
+  | ["dup"] =>
+      if sameStatement && sameProof then
+        IO.eprintln "`--same-statement` and `--same-proof` are different keys; pass one"
+        return 2
+      -- The two semantic keys default to a 40-node floor, not 200: they group whole declarations
+      -- rather than subtrees, and a 200-node declaration is already a long proof.
+      if sameStatement then return ← semanticDupReport "stmt_key" "statement" 0
+      if sameProof then return ← semanticDupReport "skel" "proof shape" (minNodes?.getD 40)
+      return ← dupReport (minNodes?.getD 200)
   | ["modularize"] =>
       -- One file converts on its own; a set has to convert together, since a module may not import
       -- a plain one.  So the two are different machinery, and which one runs follows from `--in`.

@@ -99,6 +99,7 @@ private def deletePartitions (dbPath : String) (modules : Array String) : IO Uni
         s!"delete from decl_info where module = '{m}';\n" ++
         s!"delete from use_site where use_module = '{m}';\n" ++
         s!"delete from dep where module = '{m}';\n" ++
+        s!"delete from import_edge where src = '{m}';\n" ++
         -- Before the `module` row it points at, or the id is gone and the nodes are orphans.
         s!"delete from syntax_node where module in (select id from module where name = '{m}');\n" ++
         s!"delete from module where name = '{m}';\n"
@@ -190,7 +191,7 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   -- refresh, never one per module.
   -- One import for the whole batch means one unimportable module takes the batch with it, so say
   -- which repository state caused it rather than letting Lean's bare search-path error surface.
-  let oleanRows ← if stale.isEmpty then pure { declInfos := #[], deps := #[] } else
+  let oleanRows ← if stale.isEmpty then pure { declInfos := #[], deps := #[], imports := #[] } else
     try OleanRows.ofModules (stale.map (·.srcName))
     catch e => throw <| IO.userError s!"cannot import the modules to index: {e}\n\
       the build directory holds an artefact whose imports no longer resolve; \
@@ -216,6 +217,7 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   Db.importRows dbPath "use_site" useSites
   Db.importRows dbPath "decl_info" oleanRows.declInfos
   Db.importRows dbPath "dep" oleanRows.deps
+  Db.importRows dbPath "import_edge" oleanRows.imports
   -- The `module` rows go in BEFORE the syntax nodes that intern their names against them.
   let firstId ← (· + 1) <$> maxModuleId dbPath
   Db.importRows dbPath "module" (stale.mapIdx fun i m =>

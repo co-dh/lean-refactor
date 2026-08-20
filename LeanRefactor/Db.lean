@@ -41,7 +41,7 @@ public def cell (h : UInt64) : String :=
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
     the modules whose artefacts changed, so after a keying change the untouched modules would keep
     rows computed by the old algorithm and a grouping query would silently mix two generations. -/
-public def schemaVersion : String := "8"
+public def schemaVersion : String := "9"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
@@ -72,11 +72,18 @@ create table decl_range (
 
 -- `stmt` is the signature as the source spells it, so \"what does this say\" is one query.  The
 -- no-token-text rule below is `syntax_node`'s 4.15 M rows; 12 k signatures cost 2 MB against 322.
+-- `stmt_key` and `skel` are the two duplicate keys `OleanRows` computes; see the note there for
+-- what each one sees.  Masked below 2^63 like every other hash cell, so sqlite stores an integer.
+-- `skel_size` is the skeleton's distinct-node count: below a floor, a shared skeleton is an accident
+-- rather than a copy, and the report filters on it.
 create table decl_info (
   name text, user_name text, module text,
   kind text,
   internal int,
   stmt text,
+  stmt_key int,
+  skel int,
+  skel_size int,
   primary key (name, module)
 );
 
@@ -94,6 +101,12 @@ create table use_site (
 -- is the body, which an unexposed declaration keeps to itself.  One row per pair; a constant named
 -- in both carries both flags.
 create table dep (src text, dst text, module text, in_type int, in_value int);
+
+-- `src` imports `dst` DIRECTLY, from the header the module was compiled with.  Read separately from
+-- `dep` because they answer different questions: `dep` is what a module used, this is what it can
+-- see, and collapsing a duplicate needs the second — the survivor has to be reachable from every
+-- other member, which is a fact about imports and not about use.
+create table import_edge (src text, dst text, primary key (src, dst));
 
 -- The command-level syntax tree of every indexed module, flattened in preorder.  `id` is the
 -- node's index in that order, `parent` the id of the enclosing node (-1 for a root command), so a
@@ -134,6 +147,10 @@ create unique index i_module_id on module(id);
 -- The statement join's key: a `syntax-rows` child reports positions, and this is what turns one
 -- into the name `decl_info` is keyed by.
 create index i_decl_range_pos on decl_range(module, sl1, sc1);
+-- The two duplicate reports group on these; unlike `syntax_node.hash` no other column filters
+-- alongside them, so an index is what turns each report into a lookup rather than a scan.
+create index i_decl_stmt_key on decl_info(stmt_key);
+create index i_decl_skel on decl_info(skel);
 "
 
 /-- Spawn `sqlite3` with `extraArgs`, feeding it `sql` from the temp file `tmp` via `.read`.

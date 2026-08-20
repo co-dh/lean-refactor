@@ -51,6 +51,8 @@ query
   uses d                                  modules that use d
   stmt frag                               signatures of declarations whose name has frag in it
   dup [--min-nodes n]                     repeated source subtrees
+    --same-statement                      ... declarations stating the same thing, however proved
+    --same-proof                          ... declarations whose proof term has the same shape
   inspect d                               call sites of d
 
 rename
@@ -99,7 +101,7 @@ guessed — write the module as its path to say which you meant.
 `index` recreates it. Positions in `decl_range` and `use_site` are zero-based UTF-16 LSP positions;
 `syntax_node.b0` and `b1` are byte offsets into the source file. The DDL is `LeanRefactor.Db.schemaSql`.
 
-The eight tables below are the whole readable schema. (Two more, `syntax_node_in` and
+The nine tables below are the whole readable schema. (Two more, `syntax_node_in` and
 `decl_stmt_in`, exist only inside a refresh: it fills them, interns their names into IDs, and empties
 them again.) **Bold** columns form the primary key; `use_site` and `dep` have none — they are fact
 tables, and the same pair legitimately occurs many times.
@@ -114,6 +116,7 @@ erDiagram
   module ||--o{ use_site : contains
   module ||--o{ dep : owns
   module ||--o{ syntax_node : "parses to"
+  module ||--o{ import_edge : imports
   syntax_kind ||--o{ syntax_node : types
   decl_info ||--|| decl_range : "says vs sits"
   decl_info ||--o{ use_site : "occurs at"
@@ -129,6 +132,8 @@ erDiagram
     text module PK
     text user_name "de-mangled"
     text stmt "signature as written"
+    int stmt_key "same statement"
+    int skel "same proof shape"
   }
   decl_range {
     text name PK
@@ -154,6 +159,10 @@ erDiagram
   syntax_kind {
     integer id PK
     text name UK "Lean.Parser…"
+  }
+  import_edge {
+    text src PK "importing module"
+    text dst PK "imported module"
   }
 ```
 
@@ -216,8 +225,19 @@ this repository — a dangling target is a true fact about the dependency, not a
 | `kind`       | text | `thm`, `def`, `axiom`, `ind`, or `opaque`.         | `thm`                              |
 | `internal`   | int  | `1` for a compiler-written name (`eq_1`, `injEq`). | `0`                                |
 | `stmt`       | text | The signature as the source spells it.             | `{X Y Z : 𝒞} {m : X ⟶ Y} …`        |
+| `stmt_key`   | int  | Hash of the normalised statement.                  | `4220617423569220`                 |
+| `skel`       | int  | Hash of the proof term's shape.                    | `1874455213056551`                 |
+| `skel_size`  | int  | Distinct nodes in that shape.                      | `312`                              |
 
 Query `user_name`: a private copy re-proving a public lemma is invisible under its mangled `name`.
+
+`stmt_key` and `skel` are the two duplicate keys, each finding what the other cannot. Equal
+`stmt_key` means the same statement up to binder and universe renaming — the same fact however it was
+proved, which no source or dependency comparison can see, since two independent proofs share neither.
+Equal `skel` means the proof term has the same application tree and calls the same constants, with
+names, literals and universes blanked — a proof copied and adapted to a different statement, which
+the statement key misses by construction. `dup` reports both, and neither is the source-text key it
+reports by default.
 
 ### `use_site` — every recorded occurrence
 
@@ -248,6 +268,18 @@ Indexed on `name` and on `use_module`.
 The two faces decide what an edit must do: a private constant in a public *statement* is illegal
 where the same constant in the *proof* is fine. One row per pair, both flags set if named in both.
 Indexed on `src` and `dst`.
+
+### `import_edge` — the import graph
+
+| Column    | Type | Meaning               | Example       |
+| --------- | ---- | --------------------- | ------------- |
+| **`src`** | text | The importing module. | `Freyd.S1_49` |
+| **`dst`** | text | A module it imports.  | `Freyd.S1_45` |
+
+Direct edges only, taken from the header each `.olean` was compiled with. This is what decides
+whether one declaration can SEE another, which `dep` cannot answer: `dep` records what a module
+*used*, and a module can see far more than it used. `dup` walks it to name the member of a duplicate
+group the others can collapse onto.
 
 ### `syntax_node` — the command syntax tree, flattened
 
@@ -281,6 +313,11 @@ select m.source, r.sl1 + 1 from decl_info i
 select m.source, u.l1 + 1, u.parent from use_site u
   join module m on m.name = u.use_module
  where u.name = 'Ns.foo' and u.is_definition = 0;
+
+-- Duplicates by statement, with their group size.  (`dup --same-statement` reports this, and adds
+-- which member the others can collapse onto.)
+select stmt_key, count(*) n, group_concat(user_name, '  ~  ') from decl_info
+ where internal = 0 group by stmt_key having n > 1 order by n desc;
 
 -- Name collisions: one user-facing name declared in two modules.  Renaming one is the fix, and
 -- grep cannot find these — a private copy's stored `name` is mangled.
