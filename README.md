@@ -93,32 +93,15 @@ guessed — write the module as its path to say which you meant.
 
 `--in` is the only file selector, and it only narrows.
 
-## Driving it from an agent
-
-Every command previews by default, says what it decided before writing, and refuses rather than
-guesses — so the loop is: **ask** (`stmt` for signatures, `uses` for dependents), **preview** (check
-the first line: which kind, which file), **apply**, **read the warnings** (leftover textual mentions
-the info trees never recorded, and modules that depend through notation without naming anything).
-
-- **Never grep for a declaration.** A private copy's real name is mangled (`_private.Mod.0.Foo`), so
-  grep reports a name as unique when it is not. Use `stmt`, or query `decl_info.user_name`.
-- **Pass a short replacement, not a qualified one**, or uses inside a file that already opened the
-  namespace become `Ns.Ns.name`.
-- **Do not name a file** unless the tool reports the name as ambiguous.
-- **Batch renames of one kind.** Scanning is the whole cost of a sweep, so `rename a b c d` costs one
-  pass where two commands cost two. Mixed kinds are refused.
-- **Rebuild after reverting a source by hand**, or the index keeps answering for the edit you undid.
-- **No output for minutes means a hung import**, not a slow one — usually orphaned
-  `.olean.server`/`.olean.private` parts from a rolled-back build. The tool names the files to delete.
-
 ## SQLite index
 
 `index` writes the derived cache at `.lake/build/refactor-index.db`. It is safe to delete: the next
 `index` recreates it. Positions in `decl_range` and `use_site` are zero-based UTF-16 LSP positions;
 `syntax_node.b0` and `b1` are byte offsets into the source file. The DDL is `LeanRefactor.Db.schemaSql`.
 
-`meta`, `module`, `syntax_kind`, `decl_range`, `decl_info`, `use_site`, `dep` and `syntax_node`
-persist. `syntax_node_in` and `decl_stmt_in` are staging tables, empty between refreshes.
+The eight tables below are the whole readable schema. (Two more, `syntax_node_in` and
+`decl_stmt_in`, exist only inside a refresh: it fills them, interns their names into IDs, and empties
+them again.)
 
 Every row is owned by exactly one module — the one whose artefact produced it — so refreshing a
 module is `delete where module = 'M'` and re-insert, with no cross-module invalidation.
@@ -225,30 +208,73 @@ Indexed on `src` and `dst`.
 `WITHOUT ROWID`, clustering by module. `hash` has no index deliberately — adding one measured
 158 MB for no speedup, since the query that groups on it also filters on `nodes` and scans anyway.
 
-### `syntax_node_in` — staging for `syntax_node`
+### Queries
 
-| Column   | Type | Meaning                                 | Example                |
-| -------- | ---- | --------------------------------------- | ---------------------- |
-| `module` | text | Module name, not yet interned to an ID. | `Freyd.S1_95`          |
-| `id`     | int  | As in `syntax_node`.                    | `0`                    |
-| `parent` | int  | As in `syntax_node`.                    | `-1`                   |
-| `kind`   | text | Kind name, not yet interned to an ID.   | `Lean.Parser.Term.app` |
-| `b0`     | int  | As in `syntax_node`.                    | `1572`                 |
-| `b1`     | int  | As in `syntax_node`.                    | `1605`                 |
-| `hash`   | int  | As in `syntax_node`.                    | `422061742356922016`   |
-| `nodes`  | int  | As in `syntax_node`.                    | `3`                    |
+What the tool asks the index, and what a person usefully asks it beyond the commands. Every one runs
+against `.lake/build/refactor-index.db` with `sqlite3`.
 
-A `syntax-rows` child knows nothing about the IDs the database has handed out, so it writes names
-and the refresh interns them.
+```sql
+-- Where is it declared, and on what line?  (`stmt` does this, plus the signature.)
+select m.source, r.sl1 + 1 from decl_info i
+  join module m on m.name = i.module
+  join decl_range r on r.name = i.name and r.module = i.module
+ where i.user_name = 'Ns.foo';
 
-### `decl_stmt_in` — staging for `decl_info.stmt`
+-- Every call site, with the declaration it sits in.  (`uses` aggregates this per module.)
+select m.source, u.l1 + 1, u.parent from use_site u
+  join module m on m.name = u.use_module
+ where u.name = 'Ns.foo' and u.is_definition = 0;
 
-| Column   | Type | Meaning                                     | Example                     |
-| -------- | ---- | ------------------------------------------- | --------------------------- |
-| `module` | text | Module the signature came from.             | `Freyd.S1_95`               |
-| `sl1`    | int  | Start line of the declaration's name token. | `61`                        |
-| `sc1`    | int  | Start column of it.                         | `15`                        |
-| `stmt`   | text | The signature as the source spells it.      | `{X Y Z : 𝒞} {m : X ⟶ Y} …` |
+-- Name collisions: one user-facing name declared in two modules.  Renaming one is the fix, and
+-- grep cannot find these — a private copy's stored `name` is mangled.
+select user_name, group_concat(module, ', ') from decl_info
+ where internal = 0 group by user_name having count(distinct module) > 1;
 
-Keyed by position because the child reports positions; the refresh joins through `decl_range` onto
-the mangled name. Indexed for that join as `decl_range(module, sl1, sc1)`.
+-- Dead theorems: nothing depends on them and nothing names them.
+select i.user_name, i.module from decl_info i
+ where i.internal = 0 and i.kind = 'thm'
+   and not exists (select 1 from dep d where d.dst = i.name)
+   and not exists (select 1 from use_site u where u.name = i.name and u.is_definition = 0);
+
+-- What a module actually publishes: its declarations that something outside depends on.
+select distinct d.dst from dep d join decl_info i on i.name = d.dst
+ where i.module = 'Ns.Mod' and d.module != i.module;
+
+-- A private constant named in a PUBLIC declaration's statement — illegal under the module system,
+-- and the list of `private`s that have to go before `modularize` can run.  A private in a proof is
+-- fine, which is why this filters on `in_type`.
+select d.src, d.dst from dep d
+  join decl_info i on i.name = d.src and i.module = d.module
+ where d.in_type = 1 and d.dst like '\_private%' escape '\'
+   and i.name not like '\_private%' escape '\' and i.internal = 0;
+
+-- Dependents that reach a declaration WITHOUT naming it: notation and macro expansion.  No edit is
+-- needed there, but a rename can still break them.  (`uses` reports this line.)
+select distinct module from dep where dst = 'Ns.foo'
+except select distinct use_module from use_site where name = 'Ns.foo' and is_definition = 0;
+
+-- Fan-in: the declarations most modules depend on, so the ones a rename costs most to get wrong.
+select dst, count(distinct module) m from dep group by dst order by m desc limit 20;
+
+-- Where the source volume is, in syntax nodes rather than lines.
+select m.source, count(*) n from syntax_node s join module m on m.id = s.module
+ group by m.source order by n desc limit 20;
+```
+
+## Driving it from an agent
+
+Every command previews by default, says what it decided before writing, and refuses rather than
+guesses — so the loop is: **ask** (`stmt` for signatures, `uses` for dependents), **preview** (check
+the first line: which kind, which file), **apply**, **read the warnings** (leftover textual mentions
+the info trees never recorded, and modules that depend through notation without naming anything).
+
+- **Never grep for a declaration.** A private copy's real name is mangled (`_private.Mod.0.Foo`), so
+  grep reports a name as unique when it is not. Use `stmt`, or query `decl_info.user_name`.
+- **Pass a short replacement, not a qualified one**, or uses inside a file that already opened the
+  namespace become `Ns.Ns.name`.
+- **Do not name a file** unless the tool reports the name as ambiguous.
+- **Batch renames of one kind.** Scanning is the whole cost of a sweep, so `rename a b c d` costs one
+  pass where two commands cost two. Mixed kinds are refused.
+- **Rebuild after reverting a source by hand**, or the index keeps answering for the edit you undid.
+- **No output for minutes means a hung import**, not a slow one — usually orphaned
+  `.olean.server`/`.olean.private` parts from a rolled-back build. The tool names the files to delete.
