@@ -447,8 +447,11 @@ private partial def filesEndingIn (dir : System.FilePath) (suffix : String) : IO
 private def sourceIsModule (source : String) : Bool :=
   (source.splitOn "\n").any (·.trimAsciiStart.toString.startsWith "module")
 
-/-- Repository-relative `.lean` paths matching `pattern`.  Reports and returns empty if none match,
-    so every `--glob` subcommand shares one selection rule and one message.
+/-- Repository-relative `.lean` paths matching `pattern` — the one file selector, `--in`.  A pattern
+    with no metacharacter matches exactly one path, so naming a single file and naming a glob are
+    the same operation, and there is no second spelling of either.
+
+    Reports and returns empty if none match, so every command shares one selection rule and message.
 
     `mentioning` is the set of texts an edit must rewrite — a declaration's short name, a notation
     token.  A file whose source contains none of them cannot yield a single edit, so scanning it is
@@ -457,7 +460,7 @@ private def sourceIsModule (source : String) : Bool :=
     is what turns a repository-wide rename from minutes into seconds.  Plain substring containment,
     not `isIdentifierUse`, on purpose — it also covers notation tokens, and being too generous only
     costs a scan that finds nothing, while being too clever would drop a real edit. -/
-private def globSelectedFiles (pattern : String) (mentioning : Array String := #[]) :
+private def selectedFiles (pattern : String) (mentioning : Array String := #[]) :
     IO (Array String) := do
   let files ← leanFilesUnder "."
   -- `*` crosses `/`, so a single pattern cannot name two directories, and a batch that must be
@@ -472,7 +475,7 @@ private def globSelectedFiles (pattern : String) (mentioning : Array String := #
     |>.filter fun path =>
       patterns.any (globMatches · path) && !excludes.any (globMatches · path)
   if matched.isEmpty then
-    IO.eprintln s!"glob matched no Lean files: {pattern}"
+    IO.eprintln s!"`--in {pattern}` matched no Lean file"
     return matched
   if mentioning.isEmpty then return matched
   let mut selected := #[]
@@ -660,7 +663,7 @@ The dedup report (`scripts/dep_dup.py`) flags duplicate groups where no member i
 the others: collapsing those needs the survivor RELOCATED to a module every caller already imports.
 That is the one edit the subcommands above cannot express, and the one the skill calls the riskiest
 to do by hand, so it is mechanised here: cut the declaration with its docstring, splice it into the
-target namespace selected by `move` or explicit `move-into`, and refuse the edit unless BOTH files
+target namespace selected by `move` or explicit `--into`, and refuse the edit unless BOTH files
 still elaborate. -/
 
 /-- Distinct files whose `Environment` this process has built.  Re-elaborating the SAME file is
@@ -844,7 +847,7 @@ private def replaceDeclarationBody (path declName replacement : String) (apply :
   return 1
 
 /-- Replace one complete parsed declaration command. This is the structural counterpart of
-    `replace-body`: it is intended for changing a theorem's statement together with its proof while
+    `replace --body`: it is intended for changing a theorem's statement together with its proof while
     retaining AST-selected boundaries, preview-by-default behavior, and transactional validation. -/
 private def replaceDeclaration (path declName replacement : String) (apply : Bool) : IO UInt32 := do
   initSearchPath (← findSysroot)
@@ -912,54 +915,6 @@ private def removeDeclaration (path declName : String) (apply : Bool) : IO UInt3
   IO.eprintln s!"whole-repository build failed after removing `{declName}`; restored"
   return 1
 
-/-- Move a declaration within its file to immediately before another declaration in the same
-    namespace.  Both boundaries come from parsed command syntax; preview and rollback follow the
-    same transaction contract as the other structural operations. -/
-private def relocateDeclarationBefore (path declName anchorName : String) (apply : Bool) :
-    IO UInt32 := do
-  initSearchPath (← findSysroot)
-  let (source, _, commands, _) ← elaborateFile path
-  let ((start, stop), ns) ← match declarationSite source commands declName with
-    | .ok site => pure site
-    | .error message => IO.eprintln s!"{path}: {message}"; return 1
-  let ((anchorStart, _), anchorNs) ← match declarationSite source commands anchorName with
-    | .ok site => pure site
-    | .error message => IO.eprintln s!"{path}: {message}"; return 1
-  unless ns == anchorNs do
-    IO.eprintln s!"{path}: `{declName}` is in `{ns}`, but `{anchorName}` is in `{anchorNs}`"
-    return 1
-  unless stop ≤ anchorStart || anchorStart < start do
-    IO.eprintln s!"{path}: `{declName}` already contains or precedes `{anchorName}`"
-    return 1
-  let text := String.Pos.Raw.extract source start stop
-  let updated := applyEdits source #[
-    { start := start, stop := stop, line := 0 },
-    { start := anchorStart, stop := anchorStart, line := 0, replacement := text }
-  ]
-  IO.println s!"relocate `{declName}` before `{anchorName}` in {path}"
-  unless apply do
-    IO.println "preview only; pass --apply to write"
-    return 0
-  IO.FS.writeFile path updated
-  let check ← IO.Process.output {
-    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
-  unless check.exitCode == 0 do
-    IO.FS.writeFile path source
-    unless check.stdout.isEmpty do IO.eprintln check.stdout
-    unless check.stderr.isEmpty do IO.eprintln check.stderr
-    IO.eprintln s!"{path}: relocated source does not elaborate; restored"
-    return 1
-  IO.println "verifying the capped repository build after relocating the declaration..."
-  let build ← repositoryBuild
-  if build.exitCode == 0 then
-    IO.println s!"whole-repository build passed; relocated `{declName}`"
-    return 0
-  IO.FS.writeFile path source
-  unless build.stdout.isEmpty do IO.eprintln build.stdout
-  unless build.stderr.isEmpty do IO.eprintln build.stderr
-  IO.eprintln s!"whole-repository build failed after relocating `{declName}`; restored"
-  return 1
-
 /-- Locate a named `section` command and the namespace in force immediately before it. -/
 private def sectionSite (source : String) (commands : Array Syntax) (sectionName : String) :
     Except String ((String.Pos.Raw × String.Pos.Raw) × Name) := Id.run do
@@ -973,25 +928,37 @@ private def sectionSite (source : String) (commands : Array Syntax) (sectionName
     state := scopeStep state cmd
   return .error s!"no section named `{sectionName}` in this file"
 
-private def relocateDeclarationBeforeSection (path declName sectionName : String) (apply : Bool) :
+/-- Move a declaration within its file to immediately before an ANCHOR in the same namespace: either
+    another declaration or a named `section`.  Which one the anchor is, is asked of the file rather
+    than of the caller — a `section` name is not a declaration name, so a hit in the section table
+    settles it.
+
+    Both boundaries come from parsed command syntax; preview and rollback follow the same
+    transaction contract as the other structural operations. -/
+private def relocateDeclarationBefore (path declName anchorName : String) (apply : Bool) :
     IO UInt32 := do
   initSearchPath (← findSysroot)
   let (source, _, commands, _) ← elaborateFile path
   let ((start, stop), ns) ← match declarationSite source commands declName with
     | .ok site => pure site
     | .error message => IO.eprintln s!"{path}: {message}"; return 1
-  let ((anchorStart, _), anchorNs) ← match sectionSite source commands sectionName with
-    | .ok site => pure site
-    | .error message => IO.eprintln s!"{path}: {message}"; return 1
+  let (anchorKind, (anchorStart, _), anchorNs) ← match sectionSite source commands anchorName with
+    | .ok (range, ns) => pure ("section ", range, ns)
+    | .error _ => match declarationSite source commands anchorName with
+      | .ok (range, ns) => pure ("", range, ns)
+      | .error message => IO.eprintln s!"{path}: {message}"; return 1
   unless ns == anchorNs do
-    IO.eprintln s!"{path}: `{declName}` is in `{ns}`, but section `{sectionName}` starts in `{anchorNs}`"
+    IO.eprintln s!"{path}: `{declName}` is in `{ns}`, but {anchorKind}`{anchorName}` is in `{anchorNs}`"
+    return 1
+  unless stop ≤ anchorStart || anchorStart < start do
+    IO.eprintln s!"{path}: `{declName}` already contains or precedes `{anchorName}`"
     return 1
   let text := String.Pos.Raw.extract source start stop
   let updated := applyEdits source #[
     { start := start, stop := stop, line := 0 },
     { start := anchorStart, stop := anchorStart, line := 0, replacement := text }
   ]
-  IO.println s!"relocate `{declName}` before section `{sectionName}` in {path}"
+  IO.println s!"relocate `{declName}` before {anchorKind}`{anchorName}` in {path}"
   unless apply do
     IO.println "preview only; pass --apply to write"
     return 0
@@ -1144,9 +1111,6 @@ private def collapseDeclaration (path declName replacement : String) (apply : Bo
       unless declStart ≤ edit.start && edit.stop ≤ declStop do
         candidateEdits := candidateEdits.push edit
   if let some argIndex := dropCallArg? then
-    if argIndex == 0 then
-      IO.eprintln "collapse-drop-call-arg uses a 1-based argument index"
-      return 1
     let mut sites := #[]
     for cmd in commands do
       sites := sites ++ syntaxSitesNamed fileMap declName cmd
@@ -1228,11 +1192,14 @@ private def renameArgs (renames : Array Rename) : Array String := Id.run do
   for r in renames do args := args ++ #[r.declName, r.replacement]
   return args
 
-/-- Take `--token <token>` out of an argument list, leaving the positional arguments alone. -/
-private def stripToken : List String → List String × Option String
-  | "--token" :: token :: rest => (rest, some token)
-  | arg :: rest => let (rest, token?) := stripToken rest; (arg :: rest, token?)
-  | [] => ([], none)
+/-- Take `--<name> <value>` out of an argument list, leaving the positional arguments alone.  Every
+    value-taking flag is read this way, so a flag may sit anywhere the caller finds natural — the
+    same freedom `--apply` has. -/
+private def stripFlag (name : String) : List String → List String × Option String
+  | arg :: value :: rest =>
+      if arg == name then (rest, some value)
+      else let (rest, found) := stripFlag name (value :: rest); (arg :: rest, found)
+  | rest => (rest, none)
 
 /-- Everything one elaboration of a file yields that a rename needs.  It is kept as a value so a
     BATCH of renames shares it: the elaboration costs seconds, deriving the sites costs nothing. -/
@@ -1469,7 +1436,7 @@ private def staleSplitParts : IO Bool := do
 private def forkPerFile (pattern : String) (childArgs : String → Array String)
     (mentioning : Array String := #[]) : IO UInt32 := do
   if ← staleSplitParts then return 1
-  let selected ← globSelectedFiles pattern mentioning
+  let selected ← selectedFiles pattern mentioning
   if selected.isEmpty then return 1
   let self := (← IO.appPath).toString
   let outputs ← mapFilesParallel (← scanJobs) selected fun path =>
@@ -1558,6 +1525,74 @@ private def indexSitesByPath (renames : Array Rename) :
   catch e =>
     IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
     pure none
+
+/-! ## What a name names
+
+A command takes the thing being edited, not its kind: the tool indexes every declaration and every
+module, so asking the caller which of the two a name is only asks them to repeat what the index
+already says.  That is why `rename` is one command over four kinds, and why `move` takes an anchor
+without being told whether it is a declaration or a section.
+
+The decision is printed in the preview's first line, so a misjudged kind is visible before `--apply`
+writes anything. -/
+
+/-- What a `rename`'s first argument names. -/
+private inductive NameKind where
+  | file (path : String)
+  | module (name : String)
+  | decl (name : String)
+  | token (text : String)
+
+private def kindWord : NameKind → String
+  | .file _ => "file" | .module _ => "module" | .decl _ => "declaration" | .token _ => "token"
+
+/-- Which of the four `name` is.  A path is decided by its extension alone; the other three are asked
+    of the index, which is the only thing that KNOWS.  A name it has never heard of is a notation
+    token — the one kind with no index row, a token being source text rather than a declaration, so
+    an unbuilt module and a misspelt declaration land there too.  Harmless: a token rename that
+    matches no atom reports exactly that.
+
+    A name that is both a module and a declaration is refused rather than guessed — `Freyd.Cat` is a
+    legitimate spelling of either.  The caller disambiguates by writing the module as its path,
+    `Freyd/Cat.lean`, which needs no new flag because a path is already unambiguous. -/
+private def kindOfName (dbPath? : Option String) (name : String) : IO (Except String NameKind) := do
+  if name.endsWith ".lean" then return .ok (.file name)
+  -- Without an index every name is taken as a declaration: that is the kind the per-file
+  -- elaboration path can still handle on its own, and the only one worth guessing.
+  let some dbPath := dbPath? | return .ok (.decl name)
+  let isModule ← Query.isModule dbPath name
+  let declared ← Query.declaringModules dbPath name
+  match isModule, declared.isEmpty with
+  | true, false =>
+      return .error s!"`{name}` is both a module and a declaration; write the module as its path \
+        ({name.replace "." "/"}.lean) to mean the module"
+  | true, true => return .ok (.module name)
+  | false, false => return .ok (.decl name)
+  | false, true => return .ok (.token name)
+
+/-- The repository-relative source paths that DECLARE `declName`, from the index — what a command
+    needs when the caller named a declaration and no file.  Empty means the index cannot place it,
+    which is a file never built; more than one means the name is declared twice. -/
+private def declaringFiles (dbPath declName : String) : IO (Array String) := do
+  return (← Query.declaringModules dbPath declName).map fun (_, source) => source
+
+/-- The ONE file a declaration-editing command works on: `--in` when the caller narrowed, otherwise
+    the file the index says declares `declName`.  Several files are refused rather than picked from —
+    these commands edit one declaration in one place. -/
+private def fileOfDecl (selector? : Option String) (declName : String) : IO (Except String String) := do
+  let candidates ← match selector? with
+    | some selector => selectedFiles selector
+    | none => match ← refreshedIndex? with
+      | some dbPath => declaringFiles dbPath declName
+      | none => pure #[]
+  match candidates with
+  | #[path] => return .ok path
+  | #[] => return .error <| match selector? with
+      | some selector => s!"`--in {selector}` matched no Lean file"
+      | none => s!"the index does not place `{declName}`; name its file with --in"
+  | many => return .error <|
+      s!"`{declName}` is in {many.size} files; pick one with --in:\n" ++
+        String.intercalate "\n" (many.toList.map ("  " ++ ·))
 
 /-- One warning line after a rename preview: modules that depend on `declName` without naming it
     anywhere the info trees recorded — reached only through notation or macro expansion.  No edit is
@@ -1851,7 +1886,7 @@ private def renameGlob (pattern : String) (renames : Array Rename) (apply noInde
     IO UInt32 := do
   let mentioning := renames.map fun r => shortName r.declName
   let fast? ← if apply || noIndex then pure none else indexSitesByPath renames
-  let selected ← globSelectedFiles pattern mentioning
+  let selected ← selectedFiles pattern mentioning
   if selected.isEmpty then return 1
   let self := (← IO.appPath).toString
   let childArgs := fun path => #["rename-file", path] ++ renameArgs renames ++
@@ -1920,7 +1955,7 @@ private def stagedGlob (pattern description : String)
     (stage : String → String → IO IO.Process.Output)
     (apply : Bool) (mentioning : Array String := #[]) : IO UInt32 := do
   if ← staleSplitParts then return 1
-  let selected ← globSelectedFiles pattern mentioning
+  let selected ← selectedFiles pattern mentioning
   if selected.isEmpty then return 1
   let outputs ← mapFilesParallel (← scanJobs) selected fun path => stage path (stagePathFor path)
   let mut staged : Array String := #[]
@@ -2005,7 +2040,7 @@ private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
   let mut nodesOf : Std.HashMap String (Array SyntaxRows.Node) := {}
   let mut unbuilt := #[]
   let mut blockers : Array (String × String × String × Bool) := #[]
-  for path in ← globSelectedFiles pattern do
+  for path in ← selectedFiles pattern do
     let moduleName ← IO.ofExcept (moduleNameOfPath path)
     -- A module the index has never seen was never built, so nothing is known about what names it
     -- from outside and converting it would mark nothing `public`.  It is left alone instead: a
@@ -2094,7 +2129,7 @@ private def renameTokenFile (path oldToken newToken : String) (apply : Bool) : I
 
 private def renameTokenGlob (pattern oldToken newToken : String) (apply : Bool) : IO UInt32 :=
   forkPerFile pattern
-    (fun path => #["rename-token", path, oldToken, newToken] ++ (if apply then #["--apply"] else #[]))
+    (fun path => #["rename-token-file", path, oldToken, newToken] ++ (if apply then #["--apply"] else #[]))
     (mentioning := #[oldToken])
 
 /-! ## Applied form to infix
@@ -2164,6 +2199,69 @@ private def infixGlob (pattern declName token : String) (apply : Bool) : IO UInt
     (fun path stage => IO.Process.output
       { cmd := self, args := #["infix-stage", path, declName, token, stage] }) apply
     (mentioning := #[shortName declName])
+
+/-- Every `.lean` file in the repository — what a command works on when the caller did not narrow
+    with `--in`.  Renaming is repository-wide by nature, and the `mentioning` prefilter plus the
+    index fast path are what make the default affordable: a file that does not contain the short
+    name is never opened. -/
+private def wholeRepository : String := "**.lean"
+
+/-- `rename`, over whatever the caller named.  The kind decides the machinery — a declaration is a
+    batch over the files that mention it, a module is a file rename plus every import of it, a
+    notation token is a syntax-atom rewrite — and the caller states none of it.
+
+    A batch must be of ONE kind.  Renames are batched because scanning is the whole cost of a
+    repository-wide pass, and only same-kind renames share a scan; a mixed batch would run two
+    machineries and could only report the outcome of one. -/
+private def renameAll (selector? : Option String) (renames : Array Rename)
+    (apply usesOnly noIndex : Bool) : IO UInt32 := do
+  let dbPath? ← if noIndex then pure none else refreshedIndex?
+  let mut kinds := #[]
+  for r in renames do
+    match ← kindOfName dbPath? r.declName with
+    | .error message => IO.eprintln message; return 2
+    | .ok kind => kinds := kinds.push kind
+  -- `parseRenames` refuses an empty batch, so the `none` here is unreachable; it is spelled out
+  -- rather than asserted away, an `Inhabited NameKind` being a worse price than one line.
+  let some first := kinds[0]?
+    | IO.eprintln "expected at least one <old> <replacement> pair"; return 2
+  let word := kindWord first
+  unless kinds.all (kindWord · == word) do
+    IO.eprintln <| "a batch renames one kind of thing at a time, and this one names several:\n" ++
+      String.intercalate "\n" ((kinds.zip renames).toList.map fun (kind, r) =>
+        s!"  {r.declName}: {kindWord kind}")
+    return 2
+  IO.println s!"rename {word}: {renameList renames}"
+  -- Flushed here: the drivers below report through child processes whose unbuffered stderr would
+  -- otherwise reach the terminal before the line that says what kind this run decided on.
+  (← IO.getStdout).flush
+  match first with
+  | .decl _ =>
+      let pattern := selector?.getD wholeRepository
+      -- `--uses-only` leaves the binding site alone, so each file still elaborates on its own and
+      -- the cheap per-file path applies.  A real rename moves the binding site too, which no
+      -- ordering of per-file edits keeps valid, so it stages every file and builds once.
+      if usesOnly then renameGlob pattern renames apply noIndex
+      else renameDeclGlob pattern renames apply
+  | .token _ =>
+      let mut status : UInt32 := 0
+      for r in renames do
+        let code ← renameTokenGlob (selector?.getD wholeRepository) r.declName r.replacement apply
+        if code != 0 then status := code
+      return status
+  -- A file rename IS a module rename: the module name and the path are two spellings of one thing,
+  -- so both sides are put in the spelling `renameModule` works in.
+  | .file _ | .module _ =>
+      let mut status : UInt32 := 0
+      for r in renames do
+        let asModule (name : String) : Except String String :=
+          if name.endsWith ".lean" then moduleNameOfPath name else .ok name
+        match asModule r.declName, asModule r.replacement with
+        | .ok oldModule, .ok newModule =>
+            let code ← renameModule oldModule newModule apply
+            if code != 0 then status := code
+        | .error message, _ | _, .error message => IO.eprintln message; return 2
+      return status
 
 private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool)
     (tryRemoval := false) (includeVariables := true) : IO UInt32 := do
@@ -2300,67 +2398,91 @@ private def row (cmd desc : String) : String :=
   "  " ++ cmd ++ "".pushn ' ' (max 2 (40 - cmd.length)) ++ desc
 
 /-- One screen, one line per command.  Arguments are the single letters of the legend, so a command
-    line reads as a shape; a letter that occurs in one command only is spelled out instead. -/
+    line reads as a shape; a letter that occurs in one command only is spelled out instead.
+
+    Every command takes the THING it edits and works the rest out: which file declares a declaration
+    comes from the index, and whether a name is a declaration, a module, a file or a notation token
+    is decided the same way.  `--in` is the only file selector, and it only ever NARROWS. -/
 private def usage : String := String.intercalate "\n" [
-  "usage: lean-refactor command [args] [--apply]",
+  "usage: lean-refactor command [args] [--in g] [--apply]",
   "",
   "  --apply writes the edit; without it a command only previews.  A repository-wide edit is",
   "  verified by a build and restored if that build fails.",
   "",
-  "  f  source file          d  declaration, full name    n  index, counting from 1",
-  "  m  module of f          r  replacement               M  module that declares d",
-  "  g  --glob pattern, comma-separated, a leading ! subtracts: 'Freyd/*.lean,!Freyd/S1_573.lean'",
+  "  --in g  which files to work on: one path, a glob, or a comma-list where a leading ! subtracts",
+  "          'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'",
+  "          Default: the file the index says declares d; the whole repository for the sweeps",
+  "          (rename, infix, unused, unused-simp, modularize).",
+  "",
+  "  d  declaration, full name      r  replacement      n  index, counting from 1",
   "",
   "query",
   row "index [--full]" "build or refresh the index",
   row "uses d" "modules that use d",
   row "stmt frag" "signatures of declarations whose name has frag in it",
   row "dup [--min-nodes n]" "repeated source subtrees",
-  row "inspect f m M d" "call sites of d",
+  row "inspect d" "call sites of d",
   "",
   "rename",
-  row "rename f m (d r)..." "write r where f mentions d, but not where d is declared",
-  row "rename-file f (d r)..." "the same, with m read from the path of f",
-  row "rename --glob g (d r)..." "write r where any file matching g mentions d",
-  row "  --no-index" "find those files by elaborating them, not from the index",
-  row "rename-decl --glob g (d r)..." "the same, and rename d where it is declared",
-  row "rename-module m r" "rename module m to r: its file, and every import of it",
-  row "rename-token f old new" "write the notation token new where f writes old",
-  row "rename-token --glob g old new" "the same, in every file matching g",
-  row "infix --glob g d token" "give d the infix notation token",
+  row "rename (old r)..." "old is a declaration, a module, a .lean file, or a notation token",
+  row "  --uses-only" "write r where old is used, but not where it is declared",
+  row "  --no-index" "find the files by elaborating them, not from the index",
+  row "infix d token" "give d the infix notation token",
   "",
   "move",
-  row "move f d to.lean" "move d to another file",
-  row "move-into f d to.lean ns" "... into namespace ns",
-  row "move-omit f d to.lean binders" "... omitting binders",
-  row "relocate-before f d anchor" "move d before another declaration",
-  row "relocate-before-section f d section" "move d before a section",
+  row "move d dest" "dest is another .lean file, or a declaration or section to sit before",
+  row "  --into ns" "... into namespace ns",
+  row "  --omit binders" "... omitting binders",
   "",
   "replace",
-  row "collapse f d r" "replace duplicate d by its survivor r",
-  row "collapse-drop-call-arg f d r n" "... dropping argument n at every call",
-  row "replace-body f d term" "replace the body of d",
-  row "replace-declaration f d text" "replace d entirely",
-  row "remove-declaration f d" "remove d",
+  row "collapse d r" "replace duplicate d by its survivor r",
+  row "  --drop-arg n" "... dropping argument n at every call",
+  row "replace d text" "replace d entirely",
+  row "  --body" "... replace only the body of d",
+  row "remove d" "remove d",
   "",
   "arguments",
-  row "remove-call-arg f m M d n" "remove argument n at every call of d",
+  row "remove-arg d n" "remove argument n at every call of d",
   row "  --syntax" "match calls by name where elaboration cannot",
   row "  --token tok" "also match calls written as the notation tok",
-  row "insert-call-arg f m M d n term" "insert term before argument n",
-  row "remove-parameter f m d binder n" "remove a parameter Lean reports unused",
+  row "insert-arg d n term" "insert term before argument n",
+  row "remove-param d binder n" "remove a parameter Lean reports unused",
   "",
   "cleanup",
-  row "unused f:line:col" "remove one unused binder",
-  row "unused --glob g" "remove unused binders",
-  row "unused-simp --glob g" "remove unused `simp` arguments",
-  row "modularize f | modularize --glob g" "convert to the Lean module system"]
+  row "unused [f:line:col]" "remove unused binders",
+  row "unused-simp" "remove unused `simp` arguments",
+  row "modularize" "convert to the Lean module system"]
 
 def main (args : List String) : IO UInt32 := do
-  -- `--apply` means the same thing for every editing command, so it is taken once here instead of
-  -- doubling every arm below; that also makes its position in the argument list free.
+  -- Flags mean the same thing for every command that takes them, so they are read once here rather
+  -- than in each arm; that also makes their position in the argument list free.
   let apply := args.contains "--apply"
-  let args := args.filter (· != "--apply")
+  let usesOnly := args.contains "--uses-only"
+  let noIndex := args.contains "--no-index"
+  let body := args.contains "--body"
+  let syntaxMatch := args.contains "--syntax"
+  let args := args.filter fun a =>
+    !["--apply", "--uses-only", "--no-index", "--body", "--syntax"].contains a
+  let (args, selector?) := stripFlag "--in" args
+  let (args, token?) := stripFlag "--token" args
+  let (args, into?) := stripFlag "--into" args
+  let (args, omitBinders?) := stripFlag "--omit" args
+  let (args, dropArg?) := stripFlag "--drop-arg" args
+  let (args, minNodes?) := stripFlag "--min-nodes" args
+  -- One place turns a flag's text into a number, so every command reports a bad one the same way.
+  let natFlag (name : String) : Option String → Except String (Option Nat)
+    | none => .ok none
+    | some text => match text.toNat? with
+      | some n => .ok (some n)
+      | none => .error s!"`{name} {text}` is not a number"
+  let (dropArg?, minNodes?) ← match natFlag "--drop-arg" dropArg?, natFlag "--min-nodes" minNodes? with
+    | .ok a, .ok b => pure (a, b)
+    | .error message, _ | _, .error message => IO.eprintln message; return 2
+  -- The file a declaration-editing command works on, reported and turned into an exit code once.
+  let fileOf (declName : String) : IO (Except UInt32 String) := do
+    match ← fileOfDecl selector? declName with
+    | .ok path => return .ok path
+    | .error message => IO.eprintln message; return .error 2
   match args with
   | [] | ["--help"] | ["-h"] => IO.println usage; return 0
   -- The refresh imports every stale module, and `Index.run` reaches it without going through
@@ -2383,38 +2505,22 @@ def main (args : List String) : IO UInt32 := do
       return 0
   | ["uses", declName] => return ← usesReport declName
   | ["stmt", fragment] => return ← stmtReport fragment
-  | ["modularize", "--glob", pattern] => return ← modularizeGlob pattern apply
-  | ["modularize", path] => return ← modularize path apply
   -- 200 nodes is about a ten-line proof block: 459 groups on this repository, against 8901 at 40,
   -- where a report is mostly shapes Lean's syntax gives no other spelling.
-  | ["dup"] => return ← dupReport 200
-  | ["dup", "--min-nodes", nodes] =>
-      let some n := nodes.toNat? | IO.eprintln s!"invalid --min-nodes value `{nodes}`"; return 2
-      return ← dupReport n
-  | ["rename-module", oldModule, newModule] =>
-      return ← renameModule oldModule newModule apply
-  | ["move", sourcePath, declName, targetPath] =>
-      return ← moveDeclaration sourcePath declName targetPath apply
-  | ["move-into", sourcePath, declName, targetPath, targetNamespace] =>
-      return ← moveDeclaration sourcePath declName targetPath apply none (some targetNamespace)
-  | ["move-omit", sourcePath, declName, targetPath, binders] =>
-      return ← moveDeclaration sourcePath declName targetPath apply (some binders)
-  | ["relocate-before", sourcePath, declName, anchorName] =>
-      return ← relocateDeclarationBefore sourcePath declName anchorName apply
-  | ["relocate-before-section", sourcePath, declName, sectionName] =>
-      return ← relocateDeclarationBeforeSection sourcePath declName sectionName apply
-  | ["collapse", sourcePath, declName, replacement] =>
-      return ← collapseDeclaration sourcePath declName replacement apply
-  | ["collapse-drop-call-arg", sourcePath, declName, replacement, index] =>
-      let some argIndex := index.toNat?
-        | IO.eprintln s!"invalid argument index `{index}`"; return 2
-      return ← collapseDeclaration sourcePath declName replacement apply (some argIndex)
-  | ["replace-body", sourcePath, declName, replacement] =>
-      return ← replaceDeclarationBody sourcePath declName replacement apply
-  | ["replace-declaration", sourcePath, declName, replacement] =>
-      return ← replaceDeclaration sourcePath declName replacement apply
-  | ["remove-declaration", sourcePath, declName] =>
-      return ← removeDeclaration sourcePath declName apply
+  | ["dup"] => return ← dupReport (minNodes?.getD 200)
+  | ["modularize"] =>
+      -- One file converts on its own; a set has to convert together, since a module may not import
+      -- a plain one.  So the two are different machinery, and which one runs follows from `--in`.
+      match ← selectedFiles (selector?.getD wholeRepository) with
+      | #[path] => return ← modularize path apply
+      | #[] => return 1
+      | _ => return ← modularizeGlob (selector?.getD wholeRepository) apply
+  | "rename" :: rest =>
+      match parseRenames rest with
+      | .error message => IO.eprintln message; return 2
+      | .ok renames => return ← renameAll selector? renames apply usesOnly noIndex
+  -- The staging children of the batch drivers.  Not in the usage: each is one file of a run the
+  -- parent is orchestrating, and running one by hand stages an edit nothing then applies.
   | "rename-file" :: path :: rest =>
       let moduleName ← match moduleNameOfPath path with
         | .ok n => pure n
@@ -2422,72 +2528,78 @@ def main (args : List String) : IO UInt32 := do
       match parseRenames rest with
       | .error message => IO.eprintln message; return 2
       | .ok renames => return ← renameReferences path moduleName renames apply
-  | "rename" :: args =>
-      -- `--no-index` may appear anywhere in the argument list: it forces the glob driver onto
-      -- the per-file elaboration path so the two paths can be diffed against each other.
-      let noIndex := args.contains "--no-index"
-      let args := args.filter (· != "--no-index")
-      match args with
-      | "--glob" :: pattern :: rest =>
-          match parseRenames rest with
-          | .error message => IO.eprintln message; return 2
-          | .ok renames => return ← renameGlob pattern renames apply noIndex
-      | path :: moduleName :: rest =>
-          match parseRenames rest with
-          | .error message => IO.eprintln message; return 2
-          | .ok renames => return ← renameReferences path moduleName renames apply
-      | _ => IO.eprintln usage; return 2
-  | "rename-decl" :: "--glob" :: pattern :: rest =>
-      match parseRenames rest with
-      | .error message => IO.eprintln message; return 2
-      | .ok renames => return ← renameDeclGlob pattern renames apply
   | "rename-decl-stage" :: path :: stagePath :: pairs =>
       match parseRenames pairs with
       | .error message => IO.eprintln message; return 2
       | .ok renames => return ← renameDeclStage path stagePath renames
-  | ["infix", "--glob", pattern, declName, token] =>
-      return ← infixGlob pattern declName token apply
+  | ["rename-token-file", path, oldToken, newToken] =>
+      return ← renameTokenFile path oldToken newToken apply
   | ["infix-stage", path, declName, token, stagePath] =>
       return ← infixStage path declName token stagePath
-  | ["rename-token", "--glob", pattern, oldToken, newToken] =>
-      return ← renameTokenGlob pattern oldToken newToken apply
-  | ["rename-token", path, oldToken, newToken] =>
-      return ← renameTokenFile path oldToken newToken apply
-  | ["unused", selector] =>
-      let parsed ← match parseWarningSelector selector with
+  | ["unused-file", path] =>
+      if apply then return ← refactorSuggestedWarningsUntilStable { path }
+      return ← refactorSuggestedWarnings { path } false
+  | ["unused-simp-file", path] =>
+      return ← refactorSuggestedWarnings { path } apply (includeVariables := false)
+  | ["infix", declName, token] =>
+      return ← infixGlob (selector?.getD wholeRepository) declName token apply
+  | ["move", declName, dest] =>
+      let .ok path ← fileOf declName | return 2
+      -- A `.lean` destination is another file; anything else is an anchor within this one.  The
+      -- destination says which, so there is no second command and no flag to pick between them.
+      if dest.endsWith ".lean" then
+        return ← moveDeclaration path declName dest apply omitBinders? into?
+      return ← relocateDeclarationBefore path declName dest apply
+  | ["collapse", declName, replacement] =>
+      let .ok path ← fileOf declName | return 2
+      if dropArg? == some 0 then IO.eprintln "`--drop-arg` is 1-based"; return 2
+      return ← collapseDeclaration path declName replacement apply dropArg?
+  | ["replace", declName, text] =>
+      let .ok path ← fileOf declName | return 2
+      if body then return ← replaceDeclarationBody path declName text apply
+      return ← replaceDeclaration path declName text apply
+  | ["remove", declName] =>
+      let .ok path ← fileOf declName | return 2
+      return ← removeDeclaration path declName apply
+  | ["unused"] =>
+      -- Forked, not looped: an in-process loop retained one `Environment` per file and so died on
+      -- the third, on `claimElaboration`'s bound.  This subcommand was unusable above two files.
+      return ← forkPerFile (selector?.getD wholeRepository) fun path =>
+        #["unused-file", path] ++ (if apply then #["--apply"] else #[])
+  | ["unused", warningSelector] =>
+      let parsed ← match parseWarningSelector warningSelector with
         | .ok parsed => pure parsed
         | .error message => IO.eprintln message; return 2
       if apply then return ← transactionalWarningRefactor parsed
       return ← refactorSuggestedWarnings parsed false
-  | ["unused-file", path] =>
-      if apply then return ← refactorSuggestedWarningsUntilStable { path }
-      return ← refactorSuggestedWarnings { path } false
-  | ["unused", "--glob", pattern] =>
-      -- Forked, not looped: an in-process loop retained one `Environment` per file and so died on
-      -- the third, on `claimElaboration`'s bound.  This subcommand was unusable above two files.
-      return ← forkPerFile pattern fun path =>
-        #["unused-file", path] ++ (if apply then #["--apply"] else #[])
-  | ["unused-simp-file", path] =>
-      return ← refactorSuggestedWarnings { path } apply (includeVariables := false)
-  | ["unused-simp", "--glob", pattern] =>
-      return ← forkPerFile pattern fun path =>
+  | ["unused-simp"] =>
+      return ← forkPerFile (selector?.getD wholeRepository) fun path =>
         #["unused-simp-file", path] ++ (if apply then #["--apply"] else #[])
   | _ => pure ()
-  -- `--syntax` and `--token` stay local to these commands, unlike `--apply`: `rename-token` and
-  -- `infix` take a notation token as a POSITIONAL argument, which a global sweep would eat.
-  let syntaxMatch := args.contains "--syntax"
-  let (args, token?) := stripToken (args.filter (· != "--syntax"))
-  let (mode, sourcePath, moduleName, declModule, declName, binderName?, argIndex?, insertText?) ← match args with
-    | ["inspect", sourcePath, moduleName, declModule, declName] =>
-        pure ("inspect", sourcePath, moduleName, declModule, declName, none, none, none)
-    | ["remove-call-arg", sourcePath, moduleName, declModule, declName, index] =>
-        pure (if syntaxMatch then "remove-syntax" else "remove",
-          sourcePath, moduleName, declModule, declName, none, index.toNat?, none)
-    | ["insert-call-arg", sourcePath, moduleName, declModule, declName, index, term] =>
-        pure ("insert", sourcePath, moduleName, declModule, declName, none, index.toNat?, some term)
-    | ["remove-parameter", sourcePath, moduleName, declName, binderName, index] =>
-        pure ("parameter", sourcePath, moduleName, moduleName, declName, some binderName, index.toNat?, none)
+  -- The call-site commands below share one elaboration of one file, so they are dispatched together
+  -- rather than each opening it again.  `M` — the module that DECLARES the name — is what the index
+  -- answers; the fallbacks that match by name alone stand in when it cannot.
+  let (mode, declName, binderName?, argIndex?, insertText?) ← match args with
+    | ["inspect", declName] => pure ("inspect", declName, none, none, none)
+    | ["remove-arg", declName, index] =>
+        pure (if syntaxMatch then "remove-syntax" else "remove", declName, none, index.toNat?, none)
+    | ["insert-arg", declName, index, term] =>
+        pure ("insert", declName, none, index.toNat?, some term)
+    | ["remove-param", declName, binderName, index] =>
+        pure ("parameter", declName, some binderName, index.toNat?, none)
     | _ => IO.eprintln usage; return 2
+  let .ok sourcePath ← fileOf declName | return 2
+  let moduleName ← match moduleNameOfPath sourcePath with
+    | .ok name => pure name
+    | .error message => IO.eprintln message; return 2
+  -- The declaring module, from the index.  Falling back to the edited file's own module is right
+  -- for the common case — a call site in the file that declares it — and where it is wrong the
+  -- `usageSitesNamed` fallbacks below match by name alone and still find the sites.
+  let declModule ← match ← refreshedIndex? with
+    | some dbPath => pure <| match (← Query.declaringModules dbPath declName)[0]? with
+        | some (declaring, _) => declaring
+        | none => moduleName
+    | none => pure moduleName
   claimElaboration sourcePath
   let source ← IO.FS.readFile sourcePath
   let inputCtx := Parser.mkInputContext source sourcePath

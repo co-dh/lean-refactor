@@ -87,6 +87,28 @@ order by m.source, r.sl1"
         pure (n, s, l, t)
   | _ => return #[]
 
+/-- The source paths that DECLARE `declName`, and the module names with them.  This is what lets a
+    command take a declaration and no file: the index already knows where the binding site is, so
+    naming the file at the call site only repeats what it says.  Normally one row; two mean the same
+    name is declared in two modules, and the caller has to say which with the file selector. -/
+public def declaringModules (dbPath declName : String) : IO (Array (String × String)) := do
+  let j ← Db.query dbPath s!"select distinct m.name as n, m.source as s
+from decl_info i join module m on m.name = i.module
+where i.user_name = '{Db.escaped declName}' or i.name = '{Db.escaped declName}'
+order by m.source"
+  match j with
+  | .arr rows =>
+      return rows.filterMap fun row => do
+        let n ← (row.getObjValAs? String "n").toOption
+        let s ← (row.getObjValAs? String "s").toOption
+        pure (n, s)
+  | _ => return #[]
+
+/-- Whether the index knows a MODULE by this name — `Freyd.S1_45`, as an import writes it. -/
+public def isModule (dbPath name : String) : IO Bool := do
+  let j ← Db.query dbPath s!"select name as m from module where name = '{Db.escaped name}'"
+  return !(namedModules j).isEmpty
+
 /-- Modules whose declarations mention `declName` in a type or a proof term, name-sorted. -/
 public def dependentModules (dbPath declName : String) : IO (Array String) := do
   let j ← Db.query dbPath s!"select distinct module as m from dep where dst = '{Db.escaped declName}' order by module"
