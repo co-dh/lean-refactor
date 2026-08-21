@@ -1304,8 +1304,15 @@ private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool
     for cmd in scan.commands do
       sites := sites ++ syntaxSitesNamed scan.fileMap r.declName cmd
   if sites.isEmpty then
+    -- The fallback matches by NAME, so it cannot tell a binder from a use.  Left unfiltered it
+    -- re-admits the very definition `--uses-only` promised to leave alone, and the rename then
+    -- declares a SECOND declaration under the replacement's name -- silently, since the file still
+    -- elaborates.  Measured on qlean: a second `rename Ew.nan64 QLean.nanBits --uses-only` with no
+    -- use left rewrote `def nan64` itself.
+    let defs := definitionSitesNamed scan.references r.declName
     for cmd in scan.commands do
-      sites := sites ++ syntaxSitesNamed scan.fileMap r.declName cmd
+      for site in syntaxSitesNamed scan.fileMap r.declName cmd do
+        if withDefinition || !defs.any (·.range == site.range) then sites := sites.push site
   let edits := sites.map fun site =>
     { start := scan.fileMap.lspPosToUtf8Pos site.range.start,
       stop := scan.fileMap.lspPosToUtf8Pos site.range.end,
