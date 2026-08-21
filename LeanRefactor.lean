@@ -563,11 +563,32 @@ private def verifiedEdits (env : Environment) (path source : String) (edits : Ar
     if ← elaboratesCleanly env path (applyEdits source candidate) then kept := candidate
   pure kept
 
+/-- Where `cap` is: beside the TOOL, not beside the repository being edited.  The binary runs with
+    the target repository as its working directory -- that is what lets it read the target's
+    `.ilean` files -- so a relative `./scripts/cap` looked for it in the wrong tree and every
+    transactional edit failed its build gate with "could not execute external process". -/
+private def capPath : IO String := do
+  let exe ← IO.appPath                      -- <root>/.lake/build/bin/lean-refactor
+  let up (p : System.FilePath) : System.FilePath := p.parent.getD ⟨"."⟩
+  pure (up (up (up (up exe))) / "scripts" / "cap").toString
+
+/-- Elaborating ONE file has to load the package's precompiled dynlibs itself.  `lake build` passes
+    `--load-dynlib` for a package with `precompileModules`, and `lake env lean <file>` does not, so
+    every `@[extern]` in the file's dependency cone fails as "could not find native implementation
+    of external declaration" and the gate rejects an edit that is in fact fine. -/
+private def leanArgs (path : String) : IO (Array String) := do
+  let libDir : System.FilePath := ".lake" / "build" / "lib"
+  let mut flags : Array String := #[]
+  if ← libDir.pathExists then
+    for e in ← libDir.readDir do
+      if e.path.extension == some "so" then flags := flags.push s!"--load-dynlib={e.path}"
+  pure (#["lake", "env", "lean"] ++ flags ++ #[path])
+
 /-- The check every transactional refactor is measured against.  NO TARGET is named on purpose: the
     package has four lib roots (`Freyd`, `AOP`, `leet`, `rel`) plus `diag`, and `lake build Freyd`
     builds one of them — a rename that broke `diag` was reported as "build passed". -/
-private def repositoryBuild : IO IO.Process.Output :=
-  IO.Process.output { cmd := "./scripts/cap", args := #["lake", "build"] }
+private def repositoryBuild : IO IO.Process.Output := do
+  IO.Process.output { cmd := ← capPath, args := #["lake", "build"] }
 
 /-! ## Renaming a module
 
@@ -829,7 +850,7 @@ private def replaceDeclarationBody (path declName replacement : String) (apply :
     return 0
   IO.FS.writeFile path updated
   let check ← IO.Process.output {
-    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+    cmd := ← capPath, args := ← leanArgs path }
   unless check.exitCode == 0 do
     IO.FS.writeFile path source
     unless check.stdout.isEmpty do IO.eprintln check.stdout
@@ -864,7 +885,7 @@ private def replaceDeclaration (path declName replacement : String) (apply : Boo
     return 0
   IO.FS.writeFile path updated
   let check ← IO.Process.output {
-    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+    cmd := ← capPath, args := ← leanArgs path }
   unless check.exitCode == 0 do
     IO.FS.writeFile path source
     unless check.stdout.isEmpty do IO.eprintln check.stdout
@@ -898,7 +919,7 @@ private def removeDeclaration (path declName : String) (apply : Bool) : IO UInt3
     return 0
   IO.FS.writeFile path updated
   let check ← IO.Process.output {
-    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+    cmd := ← capPath, args := ← leanArgs path }
   unless check.exitCode == 0 do
     IO.FS.writeFile path source
     unless check.stdout.isEmpty do IO.eprintln check.stdout
@@ -965,7 +986,7 @@ private def relocateDeclarationBefore (path declName anchorName : String) (apply
     return 0
   IO.FS.writeFile path updated
   let check ← IO.Process.output {
-    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+    cmd := ← capPath, args := ← leanArgs path }
   unless check.exitCode == 0 do
     IO.FS.writeFile path source
     unless check.stdout.isEmpty do IO.eprintln check.stdout
@@ -1035,7 +1056,7 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
   -- The declaration may have leaned on `variable`s of the section it is leaving, or on dependencies
   -- the target cannot reach; both surface here, in one cheap elaboration, before any build.
   let targetCheck ← IO.Process.output {
-    cmd := "./scripts/cap", args := #["lake", "env", "lean", targetPath] }
+    cmd := ← capPath, args := ← leanArgs targetPath }
   unless targetCheck.exitCode == 0 do
     restore
     unless targetCheck.stdout.isEmpty do IO.eprintln targetCheck.stdout
@@ -1133,7 +1154,7 @@ private def collapseDeclaration (path declName replacement : String) (apply : Bo
   let updated := applyEdits source selectedEdits
   IO.FS.writeFile path updated
   let check ← IO.Process.output {
-    cmd := "./scripts/cap", args := #["lake", "env", "lean", path] }
+    cmd := ← capPath, args := ← leanArgs path }
   unless check.exitCode == 0 do
     IO.FS.writeFile path source
     unless check.stdout.isEmpty do IO.eprintln check.stdout
