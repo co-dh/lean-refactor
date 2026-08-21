@@ -590,6 +590,14 @@ private def leanArgs (path : String) : IO (Array String) := do
 private def repositoryBuild : IO IO.Process.Output := do
   IO.Process.output { cmd := ← capPath, args := #["lake", "build"] }
 
+/-- Put a rejected edit's build artefacts back with its source.  `lake build` writes the `.olean` of
+    every file it compiled BEFORE the one that failed, so restoring the source alone leaves a tree
+    whose artefacts describe the rejected edit: the next `index` then reports declarations that do
+    not exist and misses ones that do, and the command after that fails on a phantom repository. -/
+private def restoreAfterBuild (path source : String) : IO Unit := do
+  IO.FS.writeFile path source
+  discard repositoryBuild
+
 /-! ## Renaming a module
 
 `rename-module` changes both a module's repository-relative filename and every Lean `import` that
@@ -862,7 +870,7 @@ private def replaceDeclarationBody (path declName replacement : String) (apply :
   if build.exitCode == 0 then
     IO.println s!"whole-repository build passed; replaced body of `{declName}`"
     return 0
-  IO.FS.writeFile path source
+  restoreAfterBuild path source
   unless build.stdout.isEmpty do IO.eprintln build.stdout
   unless build.stderr.isEmpty do IO.eprintln build.stderr
   IO.eprintln s!"whole-repository build failed after replacing `{declName}`; restored"
@@ -897,7 +905,7 @@ private def replaceDeclaration (path declName replacement : String) (apply : Boo
   if build.exitCode == 0 then
     IO.println s!"whole-repository build passed; replaced declaration `{declName}`"
     return 0
-  IO.FS.writeFile path source
+  restoreAfterBuild path source
   unless build.stdout.isEmpty do IO.eprintln build.stdout
   unless build.stderr.isEmpty do IO.eprintln build.stderr
   IO.eprintln s!"whole-repository build failed after replacing `{declName}`; restored"
@@ -931,7 +939,7 @@ private def removeDeclaration (path declName : String) (apply : Bool) : IO UInt3
   if build.exitCode == 0 then
     IO.println s!"whole-repository build passed; removed declaration `{declName}`"
     return 0
-  IO.FS.writeFile path source
+  restoreAfterBuild path source
   unless build.stdout.isEmpty do IO.eprintln build.stdout
   unless build.stderr.isEmpty do IO.eprintln build.stderr
   IO.eprintln s!"whole-repository build failed after removing `{declName}`; restored"
@@ -998,7 +1006,7 @@ private def relocateDeclarationBefore (path declName anchorName : String) (apply
   if build.exitCode == 0 then
     IO.println s!"whole-repository build passed; relocated `{declName}`"
     return 0
-  IO.FS.writeFile path source
+  restoreAfterBuild path source
   unless build.stdout.isEmpty do IO.eprintln build.stdout
   unless build.stderr.isEmpty do IO.eprintln build.stderr
   IO.eprintln s!"whole-repository build failed after relocating `{declName}`; restored"
@@ -1166,7 +1174,7 @@ private def collapseDeclaration (path declName replacement : String) (apply : Bo
   if build.exitCode == 0 then
     IO.println s!"whole-repository build passed; removed `{declName}`"
     return 0
-  IO.FS.writeFile path source
+  restoreAfterBuild path source
   unless build.stdout.isEmpty do IO.eprintln build.stdout
   unless build.stderr.isEmpty do IO.eprintln build.stderr
   IO.eprintln s!"whole-repository build failed after collapsing `{declName}`; restored"
