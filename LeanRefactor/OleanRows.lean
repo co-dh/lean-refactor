@@ -1,13 +1,11 @@
 module
 
 import Lean
+public import LeanRefactor.Db
 
 open Lean
 
 namespace LeanRefactor.OleanRows
-
-/-- 0x1F, matching sqlite3's `--ascii` import mode. Kept in step with `LeanRefactor.Db.fieldSep`. -/
-private def fieldSep : String := "\x1f"
 
 /-- The rows a set of compiled modules produces. Each string is one record: the cell values joined by
     `LeanRefactor.Db.fieldSep`. -/
@@ -196,7 +194,7 @@ private def moduleConstants (datas : Array ModuleData) : Std.HashMap Name Consta
 
 /-- Read each module's `.olean` under `buildDir` — no environment, no imports, no search path — and produce its
     rows. A module whose `.olean` is missing or unreadable is skipped, not an error. -/
-public def ofModules (modules : Array Name) (buildDir : String := ".lake/build/lib/lean") : IO Rows := do
+public def ofModules (modules : Array Name) (buildDir : String := Db.buildDir) : IO Rows := do
   let mut declInfos := #[]
   let mut deps := #[]
   let mut imports := #[]
@@ -220,7 +218,7 @@ public def ofModules (modules : Array Name) (buildDir : String := ".lake/build/l
     -- declaration can even SEE another, which no dependency edge answers — `dep` records what a
     -- module used, and a module can see far more than it used.
     for imp in datas[0]!.imports do
-      imports := imports.push s!"{toString mod}{fieldSep}{toString imp.module}"
+      imports := imports.push s!"{toString mod}{Db.fieldSep}{toString imp.module}"
     let consts := moduleConstants datas
     for ci in consts.valuesArray do
       let some kind := kindOf ci | continue
@@ -234,7 +232,7 @@ public def ofModules (modules : Array Name) (buildDir : String := ".lake/build/l
       let (skel, skelSize) := match skeletonKey ci with
         | some (h, n) => (toString (h &&& 0x7fffffffffffffff), toString n)
         | none => ("", "0")
-      declInfos := declInfos.push (String.intercalate fieldSep
+      declInfos := declInfos.push (String.intercalate Db.fieldSep
         [name, toString userName, toString mod, kind,
          if generatedName userName then "1" else "0", "",
          toString (statementKey consts ci &&& 0x7fffffffffffffff), skel, skelSize])
@@ -258,9 +256,9 @@ public def ofModules (modules : Array Name) (buildDir : String := ".lake/build/l
       let inValue := ((ci.value?.map (·.getUsedConstants)).getD #[]).toList.eraseDups
       for dst in (inType ++ inValue).eraseDups do
         if dst == ci.name then continue
-        deps := deps.push s!"{name}{fieldSep}{toString dst}{fieldSep}{toString mod}\
-          {fieldSep}{if inType.contains dst then "1" else "0"}\
-          {fieldSep}{if inValue.contains dst then "1" else "0"}"
+        deps := deps.push s!"{name}{Db.fieldSep}{toString dst}{Db.fieldSep}{toString mod}\
+          {Db.fieldSep}{if inType.contains dst then "1" else "0"}\
+          {Db.fieldSep}{if inValue.contains dst then "1" else "0"}"
   return { declInfos, deps, imports }
 
 end LeanRefactor.OleanRows

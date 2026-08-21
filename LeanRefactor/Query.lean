@@ -23,46 +23,23 @@ public def useSitesByFile (dbPath declName : String) : IO (Std.HashMap String (A
   let sql := s!"select m.source as source, u.l1 as l1, u.c1 as c1, u.l2 as l2, u.c2 as c2
 from use_site u join module m on m.name = u.use_module
 where u.name = '{Db.escaped declName}' and u.is_definition = 0"
-  let j ← Db.query dbPath sql
-  let mut map : Std.HashMap String (Array Site) := {}
-  match j with
-  | .arr rows =>
-      -- sqlite3 prints integer columns as JSON numbers; a row whose fields do not parse is skipped.
-      for row in rows do
-        let source := (row.getObjValAs? String "source").toOption
-        let l1 := (row.getObjValAs? Nat "l1").toOption
-        let c1 := (row.getObjValAs? Nat "c1").toOption
-        let l2 := (row.getObjValAs? Nat "l2").toOption
-        let c2 := (row.getObjValAs? Nat "c2").toOption
-        match source, l1, c1, l2, c2 with
-        | some source, some l1, some c1, some l2, some c2 =>
-            map := map.insert source (map.getD source #[] |>.push { l1, c1, l2, c2 })
-        | _, _, _, _, _ => pure ()
-  | _ => pure ()
-  return map
-
-/-- The module names a `select distinct module as m` query returned, in row order. -/
-private def namedModules (j : Json) : Array String :=
-  match j with
-  | .arr rows => rows.filterMap fun row => (row.getObjValAs? String "m").toOption
-  | _ => #[]
+  let rows ← Db.queryRows dbPath sql fun row => do
+    let source ← (row.getObjValAs? String "source").toOption
+    let l1 ← (row.getObjValAs? Nat "l1").toOption
+    let c1 ← (row.getObjValAs? Nat "c1").toOption
+    let l2 ← (row.getObjValAs? Nat "l2").toOption
+    let c2 ← (row.getObjValAs? Nat "c2").toOption
+    pure (source, ({ l1, c1, l2, c2 } : Site))
+  return rows.foldl (init := ({} : Std.HashMap String (Array Site))) fun map (source, site) =>
+    map.insert source (map.getD source #[] |>.push site)
 
 /-- Modules with at least one recorded USE site of `declName`, each with its site count, name-sorted. -/
 public def useModules (dbPath declName : String) : IO (Array (String × Nat)) := do
-  let j ← Db.query dbPath s!"select use_module as m, count(*) as n from use_site
-where name = '{Db.escaped declName}' and is_definition = 0 group by use_module order by use_module"
-  match j with
-  | .arr rows =>
-      -- sqlite3 prints integer columns as JSON numbers; a row whose fields do not parse is skipped.
-      let mut out := #[]
-      for row in rows do
-        let m := (row.getObjValAs? String "m").toOption
-        let n := (row.getObjValAs? Nat "n").toOption
-        match m, n with
-        | some m, some n => out := out.push (m, n)
-        | _, _ => pure ()
-      return out
-  | _ => return #[]
+  Db.queryRows dbPath s!"select use_module as m, count(*) as n from use_site
+where name = '{Db.escaped declName}' and is_definition = 0 group by use_module order by use_module" fun row => do
+    let m ← (row.getObjValAs? String "m").toOption
+    let n ← (row.getObjValAs? Nat "n").toOption
+    pure (m, n)
 
 /-- What each declaration whose user-facing name contains `fragment` SAYS: its name, the source path
     and 1-based line of that name, and the signature as the source spells it.
@@ -71,57 +48,50 @@ where name = '{Db.escaped declName}' and is_definition = 0 group by use_module o
     compiler's own declarations are dropped — an equation lemma repeats its parent's signature. -/
 public def declStatements (dbPath fragment : String) :
     IO (Array (String × String × Nat × String)) := do
-  let j ← Db.query dbPath s!"select i.user_name as n, m.source as s, r.sl1 + 1 as l, i.stmt as t
+  Db.queryRows dbPath s!"select i.user_name as n, m.source as s, r.sl1 + 1 as l, i.stmt as t
 from decl_info i
 join module m on m.name = i.module
 join decl_range r on r.name = i.name and r.module = i.module
 where i.user_name like '%{Db.escaped fragment}%' and i.internal = 0 and i.stmt != ''
-order by m.source, r.sl1"
-  match j with
-  | .arr rows =>
-      return rows.filterMap fun row => do
-        let n ← (row.getObjValAs? String "n").toOption
-        let s ← (row.getObjValAs? String "s").toOption
-        let l ← (row.getObjValAs? Nat "l").toOption
-        let t ← (row.getObjValAs? String "t").toOption
-        pure (n, s, l, t)
-  | _ => return #[]
+order by m.source, r.sl1" fun row => do
+    let n ← (row.getObjValAs? String "n").toOption
+    let s ← (row.getObjValAs? String "s").toOption
+    let l ← (row.getObjValAs? Nat "l").toOption
+    let t ← (row.getObjValAs? String "t").toOption
+    pure (n, s, l, t)
 
 /-- The source paths that DECLARE `declName`, and the module names with them.  This is what lets a
     command take a declaration and no file: the index already knows where the binding site is, so
     naming the file at the call site only repeats what it says.  Normally one row; two mean the same
     name is declared in two modules, and the caller has to say which with the file selector. -/
 public def declaringModules (dbPath declName : String) : IO (Array (String × String)) := do
-  let j ← Db.query dbPath s!"select distinct m.name as n, m.source as s
+  Db.queryRows dbPath s!"select distinct m.name as n, m.source as s
 from decl_info i join module m on m.name = i.module
 where i.user_name = '{Db.escaped declName}' or i.name = '{Db.escaped declName}'
-order by m.source"
-  match j with
-  | .arr rows =>
-      return rows.filterMap fun row => do
-        let n ← (row.getObjValAs? String "n").toOption
-        let s ← (row.getObjValAs? String "s").toOption
-        pure (n, s)
-  | _ => return #[]
+order by m.source" fun row => do
+    let n ← (row.getObjValAs? String "n").toOption
+    let s ← (row.getObjValAs? String "s").toOption
+    pure (n, s)
 
 /-- Whether the index knows a MODULE by this name — `Freyd.S1_45`, as an import writes it. -/
 public def isModule (dbPath name : String) : IO Bool := do
-  let j ← Db.query dbPath s!"select name as m from module where name = '{Db.escaped name}'"
-  return !(namedModules j).isEmpty
+  let modules ← Db.queryRows dbPath s!"select name as m from module where name = '{Db.escaped name}'"
+    (·.getObjValAs? String "m" |>.toOption)
+  return !modules.isEmpty
 
 /-- Modules whose declarations mention `declName` in a type or a proof term, name-sorted. -/
-public def dependentModules (dbPath declName : String) : IO (Array String) := do
-  let j ← Db.query dbPath s!"select distinct module as m from dep where dst = '{Db.escaped declName}' order by module"
-  return (namedModules j)
+public def dependentModules (dbPath declName : String) : IO (Array String) :=
+  Db.queryRows dbPath s!"select distinct module as m from dep where dst = '{Db.escaped declName}' order by module"
+    (·.getObjValAs? String "m" |>.toOption)
 
 /-- Modules that depend on `declName` without naming it anywhere the info trees recorded: they reach it
     through notation or macro expansion.  No edit is needed there — the notation is declared once — but
     they are exactly the modules a rename can break without touching. -/
-public def silentDependents (dbPath declName : String) : IO (Array String) := do
-  let j ← Db.query dbPath s!"select distinct module as m from dep where dst = '{Db.escaped declName}'
+public def silentDependents (dbPath declName : String) : IO (Array String) :=
+  Db.queryRows dbPath s!"select distinct module as m from dep where dst = '{Db.escaped declName}'
 except select distinct use_module from use_site where name = '{Db.escaped declName}' and is_definition = 0
 order by 1"
-  return (namedModules j)
+    (·.getObjValAs? String "m" |>.toOption)
 
 /-- One member of a duplicate group: what it is called, where it is, and how big it is. -/
 public structure DupMember where
@@ -141,7 +111,7 @@ public structure DupMember where
     does not filter one.  Compiler-written declarations are dropped: an equation lemma repeats its
     parent's statement, and there are thousands of them. -/
 public def dupGroups (dbPath column : String) (minSize : Nat) : IO (Array (Array DupMember)) := do
-  let j ← Db.query dbPath s!"select i.{column} as k, i.user_name as n, i.module as md, m.source as s,
+  let rows ← Db.queryRows dbPath s!"select i.{column} as k, i.user_name as n, i.module as md, m.source as s,
        coalesce(r.sl1 + 1, 0) as l, i.skel_size as z
 from decl_info i
 join module m on m.name = i.module
@@ -151,22 +121,22 @@ where i.internal = 0 and i.{column} is not null and i.{column} != 0 and i.skel_s
     select {column} from decl_info
      where internal = 0 and {column} is not null and {column} != 0 and skel_size >= {minSize}
      group by {column} having count(distinct user_name) > 1)
-order by k, m.source, l"
+order by k, m.source, l" fun row => do
+    let get (f : String) := (row.getObjValAs? String f).toOption
+    let getN (f : String) := (row.getObjValAs? Nat f).toOption
+    -- sqlite3 prints the key as a number; it is only ever a grouping token here.
+    let k := (get "k").getD (toString ((getN "k").getD 0))
+    let name ← get "n"
+    let module ← get "md"
+    let source ← get "s"
+    let line ← getN "l"
+    let size ← getN "z"
+    pure (k, ({ name, module, source, line, size } : DupMember))
   let mut byKey : Std.HashMap String (Array DupMember) := {}
   let mut order : Array String := #[]
-  match j with
-  | .arr rows =>
-      for row in rows do
-        let get (f : String) := (row.getObjValAs? String f).toOption
-        let getN (f : String) := (row.getObjValAs? Nat f).toOption
-        -- sqlite3 prints the key as a number; it is only ever a grouping token here.
-        let k := (get "k").getD (toString ((getN "k").getD 0))
-        match get "n", get "md", get "s", getN "l", getN "z" with
-        | some name, some module, some source, some line, some size =>
-            unless byKey.contains k do order := order.push k
-            byKey := byKey.insert k ((byKey.getD k #[]).push { name, module, source, line, size })
-        | _, _, _, _, _ => pure ()
-  | _ => pure ()
+  for (k, member) in rows do
+    unless byKey.contains k do order := order.push k
+    byKey := byKey.insert k ((byKey.getD k #[]).push member)
   -- Biggest first, as `dup` orders its groups: the head of the report is the work.
   let groups := order.filterMap (byKey[·]?) |>.filter (·.size > 1)
   return groups.qsort fun a b =>
@@ -175,16 +145,12 @@ order by k, m.source, l"
 
 /-- The direct import edges, as `module → the modules it imports`. -/
 public def importEdges (dbPath : String) : IO (Std.HashMap String (Array String)) := do
-  let j ← Db.query dbPath "select src as a, dst as b from import_edge"
-  let mut direct : Std.HashMap String (Array String) := {}
-  match j with
-  | .arr rows =>
-      for row in rows do
-        match (row.getObjValAs? String "a").toOption, (row.getObjValAs? String "b").toOption with
-        | some a, some b => direct := direct.insert a ((direct.getD a #[]).push b)
-        | _, _ => pure ()
-  | _ => pure ()
-  return direct
+  let rows ← Db.queryRows dbPath "select src as a, dst as b from import_edge" fun row => do
+    let a ← (row.getObjValAs? String "a").toOption
+    let b ← (row.getObjValAs? String "b").toOption
+    pure (a, b)
+  return rows.foldl (init := ({} : Std.HashMap String (Array String))) fun direct (a, b) =>
+    direct.insert a ((direct.getD a #[]).push b)
 
 /-- One occurrence of a repeated piece of source: its file and the byte range covering it. -/
 public structure CloneSite where
@@ -235,25 +201,19 @@ select b.nodes as nodes,
 from big b join grp on grp.h = b.h join module m on m.id = b.md
 where b.h not in (select h from interior)
 group by b.h order by b.nodes desc, count(*) desc"
-  let j ← Db.query dbPath sql
-  match j with
-  | .arr rows =>
-      let mut out := #[]
-      for row in rows do
-        let nodes := (row.getObjValAs? Nat "nodes").toOption.getD 0
-        let sources := ((row.getObjValAs? String "ss").toOption.getD "").splitOn "\x1f"
-        let b0s := ((row.getObjValAs? String "b0s").toOption.getD "").splitOn "\x1f"
-        let b1s := ((row.getObjValAs? String "b1s").toOption.getD "").splitOn "\x1f"
-        if sources.length == b0s.length && sources.length == b1s.length then
-          let sites := (sources.zip (b0s.zip b1s)).toArray.filterMap fun (s, b0, b1) =>
-            match b0.toNat?, b1.toNat? with
-            | some b0, some b1 => some { source := s, b0, b1 : CloneSite }
-            | _, _ => none
-          -- File order, so the occurrences of one clone read as a list a reader can walk down.
-          out := out.push { nodes, sites := sites.qsort fun a b =>
-            a.source < b.source || (a.source == b.source && a.b0 < b.b0) }
-      return out
-  | _ => return #[]
+  Db.queryRows dbPath sql fun row => do
+    let nodes := (row.getObjValAs? Nat "nodes").toOption.getD 0
+    let sources := ((row.getObjValAs? String "ss").toOption.getD "").splitOn Db.fieldSep
+    let b0s := ((row.getObjValAs? String "b0s").toOption.getD "").splitOn Db.fieldSep
+    let b1s := ((row.getObjValAs? String "b1s").toOption.getD "").splitOn Db.fieldSep
+    guard (sources.length == b0s.length && sources.length == b1s.length)
+    let sites := (sources.zip (b0s.zip b1s)).toArray.filterMap fun (s, b0, b1) =>
+      match b0.toNat?, b1.toNat? with
+      | some b0, some b1 => some { source := s, b0, b1 : CloneSite }
+      | _, _ => none
+    -- File order, so the occurrences of one clone read as a list a reader can walk down.
+    pure { nodes, sites := sites.qsort fun a b =>
+      a.source < b.source || (a.source == b.source && a.b0 < b.b0) }
 
 /-- The public set of one module, as the three tables both queries below select from: what a public
     body may not name (`tainted`), what is public for a reason of its own (`named`), and what those
@@ -367,7 +327,7 @@ public def publicDeclSites (dbPath moduleName : String) (instanceLines : Array N
   let onInstanceLine :=
     if instanceLines.isEmpty then "-1"
     else String.intercalate ", " (instanceLines.toList.map toString)
-  let j ← Db.query dbPath <| publicSetCTE m onInstanceLine ++ s!"
+  Db.queryRows dbPath (publicSetCTE m onInstanceLine ++ s!"
 select i.user_name as n, coalesce(r.sl1, u.l1) as l, coalesce(r.sc1, u.c1) as c,
        case when t.n is null then 1 else 0 end as e
 from decl_info i
@@ -377,33 +337,22 @@ left join use_site u on u.name = i.name and u.use_module = i.module and u.is_def
 left join tainted t on t.n = i.name
 where i.module = '{m}' and i.internal = 0 and i.name not like '\\_private%' escape '\\'
   and (r.name is not null or u.name is not null)
-order by l, c"
-  match j with
-  | .arr rows =>
-      -- sqlite3 prints integer columns as JSON numbers; a row whose fields do not parse is skipped.
-      return rows.filterMap fun row => do
-        let n ← (row.getObjValAs? String "n").toOption
-        let l ← (row.getObjValAs? Nat "l").toOption
-        let c ← (row.getObjValAs? Nat "c").toOption
-        let e ← (row.getObjValAs? Nat "e").toOption
-        pure (n, l, c, e == 1)
-  | _ => return #[]
+order by l, c") fun row => do
+    let n ← (row.getObjValAs? String "n").toOption
+    let l ← (row.getObjValAs? Nat "l").toOption
+    let c ← (row.getObjValAs? Nat "c").toOption
+    let e ← (row.getObjValAs? Nat "e").toOption
+    pure (n, l, c, e == 1)
 
 /-- The `module.source` path of every module, keyed by its `module.name` — the join the path-facing
     callers need when a query returns module names. -/
 public def moduleSources (dbPath : String) : IO (Std.HashMap String String) := do
-  let j ← Db.query dbPath "select name, source from module"
-  let mut map : Std.HashMap String String := {}
-  match j with
-  | .arr rows =>
-      for row in rows do
-        let name := (row.getObjValAs? String "name").toOption
-        let source := (row.getObjValAs? String "source").toOption
-        match name, source with
-        | some name, some source => map := map.insert name source
-        | _, _ => pure ()
-  | _ => pure ()
-  return map
+  let rows ← Db.queryRows dbPath "select name, source from module" fun row => do
+    let name ← (row.getObjValAs? String "name").toOption
+    let source ← (row.getObjValAs? String "source").toOption
+    pure (name, source)
+  return rows.foldl (init := ({} : Std.HashMap String String)) fun map (name, source) =>
+    map.insert name source
 
 /-- The `private` declarations that stand in the way of putting `moduleName` on the module system,
     as (instance, private constant it names, whether anything outside needs the instance).
@@ -428,7 +377,7 @@ public def privateBlockers (dbPath moduleName : String) (instanceLines : Array N
   let onInstanceLine :=
     if instanceLines.isEmpty then "-1"
     else String.intercalate ", " (instanceLines.toList.map toString)
-  let j ← Db.query dbPath <| publicSetCTE m onInstanceLine ++ s!",
+  Db.queryRows dbPath (publicSetCTE m onInstanceLine ++ s!",
 -- The instances this pass will actually mark. Being on an instance line is not enough and neither
 -- is an outside dependency: `Freyd.functorCat_hasPullbacks` has no dependant outside its file and
 -- is still marked, because a public body in the file names it and the closure carries it along.
@@ -457,15 +406,11 @@ join dep d on d.src = published.n and d.module = '{m}'
 join decl_info b on b.name = d.dst and b.module = '{m}'
 join decl_info r on r.name = published.root and r.module = '{m}'
 where d.dst like '\\_private%' escape '\\'
-order by i, p"
-  match j with
-  | .arr rows =>
-      return rows.filterMap fun row => do
-        let i ← (row.getObjValAs? String "i").toOption
-        let p ← (row.getObjValAs? String "p").toOption
-        let n ← (row.getObjValAs? Nat "n").toOption
-        pure (i, p, n == 1)
-  | _ => return #[]
+order by i, p") fun row => do
+    let i ← (row.getObjValAs? String "i").toOption
+    let p ← (row.getObjValAs? String "p").toOption
+    let n ← (row.getObjValAs? Nat "n").toOption
+    pure (i, p, n == 1)
 
 /-- One node of the dependency graph: what the source calls the declaration, what it is, where it
     is written, and what it says. -/
@@ -476,43 +421,24 @@ public structure GraphNode where
   line : Nat
   stmt : String
 
-/-- Every declaration the source itself wrote, as graph nodes.  `user_name`, because that is the
-    name a reader types and the name the edges below are mapped onto; a declaration the compiler
-    wrote has no source line to point at.  A declaration the `.ilean` does not place keeps line 0. -/
+/-- The nodes the page draws, from the index's `graph_node` view: one row per `user_name`, hubs
+    already cut, in the order the view fixes.  `scripts/graphdb.py` reads the same view, which is
+    what keeps the overlays it writes aligned with the page's node indices.  Line 0 means the
+    `.ilean` did not place the declaration. -/
 public def graphNodes (dbPath : String) : IO (Array GraphNode) := do
-  let j ← Db.query dbPath "select i.user_name as n, i.kind as k, m.source as s,
-       coalesce(r.sl1 + 1, 0) as l, i.stmt as t
-from decl_info i
-join module m on m.name = i.module
-left join decl_range r on r.name = i.name and r.module = i.module
-where i.internal = 0
-order by m.source, l"
-  match j with
-  | .arr rows =>
-      return rows.filterMap fun row => do
-        let name ← (row.getObjValAs? String "n").toOption
-        let kind ← (row.getObjValAs? String "k").toOption
-        let source ← (row.getObjValAs? String "s").toOption
-        let line ← (row.getObjValAs? Nat "l").toOption
-        pure { name, kind, source, line, stmt := (row.getObjValAs? String "t").toOption.getD "" }
-  | _ => return #[]
+  Db.queryRows dbPath "select n, k, s, l, t from graph_node" fun row => do
+    let name ← (row.getObjValAs? String "n").toOption
+    let kind ← (row.getObjValAs? String "k").toOption
+    let source ← (row.getObjValAs? String "s").toOption
+    let line ← (row.getObjValAs? Nat "l").toOption
+    pure { name, kind, source, line, stmt := (row.getObjValAs? String "t").toOption.getD "" }
 
-/-- The dependency edges under the names `graphNodes` gives its nodes.  `dep` stores the MANGLED
-    name, so both ends are joined back through `decl_info`; an end that is a compiler-written
-    declaration has no node and the join drops the row.  `src` is joined on its module too, which is
-    the module the edge was recorded in, so a name declared twice cannot multiply the row. -/
+/-- The dependency edges under the names `graphNodes` gives its nodes, from the index's
+    `graph_edge` view.  Every edge, hubs included: `graph_hub` counts in-degree over this view. -/
 public def graphEdges (dbPath : String) : IO (Array (String × String)) := do
-  let j ← Db.query dbPath "select distinct a.user_name as s, b.user_name as t
-from dep d
-join decl_info a on a.name = d.src and a.module = d.module and a.internal = 0
-join decl_info b on b.name = d.dst and b.internal = 0
-where a.user_name != b.user_name"
-  match j with
-  | .arr rows =>
-      return rows.filterMap fun row => do
-        let s ← (row.getObjValAs? String "s").toOption
-        let t ← (row.getObjValAs? String "t").toOption
-        pure (s, t)
-  | _ => return #[]
+  Db.queryRows dbPath "select s, t from graph_edge" fun row => do
+    let s ← (row.getObjValAs? String "s").toOption
+    let t ← (row.getObjValAs? String "t").toOption
+    pure (s, t)
 
 end LeanRefactor.Query

@@ -105,17 +105,6 @@ private def deletePartitions (dbPath : String) (modules : Array String) : IO Uni
         s!"delete from module where name = '{m}';\n"
     Db.exec dbPath (sql ++ "commit;")
 
-/-- The largest module id the database has handed out, so the refresh can number what it inserts
-    from there.  An id never collides with a LIVE module's: a module deleted and re-inserted gets a
-    fresh one, which is what keeps the syntax nodes of every module the refresh did NOT touch
-    pointing where they did. -/
-private def maxModuleId (dbPath : String) : IO Nat := do
-  match ← Db.query dbPath "select coalesce(max(id), 0) as m from module;" with
-  | .arr rows =>
-      if let some row := rows[0]? then return (row.getObjValAs? Nat "m" |>.toOption |>.getD 0)
-      return 0
-  | _ => return 0
-
 /-- Move one refresh's staged syntax rows into `syntax_node`, interning the module name and the node
     kind on the way.  Both are joins, not lookups the caller could have done: a `syntax-rows` child
     prints one module in one process and knows nothing about the ids this database has handed out. -/
@@ -141,17 +130,6 @@ update decl_info set stmt = s.stmt
   where decl_info.name = r.name and decl_info.module = r.module;
 delete from decl_stmt_in;
 commit;"
-
-/-- How many modules the `module` table holds — exactly the set the scan found, because every
-    stale row is deleted and re-inserted under the same name. -/
-private def moduleCount (dbPath : String) : IO Nat := do
-  let j ← Db.query dbPath "select count(*) from module;"
-  match j with
-  | .arr rows =>
-      if let some row := rows[0]? then
-        return (row.getObjValAs? Nat "count(*)" |>.toOption |>.getD 0)
-      return 0
-  | _ => return 0
 
 /-- A build directory outlives the sources that produced it: renaming `Fredy` to `Freyd` left 583
     `Fredy/*.ilean` behind in this repository's `.lake`, one of which still imports a package that is
@@ -219,7 +197,9 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   Db.importRows dbPath "dep" oleanRows.deps
   Db.importRows dbPath "import_edge" oleanRows.imports
   -- The `module` rows go in BEFORE the syntax nodes that intern their names against them.
-  let firstId ← (· + 1) <$> maxModuleId dbPath
+  -- Numbering from the largest id ever handed out, not from the row count: a module deleted and
+  -- re-inserted must get a fresh id, or the untouched modules' syntax nodes point at the wrong one.
+  let firstId ← (· + 1) <$> Db.queryNat dbPath "select coalesce(max(id), 0) as m from module;" "m"
   Db.importRows dbPath "module" (stale.mapIdx fun i m =>
     Db.row #[toString (firstId + i), m.name, m.source, m.ileanHash, m.oleanHash])
   Db.importRows dbPath "syntax_node_in" syntaxRows
@@ -235,15 +215,16 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
 
 /-- `lean-refactor index [--full]`: refresh and print a one-line summary. Returns the process exit code. -/
 public def run (full : Bool) : IO UInt32 := do
-  let buildDir := ".lake/build/lib/lean"
+  let buildDir := Db.buildDir
   unless ← System.FilePath.isDir buildDir do
     IO.eprintln s!"{buildDir} does not exist; run `lake build` first"
     return 1
-  let dbPath := ".lake/build/refactor-index.db"
+  let dbPath := Db.indexPath
   let t0 ← IO.monoMsNow
   let (reExtracted, dropped, orphaned) ← refresh dbPath buildDir full
   let elapsed := (← IO.monoMsNow) - t0
-  let scanned ← moduleCount dbPath
+  -- Exactly the set the scan found: every stale row is deleted and re-inserted under the same name.
+  let scanned ← Db.queryNat dbPath "select count(*) as n from module;" "n"
   IO.println s!"indexed {scanned} module(s): {reExtracted} re-extracted, {dropped} dropped, \
     {orphaned} skipped as source-less artefacts, in {elapsed} ms"
   return 0

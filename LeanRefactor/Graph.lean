@@ -1,17 +1,12 @@
 module
 
 import Lean
+import LeanRefactor.Db
 import LeanRefactor.Query
 
 open Lean
 
 namespace LeanRefactor.Graph
-
-/-- In-degree above which a declaration is a HUB and leaves the graph, taking its edges with it.
-    Composition, equality and the like are named by nearly everything, so drawn they bury every
-    other edge; `scripts/svd-layout` and `scripts/concept` cut at the same floor for the same
-    reason. -/
-private def hubInDeg : Nat := 100
 
 /-- The viewer, still holding the `__REPO__` and `__GRAPH_DATA__` markers, read at RUN time from the
     tool's own checkout.  Not `include_str`: nothing traces that input, so every edit to the page
@@ -56,34 +51,25 @@ private def sidecar (path : System.FilePath) : IO (Array String) := do
     if line.isEmpty then none
     else some ("[" ++ String.intercalate "," ((line.splitOn "\t").map cell) ++ "]")
 
-/-- What the page draws: the nodes that survive the hub cut, the edges among them as index pairs
-    into those nodes, and how many hubs were cut.  In-degree is counted over EVERY edge, so what
-    counts as a hub does not depend on what has already been dropped. -/
-private def selected (nodes : Array Query.GraphNode) (edges : Array (String × String)) :
-    Array Query.GraphNode × Array (Nat × Nat) × Nat := Id.run do
-  let mut indeg : Std.HashMap String Nat := {}
-  for (_, dst) in edges do indeg := indeg.insert dst (indeg.getD dst 0 + 1)
+/-- The edges among `nodes` as index pairs into them.  The hub cut already happened in the index's
+    `graph_node` view, so an edge with an end that is not a node here is one the cut removed. -/
+private def edgePairs (nodes : Array Query.GraphNode) (edges : Array (String × String)) :
+    Array (Nat × Nat) := Id.run do
   let mut index : Std.HashMap String Nat := {}
-  let mut hubs : Std.HashSet String := ∅
-  let mut kept : Array Query.GraphNode := #[]
-  for n in nodes do
-    if indeg.getD n.name 0 > hubInDeg then
-      hubs := hubs.insert n.name
-    -- One name declared in two modules is one node, and the edges of both meet on it.
-    else if !index.contains n.name then
-      index := index.insert n.name kept.size
-      kept := kept.push n
-  let pairs := edges.filterMap fun (s, t) => do
+  for n in nodes do index := index.insert n.name index.size
+  return edges.filterMap fun (s, t) => do
     let a ← index[s]?
     let b ← index[t]?
     pure (a, b)
-  return (kept, pairs, hubs.size)
 
 /-- `lean-refactor graph`: the dependency graph as one self-contained page, the data inlined, so
     there is nothing to serve and nothing to regenerate alongside it.  Returns what the page ended
     up holding — nodes, edges, hubs left out. -/
 public def write (dbPath outPath repo : String) : IO (Nat × Nat × Nat) := do
-  let (kept, pairs, hubs) := selected (← Query.graphNodes dbPath) (← Query.graphEdges dbPath)
+  let kept ← Query.graphNodes dbPath
+  let pairs := edgePairs kept (← Query.graphEdges dbPath)
+  let hubs ← Db.queryNat dbPath "select count(*) as n from graph_hub;" "n"
+  let hubDeg ← Db.queryNat dbPath "select cast(value as integer) as n from meta where key = 'hub_deg';" "n"
   let dir := (System.FilePath.mk outPath).parent.getD "."
   let side (what : String) : IO (Array String) :=
     sidecar (dir / ("refactor-graph-" ++ what ++ ".tsv"))
@@ -92,7 +78,7 @@ public def write (dbPath outPath repo : String) : IO (Nat × Nat × Nat) := do
     | _ => throw <| IO.userError "LeanRefactor/viz.html no longer holds exactly one __GRAPH_DATA__"
   IO.FS.withFile outPath .write fun h => do
     h.putStr before
-    h.putStr ("{\"repo\":" ++ cell repo ++ ",\"hubDeg\":" ++ toString hubInDeg ++
+    h.putStr ("{\"repo\":" ++ cell repo ++ ",\"hubDeg\":" ++ toString hubDeg ++
       ",\"hubs\":" ++ toString hubs ++ ",\"decls\":")
     putArray h (kept.map nodeRow)
     -- Two entries per edge rather than a pair per edge: at this many edges the brackets are the file.

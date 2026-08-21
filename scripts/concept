@@ -39,8 +39,8 @@ rt = {x: root(x) for x in names}
 members = defaultdict(list)
 for x in names: members[rt[x]].append(x)
 concepts = {r for r, m in members.items() if len(m) >= 2}    # a root with pieces = a real concept
-# No hub is discarded by name here: `graphdb` has already dropped every declaration named by more
-# than HUB_INDEG others, so the ubiquitous ones cannot be a root and cannot be a subject.
+# No hub is discarded by name here: the index's `graph_node` view has already dropped every
+# declaration named by more than `meta.hub_deg` others — they cannot be a root or a subject.
 
 out = defaultdict(list); indeg = Counter()
 for a, b in edges:

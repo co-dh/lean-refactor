@@ -11,6 +11,11 @@ namespace LeanRefactor.Db
 public def fieldSep : String := "\x1f"
 public def recordSep : String := "\x1e"
 
+/-- Where `lake` puts the compiled artefacts of the repository being edited, and the index this
+    tool derives from them; both relative, because every operation runs in the target's root. -/
+public def buildDir : String := ".lake/build/lib/lean"
+public def indexPath : String := ".lake/build/refactor-index.db"
+
 /-- 0x1D between the two record groups a `syntax-rows` child prints — its syntax nodes, then its
     declaration statements.  One stream and one fork: a second run would re-elaborate the file. -/
 public def groupSep : String := "\x1d"
@@ -181,6 +186,61 @@ public def query (dbPath : String) (sql : String) : IO Json := do
     | .ok j => return j
     | .error e => throw <| IO.userError s!"sqlite3 on {dbPath} returned invalid JSON: {e}"
 
+/-- The rows a `select` returned, decoded by `row`; a row it rejects is dropped.  sqlite3
+    prints integer columns as JSON numbers, so a row whose fields do not parse is skipped. -/
+public def queryRows {α : Type} (dbPath sql : String) (row : Json → Option α) : IO (Array α) := do
+  match ← query dbPath sql with
+  | .arr rows => pure (rows.filterMap row)
+  | _ => pure #[]
+
+/-- The first row's `column` as a `Nat`, `0` when the query returns no row — the shape every scalar
+    `select` has. -/
+public def queryNat (dbPath sql column : String) : IO Nat := do
+  let values ← queryRows dbPath sql (·.getObjValAs? Nat column |>.toOption)
+  pure (values[0]?.getD 0)
+
+/-- The graph both clients draw, as views, so the Lean page and `scripts/graphdb.py` cannot drift.
+    Re-applied on EVERY `ensureSchema`, not guarded by `schemaVersion`: a view stores nothing, so
+    there is no stale generation of rows to invalidate and a bump would force a full re-extract. -/
+public def viewSql : String :=
+"-- Written here, beside the views that read it, so the cut is always in step with the binary; an
+-- older database that never got the row would leave `graph_hub` comparing against NULL.
+insert or replace into meta (key, value) values ('hub_deg', '100');
+
+drop view if exists graph_edge;
+create view graph_edge as
+select distinct a.user_name as s, b.user_name as t
+from dep d
+join decl_info a on a.name = d.src and a.module = d.module and a.internal = 0
+join decl_info b on b.name = d.dst and b.internal = 0
+where a.user_name != b.user_name;
+
+-- Composition, equality and the like are named by nearly everything, so drawn they bury every other
+-- edge.  In-degree counts EVERY edge, so what is a hub does not depend on what was already dropped.
+drop view if exists graph_hub;
+create view graph_hub as
+select t as n from graph_edge
+group by t
+having count(*) > (select cast(value as integer) from meta where key = 'hub_deg');
+
+-- One row per `user_name`: a name declared in two modules is one node, and the edges of both meet
+-- on it.  `row_number` rather than `group by`, which would let sqlite pick an arbitrary row.
+drop view if exists graph_node;
+create view graph_node as
+select n, k, s, l, t from (
+  select i.user_name as n, i.kind as k, m.source as s,
+         coalesce(r.sl1 + 1, 0) as l, i.stmt as t,
+         row_number() over (partition by i.user_name
+                            order by m.source, coalesce(r.sl1 + 1, 0)) as rn
+  from decl_info i
+  join module m on m.name = i.module
+  left join decl_range r on r.name = i.name and r.module = i.module
+  where i.internal = 0 and i.user_name not in (select n from graph_hub)
+)
+where rn = 1
+order by s, l;
+"
+
 /-- True when the database already carries `schemaVersion` in `meta`.
     Any failure (missing file, missing `meta` table, corrupt db) means not current. -/
 private def schemaCurrent (dbPath : String) : IO Bool := do
@@ -193,14 +253,15 @@ private def schemaCurrent (dbPath : String) : IO Bool := do
     Returns `true` when the schema was (re)created, `false` when the existing database was already current.
     Recreating means: delete the database file and start over — this is a derived cache, never a source of truth. -/
 public def ensureSchema (dbPath : String) : IO Bool := do
-  if (← schemaCurrent dbPath) then
-    return false
-  else
+  let fresh ← if ← schemaCurrent dbPath then pure false else do
     try IO.FS.removeFile dbPath catch _ => pure ()
     exec dbPath schemaSql
     exec dbPath "pragma journal_mode = wal;"
     exec dbPath s!"insert into meta (key, value) values ('schema_version', '{schemaVersion}');"
-    return true
+    pure true
+  -- Unconditional: the views are code, and a changed definition has to reach an existing database.
+  exec dbPath viewSql
+  return fresh
 
 /-- Bulk-load ASCII-separated `records` into `table`, in one transaction.
     An empty `records` array is a no-op that must not spawn sqlite3.

@@ -2,6 +2,7 @@ module
 
 import Lean
 public import LeanRefactor.Db
+import LeanRefactor.Elaborate
 
 open Lean
 
@@ -134,16 +135,12 @@ private partial def sigs (stx : Syntax) : Array Sig :=
     and reached 18.3 GB on this repository before the OOM killer chose a different victim. -/
 public def ofFile (path moduleName : String) : IO Rows := do
   let source ← IO.FS.readFile path
-  let inputCtx := Parser.mkInputContext source path
-  let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
-  if headerMessages.hasErrors then
-    throw <| IO.userError s!"{path}: cannot parse the import header"
   initSearchPath (← findSysroot)
-  let (env, headerMessages) ← Elab.processHeader header {} headerMessages inputCtx
-    (mainModule := moduleName.toName)
-  if headerMessages.hasErrors then
-    throw <| IO.userError s!"{path}: cannot import {moduleName}'s dependencies"
-  let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
+  let (inputCtx, _, frontend) ← match ← Elaborate.frontendOf path source moduleName.toName with
+    | .ok result => pure result
+    | .error e => throw <| IO.userError <|
+        if e.parsed then s!"{path}: cannot import {moduleName}'s dependencies"
+        else s!"{path}: cannot parse the import header"
   -- Elaboration errors are NOT fatal here. The tree is what the parser produced, and a file that
   -- fails to elaborate is exactly the file a refactor is about to be pointed at.
   -- The name position is in the 0-based UTF-16 coordinates `.ilean` records, because `decl_range`

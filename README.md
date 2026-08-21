@@ -372,8 +372,8 @@ the like are named by nearly everything, so drawn they bury every other edge. Th
 it dropped.
 
 Three optional scripts add visual structure, each writing a TSV the page picks up beside itself on
-the next run. They read the same index, and share the node and edge selection with the page through
-`scripts/graphdb.py`, so all four draw the same graph:
+the next run. The node and edge selection is not theirs and not the page's either: it is two views
+in the index, `graph_node` and `graph_edge`, which all four read, so all four draw the same graph:
 
 ```sh
 scripts/svd-layout   # a reproducible layout seed, instead of a random one (numpy, scipy)
