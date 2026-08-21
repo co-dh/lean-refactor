@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__REPO__ dependency graph</title>
+<style>
+  :root {
+    --bg:#14161b; --panel:rgba(24,27,34,.94); --line:#2c313d; --fg:#d7dce5; --dim:#8a93a6; --accent:#ffcc44;
+    --thm:#4a9eff; --def:#46c46a; --instance:#b47cff; --ind:#ff9d3a; --axiom:#ff5c66; --opaque:#7a8494;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); overflow:hidden;
+    font:13px/1.45 ui-monospace,"SF Mono",Menlo,Consolas,monospace; }
+  #graph { position:absolute; inset:0; }
+  .float { position:absolute; background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    backdrop-filter:blur(6px); box-shadow:0 6px 24px rgba(0,0,0,.45); }
+  /* top-left: title + search */
+  #tl { left:12px; top:12px; width:300px; padding:10px; z-index:6; }
+  #tl h1 { margin:0 0 8px; font-size:13px; color:var(--accent); font-weight:600; letter-spacing:.3px; }
+  #search { width:100%; padding:6px 8px; background:#232733; color:var(--fg); border:1px solid var(--line);
+    border-radius:5px; font:inherit; }
+  #search:focus { outline:none; border-color:var(--accent); }
+  #results { margin-top:6px; max-height:46vh; overflow-y:auto; }
+  .row { padding:5px 7px; border-radius:5px; cursor:pointer; border:1px solid transparent; }
+  .row:hover,.row.on { background:#232733; border-color:var(--accent); }
+  .row .nm { word-break:break-all; }
+  .row .meta { color:var(--dim); font-size:11px; margin-top:1px; }
+  .kindtag { display:inline-block; padding:0 5px; border-radius:3px; font-size:10px; color:#10131a;
+    font-weight:700; vertical-align:middle; }
+  #metahint { margin-top:8px; color:var(--dim); font-size:12px; }
+  #metahint b { color:var(--fg); font-weight:600; }
+  #hubnote { margin-top:8px; color:var(--dim); font-size:11px; }
+  /* top-right: controls */
+  #tr { right:12px; top:12px; padding:8px 10px; z-index:6; color:var(--dim); display:flex; gap:12px; align-items:center; }
+  #tr select,#tr button { background:#232733; color:var(--fg); border:1px solid var(--line); border-radius:5px;
+    padding:3px 7px; font:inherit; cursor:pointer; }
+  #tr label { display:inline-flex; align-items:center; gap:3px; cursor:pointer; }
+  #tr .stat { font-size:12px; }
+  /* top-left: per-directory filters */
+  #dirs { margin:8px 0 2px; display:flex; flex-direction:column; gap:5px; }
+  .dirrow { display:flex; flex-wrap:wrap; gap:3px 6px; align-items:center; }
+  .dirrow label { display:inline-flex; align-items:center; gap:2px; font-size:11px; color:var(--dim); cursor:pointer; }
+  .dirrow label.master { color:var(--fg); font-weight:600; }
+  .dirrow input { margin:0; cursor:pointer; }
+  /* bottom-left: legend (click to toggle) */
+  #legend { left:12px; bottom:12px; padding:7px 10px; z-index:6; display:flex; gap:10px; flex-wrap:wrap; font-size:11px; }
+  #legend span { display:inline-flex; align-items:center; gap:5px; cursor:pointer; user-select:none; opacity:1; }
+  #legend span.off { opacity:.35; text-decoration:line-through; }
+  .dot { width:9px; height:9px; border-radius:50%; display:inline-block; }
+  /* right: detail */
+  #detail { right:12px; top:66px; bottom:12px; width:400px; padding:14px; overflow-y:auto; z-index:7; display:none; }
+  #detail.show { display:block; }
+  #detail h2 { font-size:14px; margin:0 6px 4px 0; word-break:break-all; }
+  #detail .sub { color:var(--dim); font-size:12px; margin-bottom:10px; }
+  #detail .sub a { color:var(--thm); cursor:pointer; }
+  #detail pre { background:#232733; border:1px solid var(--line); border-radius:5px; padding:8px;
+    white-space:pre-wrap; word-break:break-word; font-size:12px; color:#c7cede; margin:0 0 12px; }
+  #detail .doc { margin-bottom:12px; }
+  #detail h3 { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.5px;
+    margin:14px 0 5px; border-top:1px solid var(--line); padding-top:10px; }
+  #detail .link { padding:3px 6px; border-radius:4px; cursor:pointer; word-break:break-all; }
+  #detail .link:hover { background:#232733; }
+  #close { float:right; cursor:pointer; color:var(--dim); font-size:18px; line-height:1; }
+  #close:hover { color:var(--fg); }
+  /* drill breadcrumb (shown when a group has been drilled into) */
+  #crumb { left:12px; top:12px; padding:7px 11px; z-index:8; display:none; align-items:center; gap:9px; }
+  #crumb.show { display:flex; }
+  #crumb b { color:var(--accent); font-weight:600; }
+  #crumb button { background:#232733; color:var(--fg); border:1px solid var(--line); border-radius:5px;
+    padding:3px 9px; font:inherit; cursor:pointer; }
+  /* tooltip */
+  #tip { position:absolute; pointer-events:none; max-width:340px; z-index:9; padding:7px 9px;
+    background:rgba(10,12,16,.97); border:1px solid var(--line); border-radius:6px; display:none;
+    box-shadow:0 4px 18px rgba(0,0,0,.5); }
+  #tip .nm { word-break:break-all; margin-bottom:3px; }
+  #tip .doc { color:var(--dim); font-size:12px; }
+  /* center overlay */
+  #overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; z-index:20;
+    background:rgba(20,22,27,.7); text-align:center; padding:40px; }
+  #overlay .box { max-width:560px; }
+  #overlay.err { color:var(--axiom); }
+  #overlay code { color:var(--fg); }
+  .hidden { display:none !important; }
+  /* in the group-overview (meta) levels, hide the declaration-only controls */
+  body.meta #search, body.meta #dirs, body.meta #results, body.meta #legend,
+  body.meta #detail, body.meta .decl-only { display:none !important; }
+  body:not(.meta) #metahint { display:none; }
+</style>
+</head>
+<body>
+<div id="graph"></div>
+
+<div id="tl" class="float">
+  <h1>◆ __REPO__ dependency graph</h1>
+  <input id="search" placeholder="search name / statement…  (↑↓ enter)">
+  <div id="metahint">Each dot is a <b>group</b> of declarations, sized by count, coloured by directory.
+    Hover for its top directories; <b>click a group to drill in</b>.</div>
+  <div id="hubnote"></div>
+  <div id="dirs"></div>
+  <div id="results"></div>
+</div>
+
+<div id="crumb" class="float">
+  <span>drilled into <b id="crumbname"></b></span>
+  <button id="crumbback">▲ overview</button>
+</div>
+
+<div id="tr" class="float">
+  <label>view
+    <select id="view">
+      <option value="concept" selected>concepts</option>
+      <option value="community">communities</option>
+      <option value="dir">directories</option>
+      <option value="decl">declarations</option>
+    </select>
+  </label>
+  <label class="decl-only">edges
+    <select id="edgemode">
+      <option value="all" selected>all</option>
+      <option value="hover">on hover</option>
+      <option value="none">none</option>
+    </select>
+  </label>
+  <label class="decl-only" title="click a node to isolate it and everything it (transitively) depends on / is depended on by">focus
+    <select id="focus">
+      <option value="off" selected>off</option>
+      <option value="deps">dependencies</option>
+      <option value="dependents">dependents</option>
+    </select>
+  </label>
+  <button id="relayout" title="re-run force layout on the currently-visible nodes">re-run layout</button>
+  <span class="stat" id="stat">loading…</span>
+</div>
+
+<div id="legend" class="float">
+  <span data-kind="thm"><i class="dot" style="background:var(--thm)"></i>thm</span>
+  <span data-kind="def"><i class="dot" style="background:var(--def)"></i>def</span>
+  <span data-kind="ind"><i class="dot" style="background:var(--ind)"></i>ind</span>
+  <span data-kind="axiom"><i class="dot" style="background:var(--axiom)"></i>axiom</span>
+  <span data-kind="opaque"><i class="dot" style="background:var(--opaque)"></i>opaque</span>
+</div>
+
+<div id="detail" class="float"></div>
+<div id="tip"></div>
+<div id="overlay"><div class="box" id="ovbox">building graph…</div></div>
+
+<script type="module">
+import Graph from "https://cdn.jsdelivr.net/npm/graphology@0.25/+esm";
+import Sigma from "https://cdn.jsdelivr.net/npm/sigma@3/+esm";
+import forceAtlas2 from "https://cdn.jsdelivr.net/npm/graphology-layout-forceatlas2@0.10/+esm";
+
+// Written by `lean-refactor graph` straight out of the index; nothing here is fetched.
+// decls = [name, kind, source, line, statement]; deps = source/target node INDICES, two per edge.
+const D = __GRAPH_DATA__;
+
+const KIND = { thm:'#4a9eff', def:'#46c46a', instance:'#b47cff', ind:'#ff9d3a', axiom:'#ff5c66', opaque:'#7a8494' };
+// A declaration's group is the DIRECTORY it is written in — the one bucketing that means something
+// in any repository. Files at the repository root share the '(root)' group.
+const dirOf = f => { const i = f.lastIndexOf('/'); return i < 0 ? '(root)' : f.slice(0, i); };
+const DIRS = [...new Set(D.decls.map(r => dirOf(r[2])))].sort();
+// Evenly spaced hues at s=.62 l=.58, in sorted order, so every repository gets distinct and stable
+// group colours.  Emitted as `#rrggbb` because that is what sigma parses, not every CSS colour form.
+const hueColor = h => {
+  const a = 0.62 * Math.min(0.58, 0.42);
+  const part = n => { const k = (n + h/30) % 12;
+    return Math.round(255 * (0.58 - a * Math.max(-1, Math.min(k-3, 9-k, 1)))).toString(16).padStart(2,'0'); };
+  return '#' + part(0) + part(8) + part(4);
+};
+const DIRCOL = new Map(DIRS.map((d,i) => [d, hueColor(360*i/DIRS.length)]));
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const kindTag = k => `<span class="kindtag" style="background:${KIND[k]||'#7a8494'}">${k||'?'}</span>`;
+const overlay = $('#overlay'), ovbox = $('#ovbox');
+function fail(msg){ overlay.classList.add('err'); ovbox.innerHTML = msg; }
+
+const decl = new Map();               // name -> {kind,file,line,type,dir}
+const pos  = new Map();               // name -> {x,y}  (SVD seed positions)
+const commOf = new Map();             // name -> community id (Louvain, scripts/community)
+const conceptOf = new Map();          // name -> concept subject (scripts/concept)
+let graph, meta, sigma;               // graph=declaration graph, meta=group overview graph, sigma=mounted renderer
+let view = 'concept';                 // 'concept' | 'community' | 'dir' | 'decl'
+let drillFrom = 'concept';            // the overview level a drill started from (where "▲ overview" returns)
+let metaMembers = new Map();          // gid -> {names,count,dirTop,label,topDirs}
+let declLaidOut = false;              // lazily run the (expensive) whole-repository layout only when first shown
+
+async function main(){
+  if (!D.decls.length)
+    return fail(`the index holds no declarations — build it with <code>lean-refactor index --full</code>, `
+      + `then run <code>lean-refactor graph</code> again.`);
+  // Optional extras, each produced by one script next to this page and inlined when it was there:
+  // scripts/svd-layout (seed positions), scripts/community (Louvain), scripts/concept (subjects).
+  for (const p of D.pos)     pos.set(p[0], { x:+p[1], y:+p[2] });
+  for (const c of D.comm)    commOf.set(c[0], c[1]);
+  for (const c of D.concept) conceptOf.set(c[0], c[1]);
+  const names = D.decls.map(r => r[0]);
+  for (const r of D.decls)
+    decl.set(r[0], { kind:r[1], file:r[2], line:r[3], type:r[4]||'', dir:dirOf(r[2]) });
+  if (D.hubs)
+    $('#hubnote').innerHTML = `${D.hubs} hub declaration${D.hubs>1?'s':''} (in-degree &gt; ${D.hubDeg}) `
+      + `left out: named by everything, they bury every other edge.`;
+  disableEmpty('concept', conceptOf, 'scripts/concept');
+  disableEmpty('community', commOf, 'scripts/community');
+  $('#view').value = view; drillFrom = view;
+
+  // ---- build the declaration graph (nodes + edges), seeded from SVD positions ----
+  ovbox.textContent = 'building graph…'; await frame();
+  graph = new Graph({ type:'directed', multi:false, allowSelfLoops:false });
+  const indeg = new Map();
+  for (let i=1; i<D.deps.length; i+=2){ const t=names[D.deps[i]]; indeg.set(t, (indeg.get(t)||0)+1); }
+  for (const [name,d] of decl){
+    const p = pos.get(name);
+    graph.addNode(name, {
+      x: p ? p.x : Math.random()*1000, y: p ? p.y : Math.random()*1000,
+      size: 2 + Math.min(13, Math.sqrt(indeg.get(name)||0)*0.9),
+      color: KIND[d.kind] || '#7a8494',
+      label: name.split('.').slice(-2).join('.'),
+    });
+  }
+  for (let i=0; i<D.deps.length; i+=2){
+    const s=names[D.deps[i]], t=names[D.deps[i+1]];
+    if (!graph.hasDirectedEdge(s,t)) graph.addDirectedEdge(s,t);
+  }
+
+  wireGlobal();
+  // ---- show the default level (group overview) ----
+  if (view==='decl'){ mount('decl'); runLayout(); declLaidOut=true; }
+  else { buildMeta(view); mount('meta'); layoutMeta(); }
+}
+/* an overview level with no data says which script would produce it, rather than silently vanishing */
+function disableEmpty(level, map, script){
+  if (map.size) return;
+  const opt = $(`#view option[value="${level}"]`);
+  opt.disabled = true; opt.textContent += ` — run ${script}`;
+  if (view===level) view = level==='concept' ? 'community' : 'dir';
+}
+
+/* ---------- mount: (re)create the Sigma renderer bound to the declaration or the group graph ---------- */
+function mount(mode){
+  if (sigma) sigma.kill();
+  const g = mode==='decl' ? graph : meta;
+  sigma = new Sigma(g, $('#graph'), {
+    defaultEdgeColor:'#262b36', defaultEdgeType:'line',
+    labelColor:{ color:'#cfd6e2' }, labelFont:'ui-monospace, monospace',
+    labelSize: mode==='decl' ? 11 : 13,
+    labelRenderedSizeThreshold: mode==='decl' ? 9 : 0.01,   // meta: always label the few groups
+    labelDensity:0.6, zIndex:true,
+    nodeReducer: mode==='decl' ? nodeReducer : metaNodeReducer,
+    edgeReducer: mode==='decl' ? edgeReducer : metaEdgeReducer,
+  });
+  document.body.classList.toggle('meta', mode!=='decl');
+  mode==='decl' ? wireDeclSigma() : wireMetaSigma();
+}
+
+/* ---------- switch level via the top-right dropdown ---------- */
+function switchView(v){
+  view = v; selected=null; active=null; $('#tip').style.display='none';
+  $('#crumb').classList.remove('show'); closeDetail();
+  if (v==='decl'){
+    focusSet=null;
+    mount('decl');
+    if (!declLaidOut){ runLayout(); declLaidOut=true; }
+    else { sigma.setCustomBBox(null); sigma.refresh(); resetCam(); }
+  } else {
+    focusSet=null; buildMeta(v); mount('meta'); layoutMeta();
+  }
+}
+
+/* ---------- build the group overview graph (one super-node per community, concept or directory) ---------- */
+function buildMeta(level){
+  const groupOf = level==='community' ? (n=> commOf.get(n))
+                : level==='concept'   ? (n=> conceptOf.get(n))
+                : (n=> decl.get(n).dir);
+  metaMembers = new Map();
+  for (const n of decl.keys()){
+    const gid = groupOf(n); if(gid==null || gid==='') continue;
+    let e = metaMembers.get(gid);
+    if(!e){ e={ names:[], dirs:new Map() }; metaMembers.set(gid,e); }
+    e.names.push(n);
+    const dir = decl.get(n).dir; e.dirs.set(dir,(e.dirs.get(dir)||0)+1);
+  }
+  meta = new Graph({ type:'directed', multi:false, allowSelfLoops:false });
+  // deterministic circle seed (by index): force layout then pulls connected groups inward and leaves
+  // peripheral ones spread around the ring — avoids the SVD-mean seed piling low-degree groups in a corner.
+  let ci=0; const nG=metaMembers.size;
+  for (const [gid,e] of metaMembers){
+    e.count = e.names.length;
+    const topDirs = [...e.dirs].sort((a,b)=> b[1]-a[1]);
+    e.topDirs = topDirs.slice(0,4); e.dirTop = topDirs[0][0];
+    e.label = level==='dir'     ? gid
+            : level==='concept' ? gid.split('.').slice(-1)[0]        // "Alg.Allegory" -> "Allegory"
+            : topDirs[0][0] + (topDirs.length>1 ? ` +${topDirs.length-1}` : '');
+    const ang = 2*Math.PI*ci/nG; ci++;
+    meta.addNode(gid, {
+      x: Math.cos(ang)*400, y: Math.sin(ang)*400,
+      size: 3 + Math.sqrt(e.count)*1.7, color: DIRCOL.get(e.dirTop)||'#7a8494', label: e.label,
+    });
+  }
+  // gs -> gt -> count, nested rather than a joined key: a group id is a directory or a dotted name,
+  // and any separator character picked to join them could occur inside one.
+  const w = new Map();
+  graph.forEachEdge((ed,a,s,t)=>{
+    const gs=groupOf(s), gt=groupOf(t);
+    if(gs==null||gt==null||gs===''||gt===''||gs===gt) return;
+    let m=w.get(gs); if(!m){ m=new Map(); w.set(gs,m); }
+    m.set(gt,(m.get(gt)||0)+1);
+  });
+  for (const [gs,m] of w) for (const [gt,c] of m){
+    if(meta.hasNode(gs)&&meta.hasNode(gt)&&!meta.hasDirectedEdge(gs,gt))
+      meta.addDirectedEdge(gs,gt,{ size:0.4+Math.log2(1+c), weight:c }); }
+  $('#stat').textContent = `${meta.order} ${({concept:'concepts',community:'communities',dir:'directories'})[level]} · ${meta.size.toLocaleString()} links`;
+}
+function layoutMeta(){
+  overlay.classList.remove('hidden'); ovbox.textContent='arranging groups…';
+  // Exact force with adjustSizes:true treats nodes as discs and forbids overlap, so densely-tied
+  // small communities spread by radius instead of collapsing into a knot — but it is quadratic per
+  // iteration, and past a couple of hundred groups only Barnes-Hut finishes.
+  const many = meta.order > 200;
+  const settings = Object.assign(forceAtlas2.inferSettings(meta),
+    { barnesHutOptimize:many, gravity:1.1, scalingRatio:16, slowDown:3, adjustSizes:!many });
+  forceAtlas2.assign(meta, { iterations:600, settings });
+  sigma.setCustomBBox(null); sigma.refresh(); resetCam();
+  overlay.classList.add('hidden');
+}
+
+/* ---------- drill: from a group super-node into the declarations it contains + their direct neighbours ---------- */
+function drill(gid){
+  const e = metaMembers.get(gid); if(!e) return;
+  drillFrom = view; view='decl'; $('#view').value='decl';
+  const set = new Set(e.names);                                // members + 1-hop dependency context
+  for (const n of e.names){ for(const x of graph.outNeighbors(n)) set.add(x); for(const x of graph.inNeighbors(n)) set.add(x); }
+  focusSet = set; selected=null; active=null;
+  mount('decl');                                              // focusSet overrides directory/kind filters in the reducers
+  runLayout();                                               // lay out just this subset and frame it
+  declLaidOut = true;
+  $('#crumbname').textContent = `${e.label} — ${e.count} decls (+context)`;
+  $('#crumb').classList.add('show');
+}
+
+/* ---------- declaration-level reducers (hover/select highlight + kind/directory filter) ---------- */
+let active=null, neigh=new Set(), selected=null, hiddenKinds=new Set(), hiddenDirs=new Set();
+// focus mode: when non-null, ONLY nodes in this set are shown (a node's dependency cone, or a drilled group).
+// While focused we ignore the kind/directory filters so the cone is shown in full.
+let focusSet=null;
+function nodeReducer(node, data){
+  const res = Object.assign({}, data);
+  if (focusSet){ if(!focusSet.has(node)){ res.hidden=true; return res; } }
+  else { const dd = decl.get(node); if (hiddenKinds.has(dd?.kind) || hiddenDirs.has(dd?.dir)){ res.hidden=true; return res; } }
+  if (node===active){ res.zIndex=3; res.forceLabel=true; res.size=data.size*1.6; }
+  else if (active && neigh.has(node)){ res.zIndex=2; res.forceLabel=true; }
+  if (node===selected){ res.zIndex=3; res.forceLabel=true; }
+  return res;
+}
+function edgeReducer(edge, data){
+  const res = Object.assign({}, data);
+  const ex = graph.extremities(edge), s=ex[0], t=ex[1];
+  if (focusSet){ if(!focusSet.has(s)||!focusSet.has(t)){ res.hidden=true; return res; } }
+  else { const ds=decl.get(s), dt=decl.get(t);
+    if (hiddenKinds.has(ds?.kind)||hiddenKinds.has(dt?.kind)||hiddenDirs.has(ds?.dir)||hiddenDirs.has(dt?.dir)){ res.hidden=true; return res; } }
+  const mode = $('#edgemode').value;
+  const inc = active && (s===active || t===active);
+  if (mode==='none'){ res.hidden = !inc; }
+  else if (mode==='hover'){ res.hidden = !inc; }
+  else { if (active && inc){ res.color='#ffcc44'; res.zIndex=1; } }
+  return res;
+}
+/* ---------- group-level reducers ---------- */
+function metaNodeReducer(node, data){
+  const res = Object.assign({}, data); res.forceLabel=true;
+  if (node===active){ res.size=data.size*1.35; res.zIndex=3; }
+  else if (active && neigh.has(node)){ res.zIndex=2; }
+  else if (active){ res.color='#3a4150'; res.label=''; }        // dim non-neighbours while hovering
+  return res;
+}
+function metaEdgeReducer(edge, data){
+  const res = Object.assign({}, data);
+  const ex = meta.extremities(edge), s=ex[0], t=ex[1];
+  const inc = active && (s===active || t===active);
+  if (active && !inc){ res.hidden=true; }                       // on hover, show only the hovered group's links
+  else if (inc){ res.color='#ffcc44'; res.zIndex=1; }
+  return res;
+}
+
+/* ---------- events: global controls wired once; per-mode sigma handlers on each mount ---------- */
+function wireGlobal(){
+  $('#view').addEventListener('change', ()=> switchView($('#view').value));
+  $('#edgemode').addEventListener('change', ()=> sigma.refresh());
+  $('#focus').addEventListener('change', ()=>{ const v=$('#focus').value;
+    if(v==='off'){ if(focusSet) clearFocus(); } else if(selected) setFocus(selected, v==='deps'?'out':'in'); });
+  $('#relayout').addEventListener('click', ()=> view==='decl' ? runLayout() : layoutMeta());
+  $('#crumbback').addEventListener('click', ()=>{ $('#view').value = drillFrom; switchView(drillFrom); });
+  document.querySelectorAll('#legend span').forEach(el=> el.addEventListener('click', ()=>{
+    const k=el.dataset.kind; if(hiddenKinds.has(k)){hiddenKinds.delete(k);el.classList.remove('off');}
+    else {hiddenKinds.add(k);el.classList.add('off');} sigma.setCustomBBox(null); sigma.refresh();
+  }));
+  buildDirs();
+  addEventListener('keydown', e=>{ if(e.key==='Escape'){ selected=null; closeDetail(); focusSet ? clearFocus() : sigma.refresh(); } });
+}
+function wireDeclSigma(){
+  sigma.on('enterNode', ({node})=> setActive(node, true));
+  sigma.on('leaveNode', ()=> setActive(null));
+  sigma.on('clickNode', ({node})=>{
+    const v=$('#focus').value;
+    if(v!=='off') setFocus(node, v==='deps'?'out':'in');
+    openDetail(node);
+  });
+  sigma.on('clickStage', ()=>{ selected=null; closeDetail(); focusSet ? clearFocus() : sigma.refresh(); });
+}
+function wireMetaSigma(){
+  sigma.on('enterNode', ({node})=>{ active=node;
+    neigh=new Set([...meta.inNeighbors(node), ...meta.outNeighbors(node)]); sigma.refresh(); metaTip(node); });
+  sigma.on('leaveNode', ()=>{ active=null; neigh=new Set(); $('#tip').style.display='none'; sigma.refresh(); });
+  sigma.on('clickNode', ({node})=> drill(node));
+  sigma.on('clickStage', ()=>{ active=null; $('#tip').style.display='none'; sigma.refresh(); });
+}
+function metaTip(node){
+  const e=metaMembers.get(node), t=$('#tip'), p=sigma.graphToViewport(meta.getNodeAttributes(node));
+  t.style.display='block'; t.style.left=Math.min(p.x+14, innerWidth-350)+'px'; t.style.top=(p.y+14)+'px';
+  t.innerHTML=`<div class="nm"><b>${esc(e.label)}</b> — ${e.count} declarations</div>`
+    + `<div class="doc">directories: ${e.topDirs.map(([s,c])=>`${esc(s)} (${c})`).join(', ')}</div>`
+    + `<div class="doc" style="opacity:.7;margin-top:3px">click to drill in →</div>`;
+}
+
+/* ---------- per-directory filters (one checkbox per directory, built from the data) ---------- */
+function buildDirs(){
+  $('#dirs').innerHTML = `<div class="dirrow"><label class="master" title="toggle every directory">`
+    + `<input type="checkbox" checked>all</label>`
+    + DIRS.map(d=>`<label title="${esc(d)}"><input type="checkbox" class="dirbox" value="${esc(d)}" checked>${esc(d)}</label>`).join('')
+    + `</div>`;
+  $('#dirs').querySelectorAll('.dirbox').forEach(cb=> cb.addEventListener('change', ()=>{
+    cb.checked ? hiddenDirs.delete(cb.value) : hiddenDirs.add(cb.value);
+    syncMasters(); sigma.setCustomBBox(null); sigma.refresh();
+  }));
+  $('#dirs').querySelectorAll('.master input').forEach(cb=> cb.addEventListener('change', ()=>{
+    cb.closest('.dirrow').querySelectorAll('.dirbox').forEach(x=>{
+      x.checked=cb.checked; x.checked ? hiddenDirs.delete(x.value) : hiddenDirs.add(x.value);
+    });
+    cb.indeterminate=false; sigma.setCustomBBox(null); sigma.refresh();
+  }));
+}
+function syncMasters(){
+  document.querySelectorAll('#dirs .dirrow').forEach(row=>{
+    const boxes=[...row.querySelectorAll('.dirbox')], on=boxes.filter(b=>b.checked).length;
+    const m=row.querySelector('.master input');
+    m.checked = on>0; m.indeterminate = on>0 && on<boxes.length;
+  });
+}
+function setActive(node, tip){
+  active = node;
+  neigh = node ? new Set([...graph.inNeighbors(node), ...graph.outNeighbors(node)]) : new Set();
+  sigma.refresh();
+  const t=$('#tip');
+  if (node && tip){
+    const d=decl.get(node), p=sigma.graphToViewport(graph.getNodeAttributes(node));
+    t.style.display='block';
+    t.style.left=Math.min(p.x+14, innerWidth-350)+'px'; t.style.top=(p.y+14)+'px';
+    t.innerHTML=`<div class="nm">${kindTag(d.kind)} ${esc(node)}</div>`
+      + (d.type?`<div class="doc" style="opacity:.6">${esc(d.type.slice(0,140))}</div>`
+        : `<div class="doc" style="opacity:.5">no statement</div>`);
+  } else t.style.display='none';
+}
+
+/* ---------- detail panel ---------- */
+function openDetail(name){
+  const d = decl.get(name); if(!d) return;
+  selected = name;
+  const uses = graph.outNeighbors(name).filter(n=>decl.has(n));
+  const usedBy = graph.inNeighbors(name);
+  const el = $('#detail'); el.classList.add('show');
+  el.innerHTML = `<span id="close">×</span>`
+    + `<h2>${esc(name)}</h2>`
+    + `<div class="sub">${kindTag(d.kind)} &nbsp;<a id="loc">${esc(d.file)}:${d.line}</a></div>`
+    + (d.type?`<pre>${esc(d.type)}</pre>`:'')
+    + `<h3>uses (${uses.length})</h3>` + linkList(uses)
+    + `<h3>used by (${usedBy.length})</h3>` + linkList(usedBy.slice(0,200))
+    + (usedBy.length>200?`<div class="sub">… ${usedBy.length-200} more</div>`:'');
+  $('#close').onclick = closeDetail;
+  $('#loc').onclick = e=>{ navigator.clipboard?.writeText(`${d.file}:${d.line}`); e.target.textContent=`${d.file}:${d.line}  (copied)`; };
+  el.querySelectorAll('[data-name]').forEach(a=> a.onclick=()=> focusNode(a.dataset.name));
+  sigma.refresh();
+}
+function closeDetail(){ $('#detail').classList.remove('show'); }
+function linkList(arr){
+  if(!arr.length) return '<div class="sub" style="opacity:.5">none</div>';
+  return arr.map(n=>{ const d=decl.get(n)||{}; return `<div class="link" data-name="${esc(n)}">${kindTag(d.kind)} ${esc(n)}</div>`; }).join('');
+}
+function focusNode(name){
+  if(view!=='decl'){ switchView('decl'); }        // a link click from a group tooltip jumps to the decl level
+  if(!graph.hasNode(name)) return;
+  const d = decl.get(name);
+  if(focusSet){ focusSet=null; $('#crumb').classList.remove('show'); statCount(); }
+  if(d && hiddenDirs.has(d.dir)){
+    hiddenDirs.delete(d.dir);
+    const cb=document.querySelector(`#dirs .dirbox[value="${d.dir}"]`);
+    if(cb) cb.checked=true;
+    syncMasters();
+  }
+  sigma.setCustomBBox(null);
+  openDetail(name);
+  const p = sigma.getNodeDisplayData(name);
+  if(p) sigma.getCamera().setState({ x:p.x, y:p.y, ratio:0.15, angle:0 });   // animate() is a no-op here; setState works
+}
+
+/* ---------- search (declaration level) ---------- */
+const search=$('#search'), results=$('#results'); let curList=[], curSel=-1;
+function runSearch(){
+  const q=search.value.trim().toLowerCase(); const out=[];
+  if(q){ for(const [n,d] of decl){
+      if(n.toLowerCase().includes(q)||d.type.toLowerCase().includes(q)){
+        out.push([ n.toLowerCase().startsWith(q)?0 : n.toLowerCase().includes(q)?1:2, n, d ]);
+        if(out.length>400) break;
+      } }
+    out.sort((a,b)=> a[0]-b[0] || a[1].length-b[1].length);
+  }
+  curList=out.slice(0,60); curSel=-1;
+  results.innerHTML = curList.map(([,n,d],i)=>
+    `<div class="row" data-i="${i}" data-name="${esc(n)}"><div class="nm">${kindTag(d.kind)} ${esc(n)}</div>`
+    + (d.type?`<div class="meta">${esc(d.type.slice(0,80))}</div>`:'')+`</div>`).join('');
+  results.querySelectorAll('.row').forEach(el=> el.onclick=()=> focusNode(el.dataset.name));
+}
+search.addEventListener('input', runSearch);
+search.addEventListener('keydown', e=>{
+  if(e.key==='ArrowDown'||e.key==='ArrowUp'){ e.preventDefault(); curSel+= e.key==='ArrowDown'?1:-1;
+    curSel=Math.max(0,Math.min(curList.length-1,curSel));
+    results.querySelectorAll('.row').forEach((el,i)=> el.classList.toggle('on', i===curSel));
+    const el=results.querySelector(`[data-i="${curSel}"]`); if(el) el.scrollIntoView({block:'nearest'});
+  } else if(e.key==='Enter' && curList.length){ focusNode(curList[Math.max(0,curSel)][1]); }
+});
+
+/* ---------- layout (chunked ForceAtlas2 over the currently-visible declaration nodes) ---------- */
+let layoutRunning=false;
+function isVisible(n){ if(focusSet) return focusSet.has(n);
+  const d=decl.get(n); return !(hiddenKinds.has(d?.kind)||hiddenDirs.has(d?.dir)); }
+// This Sigma build's animated camera methods (animate / animatedReset) are no-ops here — only
+// setState actually moves the camera — so all camera moves go through setState.
+function resetCam(){ sigma.getCamera().setState({ x:0.5, y:0.5, ratio:1, angle:0 }); }
+function statCount(){ $('#stat').textContent = `${graph.order.toLocaleString()} nodes · ${graph.size.toLocaleString()} edges`; }
+function frameVisible(nodes){
+  let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+  for(const n of nodes){ const a=graph.getNodeAttributes(n);
+    if(a.x<x0)x0=a.x; if(a.x>x1)x1=a.x; if(a.y<y0)y0=a.y; if(a.y>y1)y1=a.y; }
+  if(x0<=x1){ const px=((x1-x0)||2)*0.06, py=((y1-y0)||2)*0.06;
+    sigma.setCustomBBox({ x:[x0-px,x1+px], y:[y0-py,y1+py] }); }
+  sigma.refresh(); resetCam();
+}
+function closure(start, dir){
+  const seen=new Set([start]), stack=[start];
+  while(stack.length){ const n=stack.pop();
+    for(const m of (dir==='out'?graph.outNeighbors(n):graph.inNeighbors(n))){
+      if(!seen.has(m)){ seen.add(m); stack.push(m); } } }
+  return seen;
+}
+function setFocus(node, dir){
+  focusSet = closure(node, dir); selected = node;
+  $('#stat').textContent = `focus: ${focusSet.size} ${dir==='out'?'deps':'dependents'} of ${node}`;
+  frameVisible(focusSet);
+}
+function clearFocus(){
+  focusSet=null; $('#crumb').classList.remove('show'); sigma.setCustomBBox(null); sigma.refresh(); resetCam(); statCount();
+}
+function runLayout(){
+  if(layoutRunning) return; layoutRunning=true;
+  sigma.setCustomBBox(null);
+  const vis=[]; graph.forEachNode(n=>{ if(isVisible(n)) vis.push(n); });
+  let target, sub=null;
+  if(vis.length===graph.order){ target=graph; }
+  else {
+    sub=new Graph({ type:'directed', multi:false, allowSelfLoops:false });
+    const set=new Set(vis);
+    for(const n of vis){ const a=graph.getNodeAttributes(n); sub.addNode(n,{ x:a.x, y:a.y, size:a.size }); }
+    graph.forEachEdge((e,ea,s,t)=>{ if(set.has(s)&&set.has(t)) sub.addEdge(s,t); });
+    target=sub;
+  }
+  const settings = Object.assign(forceAtlas2.inferSettings(target),
+    sub ? { barnesHutOptimize:true, gravity:0.8, scalingRatio:8, slowDown:3 }
+        : { barnesHutOptimize:true, gravity:1.2, slowDown:2 });
+  const TOTAL=100; let done=0;
+  overlay.classList.remove('hidden');
+  (function stepLoop(){
+    if(done>=TOTAL){
+      sigma.refresh();
+      sub ? frameVisible(vis) : resetCam();
+      overlay.classList.add('hidden'); layoutRunning=false; return;
+    }
+    const chunk=Math.min(12, TOTAL-done);
+    forceAtlas2.assign(target, { iterations:chunk, settings }); done+=chunk;
+    if(sub) sub.forEachNode((n,a)=>{ graph.setNodeAttribute(n,'x',a.x); graph.setNodeAttribute(n,'y',a.y); });
+    ovbox.textContent = `laying out ${vis.length} nodes…  ${done}/${TOTAL}`;
+    sigma.refresh();
+    requestAnimationFrame(stepLoop);
+  })();
+}
+const frame = ()=> new Promise(requestAnimationFrame);
+main();
+</script>
+</body>
+</html>

@@ -467,4 +467,52 @@ order by i, p"
         pure (i, p, n == 1)
   | _ => return #[]
 
+/-- One node of the dependency graph: what the source calls the declaration, what it is, where it
+    is written, and what it says. -/
+public structure GraphNode where
+  name : String
+  kind : String
+  source : String
+  line : Nat
+  stmt : String
+
+/-- Every declaration the source itself wrote, as graph nodes.  `user_name`, because that is the
+    name a reader types and the name the edges below are mapped onto; a declaration the compiler
+    wrote has no source line to point at.  A declaration the `.ilean` does not place keeps line 0. -/
+public def graphNodes (dbPath : String) : IO (Array GraphNode) := do
+  let j ← Db.query dbPath "select i.user_name as n, i.kind as k, m.source as s,
+       coalesce(r.sl1 + 1, 0) as l, i.stmt as t
+from decl_info i
+join module m on m.name = i.module
+left join decl_range r on r.name = i.name and r.module = i.module
+where i.internal = 0
+order by m.source, l"
+  match j with
+  | .arr rows =>
+      return rows.filterMap fun row => do
+        let name ← (row.getObjValAs? String "n").toOption
+        let kind ← (row.getObjValAs? String "k").toOption
+        let source ← (row.getObjValAs? String "s").toOption
+        let line ← (row.getObjValAs? Nat "l").toOption
+        pure { name, kind, source, line, stmt := (row.getObjValAs? String "t").toOption.getD "" }
+  | _ => return #[]
+
+/-- The dependency edges under the names `graphNodes` gives its nodes.  `dep` stores the MANGLED
+    name, so both ends are joined back through `decl_info`; an end that is a compiler-written
+    declaration has no node and the join drops the row.  `src` is joined on its module too, which is
+    the module the edge was recorded in, so a name declared twice cannot multiply the row. -/
+public def graphEdges (dbPath : String) : IO (Array (String × String)) := do
+  let j ← Db.query dbPath "select distinct a.user_name as s, b.user_name as t
+from dep d
+join decl_info a on a.name = d.src and a.module = d.module and a.internal = 0
+join decl_info b on b.name = d.dst and b.internal = 0
+where a.user_name != b.user_name"
+  match j with
+  | .arr rows =>
+      return rows.filterMap fun row => do
+        let s ← (row.getObjValAs? String "s").toOption
+        let t ← (row.getObjValAs? String "t").toOption
+        pure (s, t)
+  | _ => return #[]
+
 end LeanRefactor.Query

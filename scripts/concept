@@ -1,0 +1,67 @@
+#!/usr/bin/env -S uv run --script
+"""Group each declaration under the CONCEPT it belongs to, for the 'concepts' level of the page
+`lean-refactor graph` writes.
+
+Two mechanisms, both semantic (no statistics):
+  1. Definitional: a decl folds into the longest dotted-prefix that is itself a declared name
+     (Cat.id, Cat.comp, Cat.assoc -> the structure Cat). This bundles a structure with its fields.
+  2. Subject: a standalone theorem folds into the concept it is most ABOUT = the concept among its
+     dependencies maximising (#uses) * idf(concept). The idf (specificity) weight keeps a widely
+     used concept from swallowing every theorem — a theorem attaches to its most DISTINCTIVE
+     subject instead.
+
+Thousands of decls collapse to a few hundred named concept nodes. A theorem that references no
+structure falls back to its directory. Deterministic; stdlib only. Run in the repository being
+indexed, then rebuild the page:
+  uv run <this>; lean-refactor graph
+"""
+import math
+from collections import Counter, defaultdict
+from graphdb import graph, group, OUT
+
+names, sources, edges = graph()
+N = len(names)
+nameset = set(names)
+source = dict(zip(names, sources))
+
+def parent(name):                                  # longest proper dotted-prefix that is itself a decl
+    parts = name.split('.')
+    for i in range(len(parts) - 1, 0, -1):
+        p = '.'.join(parts[:i])
+        if p in nameset: return p
+    return None
+par = {x: parent(x) for x in names}
+def root(x):
+    seen = set()
+    while par[x] is not None and x not in seen: seen.add(x); x = par[x]
+    return x
+rt = {x: root(x) for x in names}
+members = defaultdict(list)
+for x in names: members[rt[x]].append(x)
+concepts = {r for r, m in members.items() if len(m) >= 2}    # a root with pieces = a real concept
+# No hub is discarded by name here: `graphdb` has already dropped every declaration named by more
+# than HUB_INDEG others, so the ubiquitous ones cannot be a root and cannot be a subject.
+
+out = defaultdict(list); indeg = Counter()
+for a, b in edges:
+    out[names[a]].append(names[b]); indeg[names[b]] += 1
+pop = Counter()                                     # concept popularity = total in-degree of its members
+for c in concepts:
+    for m in members[c]: pop[c] += indeg[m]
+idf = {c: math.log(N / (1 + pop[c])) for c in concepts}   # the widely used get low weight
+
+def concept_of(x):
+    r = rt.get(x); return r if r in concepts else None
+subj = {}
+for x in names:
+    if rt[x] in concepts: subj[x] = rt[x]; continue
+    score = defaultdict(float)
+    for d in out[x]:
+        c = concept_of(d)
+        if c: score[c] += idf[c]
+    subj[x] = max(score, key=score.get) if score else group(source[x])   # fallback: the directory
+
+with open(OUT % 'concepts', 'w') as f:
+    for x in names:
+        f.write(f"{x}\t{subj[x]}\n")
+print(f"wrote {OUT % 'concepts'}: {N} decls -> {len({subj[x] for x in names})} concept groups")

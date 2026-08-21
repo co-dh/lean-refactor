@@ -2,6 +2,7 @@ module
 
 import Lean
 import LeanRefactor.Fork
+import LeanRefactor.Graph
 import LeanRefactor.Index
 import LeanRefactor.Query
 import LeanRefactor.SyntaxQuery
@@ -1647,6 +1648,16 @@ private def stmtReport (fragment : String) : IO UInt32 := do
     for text in stmt.splitOn "\n" do IO.println s!"  {text}"
   return 0
 
+/-- `lean-refactor graph`: the dependency graph as one page that opens from the filesystem.  The
+    graph is named after the repository it was built in, which is the directory the tool is run in —
+    the index it reads is that repository's. -/
+private def graphPage (outPath : String) : IO UInt32 := do
+  let some dbPath ← refreshedIndex? | return 1
+  let repo := (← IO.currentDir).fileName.getD "this repository"
+  let (nodes, edges, hubs) ← Graph.write dbPath outPath repo
+  IO.println s!"{outPath}: {nodes} declarations, {edges} edges, {hubs} hub(s) left out"
+  return 0
+
 /-! ## Adopting the module system
 
 `module` is opt-in per file, and adopting it takes three edits at once: the `module` keyword, every
@@ -2473,6 +2484,7 @@ private def usage : String := String.intercalate "\n" [
   row "  --same-statement" "... declarations stating the same thing, however proved",
   row "  --same-proof" "... declarations whose proof term has the same shape",
   row "inspect d" "call sites of d",
+  row "graph [out.html]" "the dependency graph as one page (default refactor-graph.html)",
   "",
   "rename",
   row "rename (old r)..." "old is a declaration, a module, a .lean file, or a notation token",
@@ -2559,6 +2571,8 @@ def main (args : List String) : IO UInt32 := do
       return 0
   | ["uses", declName] => return ← usesReport declName
   | ["stmt", fragment] => return ← stmtReport fragment
+  | ["graph"] => return ← graphPage "refactor-graph.html"
+  | ["graph", outPath] => return ← graphPage outPath
   -- 200 nodes is about a ten-line proof block: 459 groups on this repository, against 8901 at 40,
   -- where a report is mostly shapes Lean's syntax gives no other spelling.
   | ["dup"] =>

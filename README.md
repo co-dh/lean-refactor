@@ -54,6 +54,7 @@ query
     --same-statement                      ... declarations stating the same thing, however proved
     --same-proof                          ... declarations whose proof term has the same shape
   inspect d                               call sites of d
+  graph [out.html]                        the dependency graph as one page (default refactor-graph.html)
 
 rename
   rename (old r)...                       old is a declaration, a module, a .lean file, or a notation token
@@ -354,6 +355,34 @@ select dst, count(distinct module) m from dep group by dst order by m desc limit
 select m.source, count(*) n from syntax_node s join module m on m.id = s.module
  group by m.source order by n desc limit 20;
 ```
+
+## The dependency graph
+
+```sh
+lean-refactor graph                  # writes refactor-graph.html; open it directly
+```
+
+One self-contained page — the data is inlined, so there is no server to run and nothing to keep in
+step with it. It draws every declaration the source wrote and every dependency between them, grouped
+by directory, with three overview levels to drill through and a search over names and signatures.
+Declarations nothing depends on are as visible as the ones everything does.
+
+Declarations named by more than 100 others are left out with their edges: composition, equality and
+the like are named by nearly everything, so drawn they bury every other edge. The page says how many
+it dropped.
+
+Three optional scripts add visual structure, each writing a TSV the page picks up beside itself on
+the next run. They read the same index, and share the node and edge selection with the page through
+`scripts/graphdb.py`, so all four draw the same graph:
+
+```sh
+scripts/svd-layout   # a reproducible layout seed, instead of a random one (numpy, scipy)
+scripts/community    # Louvain communities, for the 'communities' level (networkx)
+scripts/concept      # groups a declaration under the concept it is about (stdlib only)
+```
+
+They are extras: the page degrades to a random seed and fewer levels without them, and nothing in
+`lake build` needs them.
 
 ## Driving it from an agent
 

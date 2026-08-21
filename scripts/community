@@ -1,0 +1,42 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["networkx"]
+# ///
+"""Louvain community detection for the 'communities' overview level of `lean-refactor graph`.
+
+k-means on the SVD embedding degenerates (one mega-blob) because a dependency structure is a smooth
+gradient, not separated clumps. Modularity-optimizing community detection works: it finds thematic
+bundles of related files that largely respect directory boundaries — the natural mid-level between
+a handful of directories and thousands of declarations, which is what the overview collapses to.
+
+The community label is derived in the viewer from each community's dominant directory. Deterministic
+(seed=0). Run in the repository being indexed, then rebuild the page:
+  uv run <this>; lean-refactor graph
+"""
+from collections import defaultdict
+import networkx as nx
+from graphdb import graph, OUT
+
+RESOLUTION = 1.0                  # higher => more, smaller communities
+
+names, _, edges = graph()
+n = len(names)
+w = defaultdict(int)
+for a, b in edges:
+    if a != b:
+        w[(min(a, b), max(a, b))] += 1     # symmetrize: a dependency is an undirected tie
+G = nx.Graph(); G.add_nodes_from(range(n))
+G.add_weighted_edges_from((u, v, c) for (u, v), c in w.items())
+
+comms = nx.community.louvain_communities(G, weight='weight', resolution=RESOLUTION, seed=0)
+comms = sorted(comms, key=len, reverse=True)          # id 0 = biggest, stable ordering
+Q = nx.community.modularity(G, comms, weight='weight')
+cid = {}
+for i, c in enumerate(comms):
+    for node in c: cid[node] = i
+with open(OUT % 'communities', 'w') as f:
+    for i in range(n):
+        f.write(f"{names[i]}\t{cid[i]}\n")
+print(f"wrote {OUT % 'communities'}: {n} nodes in {len(comms)} communities "
+      f"(Louvain res={RESOLUTION}, Q={Q:.3f})")

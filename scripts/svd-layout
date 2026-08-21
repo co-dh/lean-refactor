@@ -1,0 +1,44 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["numpy", "scipy"]
+# ///
+"""Precompute a deterministic SVD seed layout for the page `lean-refactor graph` writes.
+
+Positions each declaration by (u2, u3) of the SVD of the dependency matrix — the two topical
+contrast axes — so the in-browser ForceAtlas2 starts from a structure-aware, REPRODUCIBLE
+arrangement instead of random noise. That makes the layout the same on every load (ForceAtlas2
+itself is deterministic; the only randomness was the old random init) and lets it converge in fewer
+iterations. The viewer falls back to random when the file is absent.
+
+Run in the repository being indexed, then rebuild the page:
+  uv run <this>; lean-refactor graph
+"""
+import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import svds
+from graphdb import graph, OUT
+
+K = 8; SCALE = 1000.0
+names, _, edges = graph()
+n = len(names)
+if not edges:
+    raise SystemExit('the index holds no dependency edges — run `lean-refactor index --full` first')
+rows, cols = zip(*edges)
+A = coo_matrix((np.ones(len(edges)), (rows, cols)), shape=(n, n)).tocsr()
+
+U, S, _ = svds(A.astype(float), k=K); o = np.argsort(-S)
+u2, u3 = U[:, o[1]], U[:, o[2]]                       # skip u1 = the core-usage gradient
+# rank-normalise each axis to a uniform spread: keeps the SVD *ordering* but drops the heavy tails
+# (a few extreme u2/u3 values would otherwise fly off as far outliers and wreck the framing).
+def rank_uniform(v): return (np.argsort(np.argsort(v)) / (len(v) - 1) - 0.5)
+x = rank_uniform(u2) * SCALE
+y = rank_uniform(u3) * SCALE
+h = (np.arange(n) * 1103515245 + 12345) % 10007       # deterministic tiny jitter: break exact overlaps
+x += (h / 10007 - 0.5) * 18
+y += ((h * 7) % 10007 / 10007 - 0.5) * 18
+
+with open(OUT % 'pos', 'w') as f:
+    for i in range(n):
+        f.write(f"{names[i]}\t{x[i]:.2f}\t{y[i]:.2f}\n")
+print(f"wrote {OUT % 'pos'}: {n} positions (SVD u2/u3 seed)")
