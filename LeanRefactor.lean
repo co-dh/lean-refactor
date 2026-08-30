@@ -1531,6 +1531,13 @@ private def fileOfDecl (selector? : Option String) (declName : String) : IO (Exc
       s!"`{declName}` is in {many.size} files; pick one with --in:\n" ++
         String.intercalate "\n" (many.toList.map ("  " ++ ·))
 
+/-- `fileOfDecl`, reported and turned into an exit code once — every declaration-editing command
+    needs exactly this. -/
+private def fileOf (selector? : Option String) (declName : String) : IO (Except UInt32 String) := do
+  match ← fileOfDecl selector? declName with
+  | .ok path => return .ok path
+  | .error message => IO.eprintln message; return .error 2
+
 /-- One warning line after a rename preview: modules that depend on `declName` without naming it
     anywhere the info trees recorded — reached only through notation or macro expansion.  No edit is
     needed there, the notation is declared once, but they must still compile: they are exactly the
@@ -2383,8 +2390,9 @@ private def usage : String := String.intercalate "\n" [
   "",
   "  --in g  which files to work on: one path, a glob, or a comma-list where a leading ! subtracts",
   "          'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'",
-  "          Default: the file the index says declares d; the whole repository for the sweeps",
-  "          (rename, infix, unused, unused-simp, modularize).",
+  "          Default: the file the index says declares d; every file the index recorded a use of",
+  "          d in for inspect; the whole repository for the sweeps (rename, infix, unused,",
+  "          unused-simp, modularize).",
   "",
   "  d  declaration, full name      r  replacement      n  index, counting from 1",
   "  tok  a notation token: the symbol a `notation`/`infixl` command introduces, as the source",
@@ -2430,6 +2438,63 @@ private def usage : String := String.intercalate "\n" [
   row "unused-simp" "remove unused `simp` arguments",
   row "modularize" "convert to the Lean module system"]
 
+/-- One file's call sites of `declName`, printed exactly as the single-file report always has.
+    Also the body the `inspect-file` child runs: one elaboration per process, so `inspectReport`'s
+    fan-out over many files stays inside `claimElaboration`'s bound instead of piling up
+    environments the way an in-process loop would. -/
+private def inspectOneFile (declModule declName path : String) : IO UInt32 := do
+  let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
+  claimElaboration path
+  let source ← IO.FS.readFile path
+  initSearchPath (← findSysroot)
+  let (inputCtx, _, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
+    | .ok result => pure result
+    | .error e =>
+        for msg in e.messages.toList do IO.eprintln (← msg.toString)
+        return 1
+  unless !frontend.commandState.messages.hasErrors do
+    for msg in frontend.commandState.messages.toList do IO.eprintln (← msg.toString)
+    return 1
+  let commands := frontend.commands
+  let ilean ← Ilean.load (ileanPath moduleName)
+  let sites := usageSitesIn ilean.references declModule declName
+  IO.println s!"{declName}: {sites.size} resolved use(s) in {moduleName}; parsed {commands.size} command(s)"
+  for site in sites do showContext inputCtx.fileMap site commands
+  return 0
+
+/-- `lean-refactor inspect d`: every call site of `d`, not just the ones in the file that declares
+    it.  The single-file version this replaced only ever looked at `d`'s own module's `.ilean`, so a
+    call site reached through an `open`ed SIBLING namespace — a different file resolving `d` under a
+    short name via its own `open` — was silently absent: the site is real and the index's
+    `use_site` table already has it (Lean's own reference tracking resolves those `open`s
+    correctly), but nothing before this read that table for anything other than the declaring
+    file. Every module the index recorded a use in is checked here, each in its OWN child process
+    (`inspect-file`) so a heavily-used declaration cannot pile up environments in one process.
+    `--in` still names one file and means just that one, like every other command; the fix is only
+    to the default (no `--in`) file set. -/
+private def inspectReport (selector? : Option String) (declName : String) : IO UInt32 := do
+  let .ok declaringSource ← fileOf selector? declName | return 2
+  let some moduleName ← okOr "" (moduleNameOfPath declaringSource) | return 2
+  let dbPath? ← refreshedIndex?
+  let declModule ← match dbPath? with
+    | some dbPath => pure <| match (← Query.declaringModules dbPath declName)[0]? with
+        | some (declaring, _) => declaring
+        | none => moduleName
+    | none => pure moduleName
+  let files ← match selector?, dbPath? with
+    | some _, _ | none, none => pure #[declaringSource]
+    | none, some dbPath =>
+        let sources ← Query.moduleSources dbPath
+        let useModules ← Query.useModules dbPath declName
+        pure ((#[declaringSource] ++ useModules.map fun (p : String × Nat) => sources.getD p.1 p.1)
+          |>.toList.eraseDups.toArray)
+  match files with
+  | #[path] => inspectOneFile declModule declName path
+  | _ =>
+      let outputs ← mapFilesParallel (← scanJobs) files fun path =>
+        spawnSelf #["inspect-file", path, declModule, declName]
+      reportOutputs outputs
+
 def main (args : List String) : IO UInt32 := do
   -- Flags mean the same thing for every command that takes them, so they are read once here rather
   -- than in each arm; that also makes their position in the argument list free.
@@ -2458,11 +2523,6 @@ def main (args : List String) : IO UInt32 := do
   let (dropArg?, minNodes?) ← match natFlag "--drop-arg" dropArg?, natFlag "--min-nodes" minNodes? with
     | .ok a, .ok b => pure (a, b)
     | .error message, _ | _, .error message => IO.eprintln message; return 2
-  -- The file a declaration-editing command works on, reported and turned into an exit code once.
-  let fileOf (declName : String) : IO (Except UInt32 String) := do
-    match ← fileOfDecl selector? declName with
-    | .ok path => return .ok path
-    | .error message => IO.eprintln message; return .error 2
   match args with
   | [] | ["--help"] | ["-h"] => IO.println usage; return 0
   -- The refresh imports every stale module, and `Index.run` reaches it without going through
@@ -2482,6 +2542,7 @@ def main (args : List String) : IO UInt32 := do
         String.intercalate Db.recordSep rows.stmts.toList)
       return 0
   | ["uses", declName] => return ← usesReport declName
+  | ["inspect", declName] => return ← inspectReport selector? declName
   | ["stmt", fragment] => return ← stmtReport fragment
   | ["graph"] => return ← graphPage "refactor-graph.html"
   | ["graph", outPath] => return ← graphPage outPath
@@ -2509,6 +2570,7 @@ def main (args : List String) : IO UInt32 := do
       | .ok renames => return ← renameAll selector? renames apply usesOnly noIndex
   -- The staging children of the batch drivers.  Not in the usage: each is one file of a run the
   -- parent is orchestrating, and running one by hand stages an edit nothing then applies.
+  | ["inspect-file", path, declModule, declName] => return ← inspectOneFile declModule declName path
   | "rename-file" :: path :: rest =>
       let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
       match parseRenames rest with
@@ -2530,22 +2592,22 @@ def main (args : List String) : IO UInt32 := do
   | ["infix", declName, token] =>
       return ← infixGlob (selector?.getD wholeRepository) declName token apply
   | ["move", declName, dest] =>
-      let .ok path ← fileOf declName | return 2
+      let .ok path ← fileOf selector? declName | return 2
       -- A `.lean` destination is another file; anything else is an anchor within this one.  The
       -- destination says which, so there is no second command and no flag to pick between them.
       if dest.endsWith ".lean" then
         return ← moveDeclaration path declName dest apply omitBinders? into?
       return ← relocateDeclarationBefore path declName dest apply
   | ["collapse", declName, replacement] =>
-      let .ok path ← fileOf declName | return 2
+      let .ok path ← fileOf selector? declName | return 2
       if dropArg? == some 0 then IO.eprintln "`--drop-arg` is 1-based"; return 2
       return ← collapseDeclaration path declName replacement apply dropArg?
   | ["replace", declName, text] =>
-      let .ok path ← fileOf declName | return 2
+      let .ok path ← fileOf selector? declName | return 2
       if body then return ← replaceDeclarationBody path declName text apply
       return ← replaceDeclaration path declName text apply
   | ["remove", declName] =>
-      let .ok path ← fileOf declName | return 2
+      let .ok path ← fileOf selector? declName | return 2
       return ← removeDeclaration path declName apply
   | ["unused"] =>
       -- Forked, not looped: an in-process loop retained one `Environment` per file and so died on
@@ -2562,11 +2624,12 @@ def main (args : List String) : IO UInt32 := do
       return ← forkPerFile (selector?.getD wholeRepository) fun path =>
         #["unused-simp-file", path] ++ (if apply then #["--apply"] else #[])
   | _ => pure ()
-  -- The call-site commands below share one elaboration of one file, so they are dispatched together
-  -- rather than each opening it again.  `M` — the module that DECLARES the name — is what the index
-  -- answers; the fallbacks that match by name alone stand in when it cannot.
+  -- The argument-editing commands below share one elaboration of one file, so they are dispatched
+  -- together rather than each opening it again (`inspect` is separate — see `inspectReport` — since
+  -- it has no edit to verify and so is free to check every file the index names, not just this one).
+  -- `M` — the module that DECLARES the name — is what the index answers; the fallbacks that match by
+  -- name alone stand in when it cannot.
   let (mode, declName, binderName?, argIndex?, insertText?) ← match args with
-    | ["inspect", declName] => pure ("inspect", declName, none, none, none)
     | ["remove-arg", declName, index] =>
         pure (if syntaxMatch then "remove-syntax" else "remove", declName, none, index.toNat?, none)
     | ["insert-arg", declName, index, term] =>
@@ -2574,7 +2637,7 @@ def main (args : List String) : IO UInt32 := do
     | ["remove-param", declName, binderName, index] =>
         pure ("parameter", declName, some binderName, index.toNat?, none)
     | _ => IO.eprintln usage; return 2
-  let .ok sourcePath ← fileOf declName | return 2
+  let .ok sourcePath ← fileOf selector? declName | return 2
   let some moduleName ← okOr "" (moduleNameOfPath sourcePath) | return 2
   -- The declaring module, from the index.  Falling back to the edited file's own module is right
   -- for the common case — a call site in the file that declares it — and where it is wrong the
@@ -2618,53 +2681,50 @@ def main (args : List String) : IO UInt32 := do
     for command in frontend.commands do
       sites := sites ++ tokenSitesNamed inputCtx.fileMap token command
   IO.println s!"{declName}: {sites.size} resolved use(s) in {moduleName}; parsed {commands.size} command(s)"
-  if mode == "inspect" then
-    for site in sites do showContext inputCtx.fileMap site commands
-  else
-    let some oneBased := argIndex? | IO.eprintln "argument index must be a positive integer"; return 2
-    if oneBased == 0 then IO.eprintln "argument index is 1-based"; return 2
-    let mut edits := #[]
-    for site in sites do
-      let result := if mode == "insert" then
-        insertionForSite inputCtx.fileMap site commands (oneBased - 1) (insertText?.getD "")
-      else editForSite inputCtx.fileMap site commands (oneBased - 1) source
-      match result with
-      | .error message =>
-          -- `--syntax` matches by name, so the declaration's own binder line answers to it and is
-          -- not an application: report and carry on rather than abandoning the file.
-          unless mode == "remove-syntax" do
-            IO.eprintln message
-            return 1
-          IO.println s!"skipped: {message}"
-      | .ok edit => edits := edits.push edit
-    if mode == "parameter" then
-      let some binderName := binderName? | IO.eprintln "missing binder name"; return 2
-      let warningNeedle := s!"unused variable `{binderName}`"
-      let mut hasUnusedWarning := false
-      for msg in frontend.commandState.messages.toList do
-        if (toString (← msg.data.format)).contains warningNeedle then hasUnusedWarning := true
-      unless hasUnusedWarning do
-        IO.eprintln s!"refusing: Lean did not report `{binderName}` as unused"
-        return 1
-      let declInfo? := ilean.references.get? (.const declModule declName)
-      let some definitionSite := declInfo?.bind (·.definition?) |>.map siteOf
-        | IO.eprintln "declaration definition is absent from this module's semantic references"
+  let some oneBased := argIndex? | IO.eprintln "argument index must be a positive integer"; return 2
+  if oneBased == 0 then IO.eprintln "argument index is 1-based"; return 2
+  let mut edits := #[]
+  for site in sites do
+    let result := if mode == "insert" then
+      insertionForSite inputCtx.fileMap site commands (oneBased - 1) (insertText?.getD "")
+    else editForSite inputCtx.fileMap site commands (oneBased - 1) source
+    match result with
+    | .error message =>
+        -- `--syntax` matches by name, so the declaration's own binder line answers to it and is
+        -- not an application: report and carry on rather than abandoning the file.
+        unless mode == "remove-syntax" do
+          IO.eprintln message
           return 1
-      match declarationBinderEdit source inputCtx.fileMap definitionSite commands binderName with
-      | .error message => IO.eprintln message; return 1
-      | .ok edit => edits := edits.push edit
-    -- `insert-call-arg` produces a zero-width edit, which spans no text to report as removed; the
-    -- preview is the only thing the caller sees before `--apply`, so it must name the real operation.
-    for edit in edits do
-      if edit.start == edit.stop then
-        IO.println s!"line {edit.line}: insert {repr edit.replacement}"
-      else
-        IO.println s!"line {edit.line}: remove {repr (String.Pos.Raw.extract source edit.start edit.stop)}"
-    if apply then
-      IO.FS.writeFile sourcePath (applyEdits source edits)
-      IO.println s!"applied {edits.size} edit(s) to {sourcePath}"
+        IO.println s!"skipped: {message}"
+    | .ok edit => edits := edits.push edit
+  if mode == "parameter" then
+    let some binderName := binderName? | IO.eprintln "missing binder name"; return 2
+    let warningNeedle := s!"unused variable `{binderName}`"
+    let mut hasUnusedWarning := false
+    for msg in frontend.commandState.messages.toList do
+      if (toString (← msg.data.format)).contains warningNeedle then hasUnusedWarning := true
+    unless hasUnusedWarning do
+      IO.eprintln s!"refusing: Lean did not report `{binderName}` as unused"
+      return 1
+    let declInfo? := ilean.references.get? (.const declModule declName)
+    let some definitionSite := declInfo?.bind (·.definition?) |>.map siteOf
+      | IO.eprintln "declaration definition is absent from this module's semantic references"
+        return 1
+    match declarationBinderEdit source inputCtx.fileMap definitionSite commands binderName with
+    | .error message => IO.eprintln message; return 1
+    | .ok edit => edits := edits.push edit
+  -- `insert-call-arg` produces a zero-width edit, which spans no text to report as removed; the
+  -- preview is the only thing the caller sees before `--apply`, so it must name the real operation.
+  for edit in edits do
+    if edit.start == edit.stop then
+      IO.println s!"line {edit.line}: insert {repr edit.replacement}"
     else
-      IO.println "preview only; pass --apply to write"
+      IO.println s!"line {edit.line}: remove {repr (String.Pos.Raw.extract source edit.start edit.stop)}"
+  if apply then
+    IO.FS.writeFile sourcePath (applyEdits source edits)
+    IO.println s!"applied {edits.size} edit(s) to {sourcePath}"
+  else
+    IO.println "preview only; pass --apply to write"
   return 0
 
 end LeanRefactor
