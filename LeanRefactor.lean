@@ -2447,8 +2447,15 @@ open Elab in
     is the elaborated application, so a hypothesis is read exactly like a constant. -/
 private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (call : TermInfo)
     (keyword : String) : IO Bool := do
+  let fn := call.expr.getAppFn
+  -- A structure field is elaborated with no `self` in scope — its carrier is a bare type variable
+  -- there — so a binder whose type mentions `self` was never testable as an object where it was
+  -- written, however well the test answers here.  `self` is the binder after the parameters.
+  let self? := match fn with
+    | .const name _ => (ci.env.getProjectionFnInfo? name).map (·.numParams)
+    | _ => none
   withLocalContext ci call.lctx do
-    let ty ← Meta.inferType call.expr.getAppFn
+    let ty ← Meta.inferType fn
     Meta.forallTelescopeReducing ty fun binders _ => do
       let upper := keyword.toUpper
       let mut object := false
@@ -2459,6 +2466,10 @@ private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (cal
         -- it is bound before this binder or after it.
         if name == upper then return false
         if name == keyword && decl.binderInfo != .instImplicit then
+          let hidden : Bool := match self? with
+            | some i => i < binders.size && decl.type.containsFVar (Expr.fvarId! binders[i]!)
+            | none => false
+          if hidden then return false
           object ← isObjectType objectClass decl.type
       return object
 
@@ -2591,13 +2602,8 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
           { start := range.start, stop := range.stop, line := lineOf range.start,
             replacement := old.toUpper }
         match call.expr.getAppFn with
-        -- A structure field's binders are written inside the structure body, where the carrier is
-        -- an unapplied projection and no category, so the sweep never capitalises them.
         | .const fn _ =>
-            if (ci.env.getProjectionFnInfo? fn).isSome then
-              clashes := clashes.push s!"line {lineOf range.start}: `({old} := …)` stays — \
-                `{fn}` is a structure field, and its binders are not the sweep's to capitalise"
-            else if (ci.env.getModuleIdxFor? fn).isSome then deferred := deferred.push edit
+            if (ci.env.getModuleIdxFor? fn).isSome then deferred := deferred.push edit
             else edits := edits.push edit
         | _ => candidates := candidates.push edit
   return { edits := (independentEdits edits).1, clashes, outside := #[],
@@ -2702,7 +2708,13 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
     IO.println s!"{path}: NOT renamed — the file does not elaborate with its object binders \
       capitalised ({errors.size} error(s)); rename it by hand, or say why it cannot be"
     for (_, message) in errors.take 3 do IO.println message
-    return 3
+    -- A deferred keyword follows ANOTHER file's binder, so this file's refusal does not touch it:
+    -- dropping it would break the call exactly as leaving the callee's rename half done would.
+    if deferred.isEmpty then return 3
+    IO.println s!"{path}: its {deferred.size} named-argument keyword(s) follow their callee anyway"
+    reportEdits path source deferred
+    IO.FS.writeFile stagePath (applyEdits source deferred)
+    return 0
   reportEdits path source (kept ++ deferred)
   IO.FS.writeFile stagePath (applyEdits source (kept ++ deferred))
   return 0
