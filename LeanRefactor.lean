@@ -2587,7 +2587,8 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
   -- compile, so the whole run is refused rather than written.
   if !outside.isEmpty then return { edits := #[], clashes, outside, deferred := #[], candidates := #[] }
   -- Now the other side of the same rename: `(a := e)` writes a binder name of the CALLEE, so it
-  -- moves exactly when the callee's binder does, and `only?` renames one declaration's binder only.
+  -- moves exactly when the callee's binder does — which a sweep does and a single declaration
+  -- (`within?`) does not: there the keyword names some other declaration's binder, and must stay.
   let mut callee : Std.HashMap (Nat × Nat) (ContextInfo × TermInfo) := {}
   for (ci, ti) in infos do
     let some range := ti.stx.getRange? | continue
@@ -2596,7 +2597,7 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
     callee := callee.insert (range.start.byteIdx, range.stop.byteIdx) (ci, ti)
   let mut deferred : Array Edit := #[]
   let mut candidates : Array Edit := #[]
-  if only?.isNone || rename?.isSome then
+  if within?.isNone && (only?.isNone || rename?.isSome) then
     for cmd in commands do
       for (keyword, app) in namedArguments cmd do
         let some range := keyword.getRange? | continue
@@ -2653,10 +2654,13 @@ private def renameBinder (path declName old new : String) (class? : Option Strin
     | .error e =>
         for msg in e.messages.toList do IO.eprintln (← msg.toString)
         return 1
-  let some objectClass ← okOr "" (objectClassOf frontend.commandState.env class?) | return 2
+  -- `rename?` names both ends, so a binder renames whatever its type is — arrow, relator, proof —
+  -- and the object test, with the class it needs, never runs: a file without one renames like any other.
+  let objectClass := (objectClassOf frontend.commandState.env class?).toOption.getD Name.anonymous
   let some (range, _) ← okOr s!"{path}: " (declarationSite source frontend.commands declName) | return 1
   let { edits, clashes, outside, .. } ← objectBinderEdits objectClass "" source ctx.fileMap
-    frontend.commandState.infoState.trees frontend.commands (within? := some range) (only? := some old)
+    frontend.commandState.infoState.trees frontend.commands (within? := some range)
+    (only? := some old) (rename? := some new)
   for message in clashes do IO.eprintln s!"{path}: {message}"
   unless outside.isEmpty do
     IO.eprintln s!"{path}: `{old}` is bound outside `{declName}` — a `variable` line, or another \
@@ -2665,12 +2669,9 @@ private def renameBinder (path declName old new : String) (class? : Option Strin
       declaration under it together."
     return 1
   if edits.isEmpty then
-    IO.eprintln s!"{path}: `{declName}` binds no object variable named `{old}` \
-      (an occurrence of one is what this command locates, and the elaborator reports none)"
+    IO.eprintln s!"{path}: `{declName}` binds no variable named `{old}` that `{new}` is free in — \
+      an occurrence is what this command locates, and the elaborator reports none it may write"
     return 1
-  unless new == old.toUpper do
-    IO.eprintln s!"refusing: `{old}` capitalises to `{old.toUpper}`, not `{new}`"
-    return 2
   reportEdits path source edits
   let updated := applyEdits source edits
   unless apply do IO.println "preview only; pass --apply to write"; return 0
