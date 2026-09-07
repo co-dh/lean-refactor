@@ -2591,8 +2591,13 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
           { start := range.start, stop := range.stop, line := lineOf range.start,
             replacement := old.toUpper }
         match call.expr.getAppFn with
+        -- A structure field's binders are written inside the structure body, where the carrier is
+        -- an unapplied projection and no category, so the sweep never capitalises them.
         | .const fn _ =>
-            if (ci.env.getModuleIdxFor? fn).isSome then deferred := deferred.push edit
+            if (ci.env.getProjectionFnInfo? fn).isSome then
+              clashes := clashes.push s!"line {lineOf range.start}: `({old} := …)` stays — \
+                `{fn}` is a structure field, and its binders are not the sweep's to capitalise"
+            else if (ci.env.getModuleIdxFor? fn).isSome then deferred := deferred.push edit
             else edits := edits.push edit
         | _ => candidates := candidates.push edit
   return { edits := (independentEdits edits).1, clashes, outside := #[],
