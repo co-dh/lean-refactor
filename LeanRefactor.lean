@@ -2582,7 +2582,8 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   let source ← IO.FS.readFile path
-  let (ctx, _, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
+  let (ctx, importEnv, frontend) ←
+    match ← Elaborate.frontendOf path source (parseName moduleName) with
     | .ok result => pure result
     | .error _ => return 3
   let fileMap := ctx.fileMap
@@ -2593,8 +2594,15 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
     frontend.commandState.infoState.trees frontend.commands
   for message in clashes do IO.println s!"{path}: {message}"
   if edits.isEmpty then return 3
+  let updated := applyEdits source edits
+  -- The sweep is all-or-nothing across the repository, so one file the rename breaks would throw
+  -- away every file it got right.  Each file carries its own elaboration and drops out alone.
+  unless ← elaboratesCleanly importEnv path updated do
+    IO.println s!"{path}: NOT renamed — the file does not elaborate with its object binders \
+      capitalised; rename it by hand, or say why it cannot be"
+    return 3
   reportEdits path source edits
-  IO.FS.writeFile stagePath (applyEdits source edits)
+  IO.FS.writeFile stagePath updated
   return 0
 
 /-- One usage line: the command shape, then what it does, at a fixed column. -/
