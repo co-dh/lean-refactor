@@ -2388,37 +2388,65 @@ private def termInfos (trees : PersistentArray InfoTree) : Array (ContextInfo ×
       | .ofTermInfo ti => acc.push (ci, ti)
       | _ => acc) acc
 
+/-- Is `type` the objects of a category?  Decided by instance SYNTHESIS, so a carrier whose only
+    instance is a class extending `objectClass` answers yes; a sort and an element of a hom-set
+    answer no.  The caller supplies the context: a binder's own, or a callee telescope's. -/
+private def isObjectType (objectClass : Name) (type : Expr) : MetaM Bool := do
+  let ty ← Meta.whnf type
+  if ty.isSort then return false
+  let cls ← Meta.mkConstWithFreshMVarLevels objectClass
+  return (← Meta.synthInstance? (mkApp cls ty)).isSome
+
 open Elab in
-/-- Is this local variable an object of a category?  Decided by instance SYNTHESIS in the binder's
-    own local context, so a carrier whose only instance is a class extending `objectClass` answers
-    yes; a `Type`-valued binder, an instance binder and an element of a hom-set answer no. -/
+/-- Is this local variable an object of a category?  Tested in the binder's own local context, so an
+    instance binder and a `Type`-valued binder answer no. -/
 private def isObjectVariable (objectClass : Name) (ci : ContextInfo) (lctx : LocalContext)
     (fvarId : FVarId) : IO Bool := do
   let some decl := lctx.find? fvarId | return false
   if decl.binderInfo == .instImplicit || decl.isImplementationDetail then return false
   ci.runMetaM lctx do
-    let ty ← Meta.whnf decl.type
-    if ty.isSort then return false
     let insts ← lctx.foldlM (init := (#[] : LocalInstances)) fun acc d => do
       if d.isImplementationDetail then return acc
       match ← Meta.isClass? d.type with
       | some className => return acc.push { className, fvar := d.toExpr }
       | none => return acc
-    Meta.withLCtx lctx insts do
-      let cls ← Meta.mkConstWithFreshMVarLevels objectClass
-      return (← Meta.synthInstance? (mkApp cls ty)).isSome
+    Meta.withLCtx lctx insts (isObjectType objectClass decl.type)
 
 private def containedIn (start stop : String.Pos.Raw) : Option (String.Pos.Raw × String.Pos.Raw) → Bool
   | none => true
   | some (lo, hi) => lo.byteIdx ≤ start.byteIdx && stop.byteIdx ≤ hi.byteIdx
 
-/-- The keywords of every named argument `(x := e)` in `stx`.  A binder's name is part of its
-    declaration's INTERFACE through these, and the keyword cannot be rewritten from the callee's
-    side, so a letter used as one is left alone rather than renamed into a call nobody fixed. -/
-private partial def namedArgumentKeys : Syntax → Array String := fun stx =>
-  let below := stx.getArgs.foldl (init := #[]) fun acc s => acc ++ namedArgumentKeys s
-  if stx.isOfKind ``Lean.Parser.Term.namedArgument && stx[1].isIdent then
-    below.push (shortName stx[1].getId.toString) else below
+/-- Every named argument `(x := e)` of `stx`, as the keyword identifier paired with the application
+    node it sits in — the node whose elaborated term says which constant is being called. -/
+private partial def namedArguments : Syntax → Array (Syntax × Syntax) := fun stx =>
+  let below := stx.getArgs.foldl (init := #[]) fun acc s => acc ++ namedArguments s
+  if stx.isOfKind ``Lean.Parser.Term.app then
+    stx[1].getArgs.foldl (init := below) fun acc arg =>
+      if arg.isOfKind ``Lean.Parser.Term.namedArgument && arg[1].isIdent then acc.push (arg[1], stx)
+      else acc
+  else below
+
+open Elab in
+/-- Does the sweep capitalise the callee's binder named `keyword`?  A named argument's keyword is
+    the CALLEE's binder name, and the callee is usually declared in another file, so the decision is
+    read off its TYPE: the same object test and the same capital clash `objectBinderEdits` makes
+    from a binder's source, made instead from the telescope of the constant being called. -/
+private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (fn : Name)
+    (keyword : String) : IO Bool := do
+  let some info := ci.env.find? fn | return false
+  ci.runMetaM {} do
+    Meta.forallTelescopeReducing info.type fun binders _ => do
+      let upper := keyword.toUpper
+      let mut object := false
+      for binder in binders do
+        let decl ← binder.fvarId!.getDecl
+        let name := decl.userName.eraseMacroScopes.toString
+        -- A capital anywhere in the telescope is the clash that keeps the callee lowercase, whether
+        -- it is bound before this binder or after it.
+        if name == upper then return false
+        if name == keyword && decl.binderInfo != .instImplicit then
+          object ← isObjectType objectClass decl.type
+      return object
 
 open Elab in
 /-- Edits capitalising every single-lowercase-letter object binder of one elaborated file.
@@ -2427,14 +2455,17 @@ open Elab in
     and any occurrence of a kept variable that falls OUTSIDE it is reported instead of edited,
     which is exactly the `variable`-introduced binder a single declaration may not rename alone.
     `only?` keeps only the binder spelled that way, and then `letters` does not apply: the caller
-    named the variable, so it is not the sweep's business which letter it is. -/
+    named the variable, so it is not the sweep's business which letter it is.
+
+    The fourth component is the DEFERRED edits: named-argument keywords naming a binder of a
+    declaration in another file.  They are right by the callee's type and cannot be checked by
+    elaborating this file, whose imports still spell that binder the old way. -/
 private def objectBinderEdits (objectClass : Name) (letters : String) (source : String)
     (fileMap : FileMap) (trees : PersistentArray InfoTree) (commands : Array Syntax)
     (within? : Option (String.Pos.Raw × String.Pos.Raw) := none)
-    (only? : Option String := none) : IO (Array Edit × Array String × Array String) := do
+    (only? : Option String := none) :
+    IO (Array Edit × Array String × Array String × Array Edit) := do
   let infos := termInfos trees
-  let named : Std.HashSet String :=
-    commands.foldl (init := {}) fun acc cmd => acc.insertMany (namedArgumentKeys cmd)
   let lineOf (p : String.Pos.Raw) : Nat := (fileMap.toPosition p).line
   -- Every binder already spelled with a capital, and the context it was introduced in.  A clash is
   -- not only a capital ALREADY bound where this binder sits: one introduced LATER in the same
@@ -2468,12 +2499,6 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
     unless ← isObjectVariable objectClass ci ti.lctx fvarId do continue
     let new := old.toUpper
     let key := (range.start.byteIdx, range.stop.byteIdx)
-    if named.contains old then
-      unless clashed.contains key do
-        clashed := clashed.insert key
-        clashes := clashes.push s!"line {lineOf range.start}: `{old}` stays — it is written as a \
-          named argument `({old} := …)` in this file, and a keyword cannot be rewritten from here"
-      continue
     if (ti.lctx.findFromUserName? new.toName).isSome ||
         (capitals.getD new #[]).any fun lctx => (lctx.find? fvarId).isSome then
       unless clashed.contains key do
@@ -2515,8 +2540,36 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
         outside := outside.push s!"line {lineOf lo}: `{old}`"
   -- A variable kept for `within?` but also bound outside it is shared, and half a rename does not
   -- compile, so the whole run is refused rather than written.
-  if !outside.isEmpty then return (#[], clashes, outside)
-  return ((independentEdits edits).1, clashes, #[])
+  if !outside.isEmpty then return (#[], clashes, outside, #[])
+  -- Now the other side of the same rename: `(a := e)` writes a binder name of the CALLEE, so it
+  -- moves exactly when the callee's binder does, and `only?` renames one declaration's binder only.
+  let mut callee : Std.HashMap (Nat × Nat) (ContextInfo × Name) := {}
+  for (ci, ti) in infos do
+    let some range := ti.stx.getRange? | continue
+    let .const fn _ := ti.expr.getAppFn | continue
+    callee := callee.insert (range.start.byteIdx, range.stop.byteIdx) (ci, fn)
+  let mut deferred : Array Edit := #[]
+  if only?.isNone then
+    for cmd in commands do
+      for (keyword, app) in namedArguments cmd do
+        let some range := keyword.getRange? | continue
+        let old := shortName keyword.getId.toString
+        unless old.length == 1 && old.front.isLower && letters.contains old.front do continue
+        unless containedIn range.start range.stop within? do continue
+        let some appRange := app.getRange? | continue
+        let some (ci, fn) := callee[(appRange.start.byteIdx, appRange.stop.byteIdx)]? |
+          clashes := clashes.push s!"line {lineOf range.start}: `({old} := …)` stays — the \
+            elaborator names no constant for this call, so the callee's binder cannot be read"
+          continue
+        unless ← calleeBinderCapitalised objectClass ci fn old do continue
+        let edit : Edit :=
+          { start := range.start, stop := range.stop, line := lineOf range.start,
+            replacement := old.toUpper }
+        -- A callee declared in THIS file is renamed by the edits above, so its keyword is checkable
+        -- here; one from an import is not, and travels as a deferred edit.
+        if (ci.env.getModuleIdxFor? fn).isSome then deferred := deferred.push edit
+        else edits := edits.push edit
+  return ((independentEdits edits).1, clashes, #[], (independentEdits deferred).1)
 
 /-- The class that says a type is a category's objects.  `--class` may spell it in full; a bare name
     is resolved in the file's own environment, so `Cat` finds `Freyd.Cat`. -/
@@ -2549,7 +2602,7 @@ private def renameBinder (path declName old new : String) (class? : Option Strin
         return 1
   let some objectClass ← okOr "" (objectClassOf frontend.commandState.env class?) | return 2
   let some (range, _) ← okOr s!"{path}: " (declarationSite source frontend.commands declName) | return 1
-  let (edits, clashes, outside) ← objectBinderEdits objectClass "" source ctx.fileMap
+  let (edits, clashes, outside, _) ← objectBinderEdits objectClass "" source ctx.fileMap
     frontend.commandState.infoState.trees frontend.commands (within? := some range) (only? := some old)
   for message in clashes do IO.eprintln s!"{path}: {message}"
   unless outside.isEmpty do
@@ -2590,19 +2643,19 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
   -- A file whose environment does not even have the class cannot bind one of its objects, so this
   -- is "not affected" (3), not a failure; only a `--class` no file at all knows fails the sweep.
   let .ok objectClass := objectClassOf frontend.commandState.env class? | return 3
-  let (edits, clashes, _) ← objectBinderEdits objectClass (letters?.getD "abcd") source fileMap
-    frontend.commandState.infoState.trees frontend.commands
+  let (edits, clashes, _, deferred) ← objectBinderEdits objectClass (letters?.getD "abcd") source
+    fileMap frontend.commandState.infoState.trees frontend.commands
   for message in clashes do IO.println s!"{path}: {message}"
-  if edits.isEmpty then return 3
-  let updated := applyEdits source edits
+  if edits.isEmpty && deferred.isEmpty then return 3
   -- The sweep is all-or-nothing across the repository, so one file the rename breaks would throw
-  -- away every file it got right.  Each file carries its own elaboration and drops out alone.
-  unless ← elaboratesCleanly importEnv path updated do
+  -- away every file it got right.  Each file carries its own elaboration and drops out alone —
+  -- checking the edits this file's own imports can judge, which the deferred keywords are not.
+  unless ← elaboratesCleanly importEnv path (applyEdits source edits) do
     IO.println s!"{path}: NOT renamed — the file does not elaborate with its object binders \
       capitalised; rename it by hand, or say why it cannot be"
     return 3
-  reportEdits path source edits
-  IO.FS.writeFile stagePath updated
+  reportEdits path source (edits ++ deferred)
+  IO.FS.writeFile stagePath (applyEdits source (edits ++ deferred))
   return 0
 
 /-- One usage line: the command shape, then what it does, at a fixed column. -/
