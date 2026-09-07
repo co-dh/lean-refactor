@@ -2372,6 +2372,179 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
   IO.println s!"{site.range.start.line + 1}:{site.range.start.character + 1}\t{site.parent?.getD "<command>"}"
   IO.println s!"  {String.intercalate " → " kinds}"
 
+/-! ## Renaming a bound variable
+
+`rename-binder` renames ONE bound variable of one declaration; `rename-objects` sweeps a repository
+and capitalises every binder that stands for an object of a category.  Neither searches the source
+for an occurrence: the elaborator's info trees carry a `TermInfo` per occurrence with the `FVarId`
+it denotes, so a shadowing `a` inside a proof is a different variable and is left alone.  The source
+text is read only to CONFIRM a range before it is overwritten, never to find one. -/
+
+open Elab in
+/-- Every `TermInfo` of `trees`, each with the context it was elaborated in. -/
+private def termInfos (trees : PersistentArray InfoTree) : Array (ContextInfo × TermInfo) :=
+  trees.foldl (init := #[]) fun acc tree =>
+    tree.foldInfo (fun ci info acc => match info with
+      | .ofTermInfo ti => acc.push (ci, ti)
+      | _ => acc) acc
+
+open Elab in
+/-- Is this local variable an object of a category?  Decided by instance SYNTHESIS in the binder's
+    own local context, so a carrier whose only instance is a class extending `objectClass` answers
+    yes; a `Type`-valued binder, an instance binder and an element of a hom-set answer no. -/
+private def isObjectVariable (objectClass : Name) (ci : ContextInfo) (lctx : LocalContext)
+    (fvarId : FVarId) : IO Bool := do
+  let some decl := lctx.find? fvarId | return false
+  if decl.binderInfo == .instImplicit || decl.isImplementationDetail then return false
+  ci.runMetaM lctx do
+    let ty ← Meta.whnf decl.type
+    if ty.isSort then return false
+    let insts ← lctx.foldlM (init := (#[] : LocalInstances)) fun acc d => do
+      if d.isImplementationDetail then return acc
+      match ← Meta.isClass? d.type with
+      | some className => return acc.push { className, fvar := d.toExpr }
+      | none => return acc
+    Meta.withLCtx lctx insts do
+      let cls ← Meta.mkConstWithFreshMVarLevels objectClass
+      return (← Meta.synthInstance? (mkApp cls ty)).isSome
+
+private def containedIn (start stop : String.Pos.Raw) : Option (String.Pos.Raw × String.Pos.Raw) → Bool
+  | none => true
+  | some (lo, hi) => lo.byteIdx ≤ start.byteIdx && stop.byteIdx ≤ hi.byteIdx
+
+open Elab in
+/-- Edits capitalising every single-lowercase-letter object binder of one elaborated file.
+
+    `within?` keeps only the variables with an occurrence inside that range — one declaration —
+    and any occurrence of a kept variable that falls OUTSIDE it is reported instead of edited,
+    which is exactly the `variable`-introduced binder a single declaration may not rename alone.
+    `only?` keeps only the binder spelled that way. -/
+private def objectBinderEdits (objectClass : Name) (source : String) (fileMap : FileMap)
+    (trees : PersistentArray InfoTree) (within? : Option (String.Pos.Raw × String.Pos.Raw) := none)
+    (only? : Option String := none) : IO (Array Edit × Array String × Array String) := do
+  let infos := termInfos trees
+  let lineOf (p : String.Pos.Raw) : Nat := (fileMap.toPosition p).line
+  let mut chosen : Std.HashMap FVarId (String × String) := {}
+  let mut seen : Std.HashSet FVarId := {}
+  let mut clashes : Array String := #[]
+  for (ci, ti) in infos do
+    let .fvar fvarId := ti.expr | continue
+    unless ti.isBinder do continue
+    if seen.contains fvarId then continue
+    seen := seen.insert fvarId
+    let some range := ti.stx.getRange? | continue
+    let old := String.Pos.Raw.extract source range.start range.stop
+    unless old.length == 1 && old.front.isLower do continue
+    unless only?.all (· == old) do continue
+    unless ← isObjectVariable objectClass ci ti.lctx fvarId do continue
+    let new := old.toUpper
+    if (ti.lctx.findFromUserName? new.toName).isSome then
+      clashes := clashes.push
+        s!"line {lineOf range.start}: `{old}` stays — `{new}` is already bound in the same scope"
+      continue
+    chosen := chosen.insert fvarId (old, new)
+  let mut occurrences : Std.HashMap FVarId (Array (String.Pos.Raw × String.Pos.Raw)) := {}
+  for (_, ti) in infos do
+    let .fvar fvarId := ti.expr | continue
+    let some (old, _) := chosen[fvarId]? | continue
+    let some range := ti.stx.getRange? | continue
+    unless String.Pos.Raw.extract source range.start range.stop == old do continue
+    occurrences := occurrences.insert fvarId
+      ((occurrences.getD fvarId #[]).push (range.start, range.stop))
+  let mut edits : Array Edit := #[]
+  let mut outside : Array String := #[]
+  for (fvarId, (old, new)) in chosen do
+    let ranges := occurrences.getD fvarId #[]
+    -- `within?` picks the VARIABLES the declaration mentions; another declaration's own `a` is a
+    -- different fvar with no occurrence here, and is not this command's business.
+    unless ranges.any fun (lo, hi) => containedIn lo hi within? do continue
+    for (lo, hi) in ranges do
+      if containedIn lo hi within? then
+        let edit : Edit := { start := lo, stop := hi, line := lineOf lo, replacement := new }
+        edits := edits.push edit
+      else
+        outside := outside.push s!"line {lineOf lo}: `{old}`"
+  -- A variable kept for `within?` but also bound outside it is shared, and half a rename does not
+  -- compile, so the whole run is refused rather than written.
+  if !outside.isEmpty then return (#[], clashes, outside)
+  return ((independentEdits edits).1, clashes, #[])
+
+/-- The class that says a type is a category's objects.  `--class` may spell it in full; a bare name
+    is resolved in the file's own environment, so `Cat` finds `Freyd.Cat`. -/
+private def resolveObjectClass (env : Environment) (name : String) : Except String Name := do
+  let wanted := parseName name
+  if env.contains wanted && Lean.isClass env wanted then return wanted
+  let found := env.constants.fold (init := #[]) fun acc n _ =>
+    if !n.isInternal && n.getRoot != `_root_ && (match n with | .str _ s => s == name | _ => false)
+      && Lean.isClass env n then acc.push n else acc
+  match found with
+  | #[n] => return n
+  | #[] => throw s!"no class named `{name}` is in scope in this file; give `--class` its full name"
+  | many => throw s!"`{name}` is ambiguous ({many.toList}); give `--class` its full name"
+
+private def objectClassOf (env : Environment) (class? : Option String) : Except String Name :=
+  resolveObjectClass env (class?.getD "Cat")
+
+/-- `rename-binder d old new`: rename one bound variable of `d`, everywhere the elaborator says that
+    variable occurs — signature, statement and proof alike. -/
+private def renameBinder (path declName old new : String) (class? : Option String) (apply : Bool) :
+    IO UInt32 := do
+  initSearchPath (← findSysroot)
+  claimElaboration path
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let source ← IO.FS.readFile path
+  let (ctx, importEnv, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
+    | .ok result => pure result
+    | .error e =>
+        for msg in e.messages.toList do IO.eprintln (← msg.toString)
+        return 1
+  let some objectClass ← okOr "" (objectClassOf frontend.commandState.env class?) | return 2
+  let some (range, _) ← okOr s!"{path}: " (declarationSite source frontend.commands declName) | return 1
+  let (edits, clashes, outside) ← objectBinderEdits objectClass source ctx.fileMap
+    frontend.commandState.infoState.trees (within? := some range) (only? := some old)
+  for message in clashes do IO.eprintln s!"{path}: {message}"
+  unless outside.isEmpty do
+    IO.eprintln s!"{path}: `{old}` is bound outside `{declName}` — a `variable` line, or another \
+      declaration sharing it — so renaming it here alone would not compile.  Occurrences: \
+      {outside.toList}.  Use `rename-objects`, which renames the `variable` line and every \
+      declaration under it together."
+    return 1
+  if edits.isEmpty then
+    IO.eprintln s!"{path}: `{declName}` binds no object variable named `{old}` \
+      (an occurrence of one is what this command locates, and the elaborator reports none)"
+    return 1
+  unless new == old.toUpper do
+    IO.eprintln s!"refusing: `{old}` capitalises to `{old.toUpper}`, not `{new}`"
+    return 2
+  reportEdits path source edits
+  let updated := applyEdits source edits
+  unless apply do IO.println "preview only; pass --apply to write"; return 0
+  if !(← elaboratesCleanly importEnv path updated) then
+    IO.eprintln s!"{path}: `{old}` → `{new}` does not elaborate; nothing was written"
+    return 1
+  IO.FS.writeFile path updated
+  IO.println s!"applied {edits.size} edit(s) to {path}"
+  return 0
+
+/-- The staging child of `rename-objects`: one file, whose renamed text goes to `stagePath`. -/
+private def renameObjectsStage (path stagePath : String) (class? : Option String) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  claimElaboration path
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let source ← IO.FS.readFile path
+  let (ctx, _, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
+    | .ok result => pure result
+    | .error _ => return 3
+  let fileMap := ctx.fileMap
+  let some objectClass ← okOr "" (objectClassOf frontend.commandState.env class?) | return 2
+  let (edits, clashes, _) ← objectBinderEdits objectClass source fileMap
+    frontend.commandState.infoState.trees
+  for message in clashes do IO.println s!"{path}: {message}"
+  if edits.isEmpty then return 3
+  reportEdits path source edits
+  IO.FS.writeFile stagePath (applyEdits source edits)
+  return 0
+
 /-- One usage line: the command shape, then what it does, at a fixed column. -/
 private def row (cmd desc : String) : String :=
   "  " ++ cmd ++ "".pushn ' ' (max 2 (40 - cmd.length)) ++ desc
@@ -2412,6 +2585,9 @@ private def usage : String := String.intercalate "\n" [
   row "rename (old r)..." "old is a declaration, a module, a .lean file, or a notation token",
   row "  --uses-only" "write r where old is used, but not where it is declared",
   row "  --no-index" "find the files by elaborating them, not from the index",
+  row "rename-binder d old new" "rename one bound variable of d, in its signature and its proof",
+  row "rename-objects" "capitalise every binder that is an object of a category",
+  row "  --class C" "... which is the type C has an instance for (default Cat)",
   row "infix d token" "give d the infix notation token",
   "",
   "move",
@@ -2514,6 +2690,7 @@ def main (args : List String) : IO UInt32 := do
   let (args, omitBinders?) := stripFlag "--omit" args
   let (args, dropArg?) := stripFlag "--drop-arg" args
   let (args, minNodes?) := stripFlag "--min-nodes" args
+  let (args, class?) := stripFlag "--class" args
   -- One place turns a flag's text into a number, so every command reports a bad one the same way.
   let natFlag (name : String) : Option String → Except String (Option Nat)
     | none => .ok none
@@ -2623,6 +2800,16 @@ def main (args : List String) : IO UInt32 := do
   | ["unused-simp"] =>
       return ← forkPerFile (selector?.getD wholeRepository) fun path =>
         #["unused-simp-file", path] ++ (if apply then #["--apply"] else #[])
+  | ["rename-binder", declName, old, new] =>
+      let .ok path ← fileOf selector? declName | return 2
+      return ← renameBinder path declName old new class? apply
+  | ["rename-objects-stage", path, stagePath] => return ← renameObjectsStage path stagePath class?
+  -- A `variable` line and every declaration under it must be renamed together, so this is a STAGED
+  -- glob (all files swapped in at once, one build) rather than a file-at-a-time fork.
+  | ["rename-objects"] =>
+      return ← stagedGlob (selector?.getD wholeRepository) "capitalised object binders"
+        (fun path stage => spawnSelf (#["rename-objects-stage", path, stage] ++
+          (match class? with | some c => #["--class", c] | none => #[]))) apply
   | _ => pure ()
   -- The argument-editing commands below share one elaboration of one file, so they are dispatched
   -- together rather than each opening it again (`inspect` is separate — see `inspectReport` — since

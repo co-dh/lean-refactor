@@ -39,8 +39,9 @@ usage: lean-refactor command [args] [--in g] [--apply]
 
   --in g  which files to work on: one path, a glob, or a comma-list where a leading ! subtracts
           'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'
-          Default: the file the index says declares d; the whole repository for the sweeps
-          (rename, infix, unused, unused-simp, modularize).
+          Default: the file the index says declares d; every file the index recorded a use of
+          d in for inspect; the whole repository for the sweeps (rename, infix, unused,
+          unused-simp, modularize).
 
   d  declaration, full name      r  replacement      n  index, counting from 1
   tok  a notation token: the symbol a `notation`/`infixl` command introduces, as the source
@@ -60,6 +61,9 @@ rename
   rename (old r)...                       old is a declaration, a module, a .lean file, or a notation token
     --uses-only                           write r where old is used, but not where it is declared
     --no-index                            find the files by elaborating them, not from the index
+  rename-binder d old new                 rename one bound variable of d, in its signature and its proof
+  rename-objects                          capitalise every binder that is an object of a category
+    --class C                             ... which is the type C has an instance for (default Cat)
   infix d token                           give d the infix notation token
 
 move
