@@ -2412,19 +2412,44 @@ private def containedIn (start stop : String.Pos.Raw) : Option (String.Pos.Raw �
   | none => true
   | some (lo, hi) => lo.byteIdx ≤ start.byteIdx && stop.byteIdx ≤ hi.byteIdx
 
+/-- The keywords of every named argument `(x := e)` in `stx`.  A binder's name is part of its
+    declaration's INTERFACE through these, and the keyword cannot be rewritten from the callee's
+    side, so a letter used as one is left alone rather than renamed into a call nobody fixed. -/
+private partial def namedArgumentKeys : Syntax → Array String := fun stx =>
+  let below := stx.getArgs.foldl (init := #[]) fun acc s => acc ++ namedArgumentKeys s
+  if stx.isOfKind ``Lean.Parser.Term.namedArgument && stx[1].isIdent then
+    below.push (shortName stx[1].getId.toString) else below
+
 open Elab in
 /-- Edits capitalising every single-lowercase-letter object binder of one elaborated file.
 
     `within?` keeps only the variables with an occurrence inside that range — one declaration —
     and any occurrence of a kept variable that falls OUTSIDE it is reported instead of edited,
     which is exactly the `variable`-introduced binder a single declaration may not rename alone.
-    `only?` keeps only the binder spelled that way. -/
-private def objectBinderEdits (objectClass : Name) (source : String) (fileMap : FileMap)
-    (trees : PersistentArray InfoTree) (within? : Option (String.Pos.Raw × String.Pos.Raw) := none)
+    `only?` keeps only the binder spelled that way, and then `letters` does not apply: the caller
+    named the variable, so it is not the sweep's business which letter it is. -/
+private def objectBinderEdits (objectClass : Name) (letters : String) (source : String)
+    (fileMap : FileMap) (trees : PersistentArray InfoTree) (commands : Array Syntax)
+    (within? : Option (String.Pos.Raw × String.Pos.Raw) := none)
     (only? : Option String := none) : IO (Array Edit × Array String × Array String) := do
   let infos := termInfos trees
+  let named : Std.HashSet String :=
+    commands.foldl (init := {}) fun acc cmd => acc.insertMany (namedArgumentKeys cmd)
   let lineOf (p : String.Pos.Raw) : Nat := (fileMap.toPosition p).line
+  -- Every binder already spelled with a capital, and the context it was introduced in.  A clash is
+  -- not only a capital ALREADY bound where this binder sits: one introduced LATER in the same
+  -- telescope is equally fatal (`{a : 𝒜} {A B : a ⟶ a}`), and it is later exactly when this
+  -- binder is in ITS context.
+  let mut capitals : Std.HashMap String (Array LocalContext) := {}
+  for (_, ti) in infos do
+    unless ti.isBinder do continue
+    let some range := ti.stx.getRange? | continue
+    let text := String.Pos.Raw.extract source range.start range.stop
+    unless text.length == 1 && text.front.isUpper do continue
+    capitals := capitals.insert text ((capitals.getD text #[]).push ti.lctx)
   let mut chosen : Std.HashMap FVarId (String × String) := {}
+  let mut renamed : Std.HashMap (Nat × Nat) (String × String) := {}
+  let mut clashed : Std.HashSet (Nat × Nat) := {}
   let mut seen : Std.HashSet FVarId := {}
   let mut clashes : Array String := #[]
   for (ci, ti) in infos do
@@ -2436,13 +2461,37 @@ private def objectBinderEdits (objectClass : Name) (source : String) (fileMap : 
     let old := String.Pos.Raw.extract source range.start range.stop
     unless old.length == 1 && old.front.isLower do continue
     unless only?.all (· == old) do continue
+    -- A type test alone is not the convention: in a THIN category the objects are the elements of a
+    -- lattice, so `x`, `i` and `f` are object-typed there too, and capitalising them would undo the
+    -- very naming the sweep exists to impose — objects a–d, arrows f–h, indices i–k, elements x–z.
+    unless only?.isSome || letters.contains old.front do continue
     unless ← isObjectVariable objectClass ci ti.lctx fvarId do continue
     let new := old.toUpper
-    if (ti.lctx.findFromUserName? new.toName).isSome then
-      clashes := clashes.push
-        s!"line {lineOf range.start}: `{old}` stays — `{new}` is already bound in the same scope"
+    let key := (range.start.byteIdx, range.stop.byteIdx)
+    if named.contains old then
+      unless clashed.contains key do
+        clashed := clashed.insert key
+        clashes := clashes.push s!"line {lineOf range.start}: `{old}` stays — it is written as a \
+          named argument `({old} := …)` in this file, and a keyword cannot be rewritten from here"
       continue
+    if (ti.lctx.findFromUserName? new.toName).isSome ||
+        (capitals.getD new #[]).any fun lctx => (lctx.find? fvarId).isSome then
+      unless clashed.contains key do
+        clashed := clashed.insert key
+        clashes := clashes.push
+          s!"line {lineOf range.start}: `{old}` stays — `{new}` is already bound in the same scope"
+      continue
+    renamed := renamed.insert key (old, new)
     chosen := chosen.insert fvarId (old, new)
+  -- One WRITTEN binder can have two FVarIds: an auto-bound implicit in a signature makes Lean
+  -- elaborate that signature a second time, and only the later attempt has the real type, so the
+  -- first attempt's fvar carries the USES while failing the object test.  Both are the same binder.
+  for (_, ti) in infos do
+    let .fvar fvarId := ti.expr | continue
+    unless ti.isBinder && !chosen.contains fvarId do continue
+    let some range := ti.stx.getRange? | continue
+    if let some names := renamed[(range.start.byteIdx, range.stop.byteIdx)]? then
+      chosen := chosen.insert fvarId names
   let mut occurrences : Std.HashMap FVarId (Array (String.Pos.Raw × String.Pos.Raw)) := {}
   for (_, ti) in infos do
     let .fvar fvarId := ti.expr | continue
@@ -2500,8 +2549,8 @@ private def renameBinder (path declName old new : String) (class? : Option Strin
         return 1
   let some objectClass ← okOr "" (objectClassOf frontend.commandState.env class?) | return 2
   let some (range, _) ← okOr s!"{path}: " (declarationSite source frontend.commands declName) | return 1
-  let (edits, clashes, outside) ← objectBinderEdits objectClass source ctx.fileMap
-    frontend.commandState.infoState.trees (within? := some range) (only? := some old)
+  let (edits, clashes, outside) ← objectBinderEdits objectClass "" source ctx.fileMap
+    frontend.commandState.infoState.trees frontend.commands (within? := some range) (only? := some old)
   for message in clashes do IO.eprintln s!"{path}: {message}"
   unless outside.isEmpty do
     IO.eprintln s!"{path}: `{old}` is bound outside `{declName}` — a `variable` line, or another \
@@ -2527,7 +2576,8 @@ private def renameBinder (path declName old new : String) (class? : Option Strin
   return 0
 
 /-- The staging child of `rename-objects`: one file, whose renamed text goes to `stagePath`. -/
-private def renameObjectsStage (path stagePath : String) (class? : Option String) : IO UInt32 := do
+private def renameObjectsStage (path stagePath : String) (class? letters? : Option String) :
+    IO UInt32 := do
   initSearchPath (← findSysroot)
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
@@ -2536,9 +2586,11 @@ private def renameObjectsStage (path stagePath : String) (class? : Option String
     | .ok result => pure result
     | .error _ => return 3
   let fileMap := ctx.fileMap
-  let some objectClass ← okOr "" (objectClassOf frontend.commandState.env class?) | return 2
-  let (edits, clashes, _) ← objectBinderEdits objectClass source fileMap
-    frontend.commandState.infoState.trees
+  -- A file whose environment does not even have the class cannot bind one of its objects, so this
+  -- is "not affected" (3), not a failure; only a `--class` no file at all knows fails the sweep.
+  let .ok objectClass := objectClassOf frontend.commandState.env class? | return 3
+  let (edits, clashes, _) ← objectBinderEdits objectClass (letters?.getD "abcd") source fileMap
+    frontend.commandState.infoState.trees frontend.commands
   for message in clashes do IO.println s!"{path}: {message}"
   if edits.isEmpty then return 3
   reportEdits path source edits
@@ -2588,6 +2640,7 @@ private def usage : String := String.intercalate "\n" [
   row "rename-binder d old new" "rename one bound variable of d, in its signature and its proof",
   row "rename-objects" "capitalise every binder that is an object of a category",
   row "  --class C" "... which is the type C has an instance for (default Cat)",
+  row "  --letters s" "... only these binder letters (default abcd, the object letters)",
   row "infix d token" "give d the infix notation token",
   "",
   "move",
@@ -2691,6 +2744,7 @@ def main (args : List String) : IO UInt32 := do
   let (args, dropArg?) := stripFlag "--drop-arg" args
   let (args, minNodes?) := stripFlag "--min-nodes" args
   let (args, class?) := stripFlag "--class" args
+  let (args, letters?) := stripFlag "--letters" args
   -- One place turns a flag's text into a number, so every command reports a bad one the same way.
   let natFlag (name : String) : Option String → Except String (Option Nat)
     | none => .ok none
@@ -2803,13 +2857,15 @@ def main (args : List String) : IO UInt32 := do
   | ["rename-binder", declName, old, new] =>
       let .ok path ← fileOf selector? declName | return 2
       return ← renameBinder path declName old new class? apply
-  | ["rename-objects-stage", path, stagePath] => return ← renameObjectsStage path stagePath class?
+  | ["rename-objects-stage", path, stagePath] =>
+      return ← renameObjectsStage path stagePath class? letters?
   -- A `variable` line and every declaration under it must be renamed together, so this is a STAGED
   -- glob (all files swapped in at once, one build) rather than a file-at-a-time fork.
   | ["rename-objects"] =>
+      let childFlags := (match class? with | some c => #["--class", c] | none => #[]) ++
+        (match letters? with | some l => #["--letters", l] | none => #[])
       return ← stagedGlob (selector?.getD wholeRepository) "capitalised object binders"
-        (fun path stage => spawnSelf (#["rename-objects-stage", path, stage] ++
-          (match class? with | some c => #["--class", c] | none => #[]))) apply
+        (fun path stage => spawnSelf (#["rename-objects-stage", path, stage] ++ childFlags)) apply
   | _ => pure ()
   -- The argument-editing commands below share one elaboration of one file, so they are dispatched
   -- together rather than each opening it again (`inspect` is separate — see `inspectReport` — since

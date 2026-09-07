@@ -64,6 +64,7 @@ rename
   rename-binder d old new                 rename one bound variable of d, in its signature and its proof
   rename-objects                          capitalise every binder that is an object of a category
     --class C                             ... which is the type C has an instance for (default Cat)
+    --letters s                           ... only these binder letters (default abcd, the object letters)
   infix d token                           give d the infix notation token
 
 move
