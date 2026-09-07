@@ -2381,8 +2381,10 @@ private def showContext (fileMap : FileMap) (site : ReferenceSite)
 /-! ## Renaming a bound variable
 
 `rename-binder` renames ONE bound variable of one declaration; `rename-objects` sweeps a repository
-and capitalises every binder that stands for an object of a category.  Neither searches the source
-for an occurrence: the elaborator's info trees carry a `TermInfo` per occurrence with the `FVarId`
+and capitalises every binder that stands for an object of a category; `rename-var` sweeps it for one
+named binder and writes one given name, which is what a `variable` line needs — a declaration under
+it may not rename it alone, and neither its letter nor its type decides anything.  None of the three
+searches the source for an occurrence: the elaborator's info trees carry a `TermInfo` per occurrence with the `FVarId`
 it denotes, so a shadowing `a` inside a proof is a different variable and is left alone.  The source
 text is read only to CONFIRM a range before it is overwritten, never to find one. -/
 
@@ -2446,7 +2448,7 @@ open Elab in
     from a binder's source, made instead from the telescope of the function being applied.  `call`
     is the elaborated application, so a hypothesis is read exactly like a constant. -/
 private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (call : TermInfo)
-    (keyword : String) : IO Bool := do
+    (keyword : String) (new? : Option String := none) : IO Bool := do
   let fn := call.expr.getAppFn
   -- A structure field is elaborated with no `self` in scope — its carrier is a bare type variable
   -- there — so a binder whose type mentions `self` was never testable as an object where it was
@@ -2457,7 +2459,7 @@ private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (cal
   withLocalContext ci call.lctx do
     let ty ← Meta.inferType fn
     Meta.forallTelescopeReducing ty fun binders _ => do
-      let upper := keyword.toUpper
+      let upper := new?.getD keyword.toUpper
       for binder in binders do
         let decl ← binder.fvarId!.getDecl
         let name := decl.userName.eraseMacroScopes.toString
@@ -2466,6 +2468,9 @@ private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (cal
         -- argument against the first one too, and `P → Q` in the result type adds another `a`.
         if name == upper then return false
         if name == keyword && decl.binderInfo != .instImplicit then
+          -- An explicit rename has already decided; only the derived capitalisation needs the type
+          -- test, and only it can be defeated by a binder the structure elaborator hid.
+          if new?.isSome then return true
           let hidden : Bool := match self? with
             | some i => i < binders.size && decl.type.containsFVar (Expr.fvarId! binders[i]!)
             | none => false
@@ -2491,14 +2496,16 @@ open Elab in
     and any occurrence of a kept variable that falls OUTSIDE it is reported instead of edited,
     which is exactly the `variable`-introduced binder a single declaration may not rename alone.
     `only?` keeps only the binder spelled that way, and then `letters` does not apply: the caller
-    named the variable, so it is not the sweep's business which letter it is.
+    named the variable, so it is not the sweep's business which letter it is.  `rename?` names the
+    NEW spelling as well, so neither the letter test nor the object test applies: the caller has
+    decided both ends, and a binder that is not an object of a category renames like any other.
 
     A named-argument keyword names a binder of the CALLEE, so which of the three edit fields it
     lands in is which file answers for it. -/
 private def objectBinderEdits (objectClass : Name) (letters : String) (source : String)
     (fileMap : FileMap) (trees : PersistentArray InfoTree) (commands : Array Syntax)
     (within? : Option (String.Pos.Raw × String.Pos.Raw) := none)
-    (only? : Option String := none) : IO ObjectEdits := do
+    (only? : Option String := none) (rename? : Option String := none) : IO ObjectEdits := do
   let infos := termInfos trees
   let lineOf (p : String.Pos.Raw) : Nat := (fileMap.toPosition p).line
   -- Every binder already spelled with a capital, and the context it was introduced in.  A clash is
@@ -2510,7 +2517,8 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
     unless ti.isBinder do continue
     let some range := ti.stx.getRange? | continue
     let text := String.Pos.Raw.extract source range.start range.stop
-    unless text.length == 1 && text.front.isUpper do continue
+    -- Every binder spelling, not only the single capitals: the clash test asks whether the TARGET
+    -- name is already bound, and an explicit rename's target need not be a capitalised letter.
     capitals := capitals.insert text ((capitals.getD text #[]).push ti.lctx)
   let mut chosen : Std.HashMap FVarId (String × String) := {}
   let mut renamed : Std.HashMap (Nat × Nat) (String × String) := {}
@@ -2524,14 +2532,17 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
     seen := seen.insert fvarId
     let some range := ti.stx.getRange? | continue
     let old := String.Pos.Raw.extract source range.start range.stop
-    unless old.length == 1 && old.front.isLower do continue
     unless only?.all (· == old) do continue
     -- A type test alone is not the convention: in a THIN category the objects are the elements of a
     -- lattice, so `x`, `i` and `f` are object-typed there too, and capitalising them would undo the
     -- very naming the sweep exists to impose — objects a–d, arrows f–h, indices i–k, elements x–z.
-    unless only?.isSome || letters.contains old.front do continue
-    unless ← isObjectVariable objectClass ci ti.lctx fvarId do continue
-    let new := old.toUpper
+    -- None of it applies once the caller has named both ends: an explicit rename says which binder
+    -- and which new spelling, so the sweep's letter and object tests have nothing left to decide.
+    if rename?.isNone then
+      unless old.length == 1 && old.front.isLower do continue
+      unless only?.isSome || letters.contains old.front do continue
+      unless ← isObjectVariable objectClass ci ti.lctx fvarId do continue
+    let new := rename?.getD old.toUpper
     let key := (range.start.byteIdx, range.stop.byteIdx)
     if (ti.lctx.findFromUserName? new.toName).isSome ||
         (capitals.getD new #[]).any fun lctx => (lctx.find? fvarId).isSome then
@@ -2585,22 +2596,25 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
     callee := callee.insert (range.start.byteIdx, range.stop.byteIdx) (ci, ti)
   let mut deferred : Array Edit := #[]
   let mut candidates : Array Edit := #[]
-  if only?.isNone then
+  if only?.isNone || rename?.isSome then
     for cmd in commands do
       for (keyword, app) in namedArguments cmd do
         let some range := keyword.getRange? | continue
         let old := shortName keyword.getId.toString
-        unless old.length == 1 && old.front.isLower && letters.contains old.front do continue
+        if rename?.isNone then
+          unless old.length == 1 && old.front.isLower && letters.contains old.front do continue
+        else
+          unless only?.all (· == old) do continue
         unless containedIn range.start range.stop within? do continue
         let some appRange := app.getRange? | continue
         let some (ci, call) := callee[(appRange.start.byteIdx, appRange.stop.byteIdx)]? |
           clashes := clashes.push s!"line {lineOf range.start}: `({old} := …)` stays — the \
             elaborator records no term for this call, so the callee's binder cannot be read"
           continue
-        unless ← calleeBinderCapitalised objectClass ci call old do continue
+        unless ← calleeBinderCapitalised objectClass ci call old rename? do continue
         let edit : Edit :=
           { start := range.start, stop := range.stop, line := lineOf range.start,
-            replacement := old.toUpper }
+            replacement := rename?.getD old.toUpper }
         match call.expr.getAppFn with
         | .const fn _ =>
             if (ci.env.getModuleIdxFor? fn).isSome then deferred := deferred.push edit
@@ -2667,6 +2681,16 @@ private def renameBinder (path declName old new : String) (class? : Option Strin
   IO.println s!"applied {edits.size} edit(s) to {path}"
   return 0
 
+/-- The errors a set of edits INTRODUCES: those at a position the untouched source does not already
+    err at.  A gate must catch what the RENAME breaks, not what the file already has — an attribute
+    these imports do not register would make a file unrenameable for good otherwise. -/
+private def errorsIntroduced (importEnv : Environment) (path source : String)
+    (chosen : Array Edit) : IO (Array (Position × String)) := do
+  let errors ← elaborationErrors importEnv path (applyEdits source chosen)
+  if errors.isEmpty then return #[]
+  let baseline ← elaborationErrors importEnv path source
+  return errors.filter fun (p, _) => !baseline.any fun (q, _) => q == p
+
 /-- The staging child of `rename-objects`: one file, whose renamed text goes to `stagePath`. -/
 private def renameObjectsStage (path stagePath : String) (class? letters? : Option String) :
     IO UInt32 := do
@@ -2687,21 +2711,13 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
       frontend.commandState.infoState.trees frontend.commands
   for message in clashes do IO.println s!"{path}: {message}"
   if edits.isEmpty && deferred.isEmpty && candidates.isEmpty then return 3
-  -- The gate must catch what the RENAME breaks, not what the file already has: an attribute these
-  -- imports do not register makes a file unrenameable for good otherwise.  Every edit is one letter
-  -- for one letter, so an error at a position the untouched source also errs at is not ours.
-  let introduced (chosen : Array Edit) : IO (Array (Position × String)) := do
-    let errors ← elaborationErrors importEnv path (applyEdits source chosen)
-    if errors.isEmpty then return #[]
-    let baseline ← elaborationErrors importEnv path source
-    return errors.filter fun (p, _) => !baseline.any fun (q, _) => q == p
   -- The sweep is all-or-nothing across the repository, so one file the rename breaks would throw
   -- away every file it got right.  Each file carries its own elaboration and drops out alone.
   -- A candidate keyword names a LOCAL's binder, which a hypothesis often takes from an IMPORTED
   -- statement: these imports still spell it the old way, so this elaboration would reject the one
   -- edit the repository build then demands.  Gate on the rest, and let them ride with the file.
   let kept := edits
-  let errors ← introduced kept
+  let errors ← errorsIntroduced importEnv path source kept
   unless errors.isEmpty do
     IO.println s!"{path}: NOT renamed — the file does not elaborate with its object binders \
       capitalised ({errors.size} error(s)); rename it by hand, or say why it cannot be"
@@ -2714,6 +2730,40 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
     IO.FS.writeFile stagePath (applyEdits source deferred)
     return 0
   let staged := kept ++ candidates ++ deferred
+  reportEdits path source staged
+  IO.FS.writeFile stagePath (applyEdits source staged)
+  return 0
+
+/-- The staging child of `rename-var`: one file, in which every occurrence of the variable `old` —
+    its `variable` line, every signature and proof under it, and every named argument spelling it —
+    becomes `new`.  Renamed by the elaborator's fvars, so a shadowing `old` inside a proof, and the
+    unrelated `old` inside a longer identifier, are different things and are left alone. -/
+private def renameVarStage (path stagePath old new : String) (class? : Option String) :
+    IO UInt32 := do
+  initSearchPath (← findSysroot)
+  claimElaboration path
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let source ← IO.FS.readFile path
+  let (ctx, importEnv, frontend) ←
+    match ← Elaborate.frontendOf path source (parseName moduleName) with
+    | .ok result => pure result
+    | .error _ => return 3
+  -- The object test never runs here, so a file with no such class in scope is renameable like any
+  -- other; failing it would silently skip exactly the file the rename was asked for.
+  let objectClass := (objectClassOf frontend.commandState.env class?).toOption.getD Name.anonymous
+  let { edits, clashes, deferred, candidates, .. } ←
+    objectBinderEdits objectClass "" source ctx.fileMap
+      frontend.commandState.infoState.trees frontend.commands
+      (only? := some old) (rename? := some new)
+  for message in clashes do IO.println s!"{path}: {message}"
+  if edits.isEmpty && deferred.isEmpty && candidates.isEmpty then return 3
+  let errors ← errorsIntroduced importEnv path source edits
+  unless errors.isEmpty do
+    IO.println s!"{path}: NOT renamed — `{old}` → `{new}` does not elaborate here \
+      ({errors.size} error(s)); rename it by hand, or say why it cannot be"
+    for (_, message) in errors.take 3 do IO.println message
+    return 1
+  let staged := edits ++ candidates ++ deferred
   reportEdits path source staged
   IO.FS.writeFile stagePath (applyEdits source staged)
   return 0
@@ -2759,6 +2809,7 @@ private def usage : String := String.intercalate "\n" [
   row "  --uses-only" "write r where old is used, but not where it is declared",
   row "  --no-index" "find the files by elaborating them, not from the index",
   row "rename-binder d old new" "rename one bound variable of d, in its signature and its proof",
+  row "rename-var old new" "rename a variable-bound binder, and its uses, repository-wide",
   row "rename-objects" "capitalise every binder that is an object of a category",
   row "  --class C" "... which is the type C has an instance for (default Cat)",
   row "  --letters s" "... only these binder letters (default abcd, the object letters)",
@@ -2980,6 +3031,15 @@ def main (args : List String) : IO UInt32 := do
       return ← renameBinder path declName old new class? apply
   | ["rename-objects-stage", path, stagePath] =>
       return ← renameObjectsStage path stagePath class? letters?
+  | ["rename-var-stage", path, stagePath, old, new] =>
+      return ← renameVarStage path stagePath old new class?
+  -- Same staging as `rename-objects`, and for the same reason: the `variable` line and every
+  -- declaration under it are one rename, so they are swapped in together and built once.
+  | ["rename-var", old, new] =>
+      let childFlags := (match class? with | some c => #["--class", c] | none => #[])
+      return ← stagedGlob (selector?.getD wholeRepository) s!"`{old}` renamed to `{new}`"
+        (fun path stage => spawnSelf (#["rename-var-stage", path, stage, old, new] ++ childFlags))
+        apply (mentioning := #[old])
   -- A `variable` line and every declaration under it must be renamed together, so this is a STAGED
   -- glob (all files swapped in at once, one build) rather than a file-at-a-time fork.
   | ["rename-objects"] =>

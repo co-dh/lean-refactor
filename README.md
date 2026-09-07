@@ -62,6 +62,7 @@ rename
     --uses-only                           write r where old is used, but not where it is declared
     --no-index                            find the files by elaborating them, not from the index
   rename-binder d old new                 rename one bound variable of d, in its signature and its proof
+  rename-var old new                      rename a variable-bound binder, and its uses, repository-wide
   rename-objects                          capitalise every binder that is an object of a category
     --class C                             ... which is the type C has an instance for (default Cat)
     --letters s                           ... only these binder letters (default abcd, the object letters)
