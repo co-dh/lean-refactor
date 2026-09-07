@@ -527,16 +527,22 @@ private partial def messageHintEdits (data : MessageData) (fileMap : FileMap) : 
       pure edits
   | _ => pure #[]
 
-/-- Re-elaborate `source` (against the already-imported `env`) and report whether it is error-free.
-    Used to reject an edit that would break the build — chiefly an unused-variable *false positive*
-    (a binder the linter flags yet a `letI`/`haveI` body actually uses) or a parameter referenced by
-    name at a call site.  This is a single in-process elaboration, far cheaper than a `lake build`. -/
-private def elaboratesCleanly (env : Environment) (path source : String) : IO Bool := do
+/-- Re-elaborate `source` (against the already-imported `env`) and return its errors.  Used to reject
+    an edit that would break the build — chiefly an unused-variable *false positive* (a binder the
+    linter flags yet a `letI`/`haveI` body actually uses) or a parameter referenced by name at a call
+    site.  This is a single in-process elaboration, far cheaper than a `lake build`. -/
+private def elaborationErrors (env : Environment) (path source : String) :
+    IO (Array (Position × String)) := do
   let ctx := Parser.mkInputContext source path
   let (_, parserState, headerMessages) ← Parser.parseHeader ctx
-  if headerMessages.hasErrors then return false
+  let errorsOf (log : MessageLog) : IO (Array (Position × String)) :=
+    (log.toList.filter (·.severity == .error)).toArray.mapM fun m => return (m.pos, ← m.toString)
+  if headerMessages.hasErrors then return ← errorsOf headerMessages
   let frontend ← Elab.IO.processCommands ctx parserState (Elab.Command.mkState env {} {})
-  pure !frontend.commandState.messages.hasErrors
+  errorsOf frontend.commandState.messages
+
+private def elaboratesCleanly (env : Environment) (path source : String) : IO Bool := do
+  return (← elaborationErrors env path source).isEmpty
 
 /-- Keep the largest prefix-safe subset of `edits` whose combined application still elaborates.
     Fast path: if applying them all elaborates cleanly, keep them all (one extra elaboration).  Only
@@ -2398,19 +2404,26 @@ private def isObjectType (objectClass : Name) (type : Expr) : MetaM Bool := do
   return (← Meta.synthInstance? (mkApp cls ty)).isSome
 
 open Elab in
-/-- Is this local variable an object of a category?  Tested in the binder's own local context, so an
-    instance binder and a `Type`-valued binder answer no. -/
-private def isObjectVariable (objectClass : Name) (ci : ContextInfo) (lctx : LocalContext)
-    (fvarId : FVarId) : IO Bool := do
-  let some decl := lctx.find? fvarId | return false
-  if decl.binderInfo == .instImplicit || decl.isImplementationDetail then return false
+/-- Run `x` in `lctx` WITH the classes it binds as local instances.  `runMetaM` restores the
+    declarations but not the instances, and without them a `[Cat 𝒞]` hypothesis in scope is unseen,
+    so every binder of a section-variable category answers "not an object". -/
+private def withLocalContext {α} (ci : ContextInfo) (lctx : LocalContext) (x : MetaM α) : IO α :=
   ci.runMetaM lctx do
     let insts ← lctx.foldlM (init := (#[] : LocalInstances)) fun acc d => do
       if d.isImplementationDetail then return acc
       match ← Meta.isClass? d.type with
       | some className => return acc.push { className, fvar := d.toExpr }
       | none => return acc
-    Meta.withLCtx lctx insts (isObjectType objectClass decl.type)
+    Meta.withLCtx lctx insts x
+
+open Elab in
+/-- Is this local variable an object of a category?  Tested in the binder's own local context, so an
+    instance binder and a `Type`-valued binder answer no. -/
+private def isObjectVariable (objectClass : Name) (ci : ContextInfo) (lctx : LocalContext)
+    (fvarId : FVarId) : IO Bool := do
+  let some decl := lctx.find? fvarId | return false
+  if decl.binderInfo == .instImplicit || decl.isImplementationDetail then return false
+  withLocalContext ci lctx (isObjectType objectClass decl.type)
 
 private def containedIn (start stop : String.Pos.Raw) : Option (String.Pos.Raw × String.Pos.Raw) → Bool
   | none => true
@@ -2430,12 +2443,13 @@ open Elab in
 /-- Does the sweep capitalise the callee's binder named `keyword`?  A named argument's keyword is
     the CALLEE's binder name, and the callee is usually declared in another file, so the decision is
     read off its TYPE: the same object test and the same capital clash `objectBinderEdits` makes
-    from a binder's source, made instead from the telescope of the constant being called. -/
-private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (fn : Name)
+    from a binder's source, made instead from the telescope of the function being applied.  `call`
+    is the elaborated application, so a hypothesis is read exactly like a constant. -/
+private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (call : TermInfo)
     (keyword : String) : IO Bool := do
-  let some info := ci.env.find? fn | return false
-  ci.runMetaM {} do
-    Meta.forallTelescopeReducing info.type fun binders _ => do
+  withLocalContext ci call.lctx do
+    let ty ← Meta.inferType call.expr.getAppFn
+    Meta.forallTelescopeReducing ty fun binders _ => do
       let upper := keyword.toUpper
       let mut object := false
       for binder in binders do
@@ -2448,6 +2462,17 @@ private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (fn 
           object ← isObjectType objectClass decl.type
       return object
 
+/-- One file's object-binder edits, split by WHO can check them.  `edits` this file's elaboration
+    settles; `deferred` is right by an imported callee's type and unknowable here, since this file's
+    imports still spell that binder the old way; `candidates` name a binder of a LOCAL callee, whose
+    type may have been written in another file, so the file's elaboration keeps or drops them. -/
+structure ObjectEdits where
+  edits : Array Edit
+  clashes : Array String
+  outside : Array String
+  deferred : Array Edit
+  candidates : Array Edit
+
 open Elab in
 /-- Edits capitalising every single-lowercase-letter object binder of one elaborated file.
 
@@ -2457,14 +2482,12 @@ open Elab in
     `only?` keeps only the binder spelled that way, and then `letters` does not apply: the caller
     named the variable, so it is not the sweep's business which letter it is.
 
-    The fourth component is the DEFERRED edits: named-argument keywords naming a binder of a
-    declaration in another file.  They are right by the callee's type and cannot be checked by
-    elaborating this file, whose imports still spell that binder the old way. -/
+    A named-argument keyword names a binder of the CALLEE, so which of the three edit fields it
+    lands in is which file answers for it. -/
 private def objectBinderEdits (objectClass : Name) (letters : String) (source : String)
     (fileMap : FileMap) (trees : PersistentArray InfoTree) (commands : Array Syntax)
     (within? : Option (String.Pos.Raw × String.Pos.Raw) := none)
-    (only? : Option String := none) :
-    IO (Array Edit × Array String × Array String × Array Edit) := do
+    (only? : Option String := none) : IO ObjectEdits := do
   let infos := termInfos trees
   let lineOf (p : String.Pos.Raw) : Nat := (fileMap.toPosition p).line
   -- Every binder already spelled with a capital, and the context it was introduced in.  A clash is
@@ -2540,15 +2563,17 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
         outside := outside.push s!"line {lineOf lo}: `{old}`"
   -- A variable kept for `within?` but also bound outside it is shared, and half a rename does not
   -- compile, so the whole run is refused rather than written.
-  if !outside.isEmpty then return (#[], clashes, outside, #[])
+  if !outside.isEmpty then return { edits := #[], clashes, outside, deferred := #[], candidates := #[] }
   -- Now the other side of the same rename: `(a := e)` writes a binder name of the CALLEE, so it
   -- moves exactly when the callee's binder does, and `only?` renames one declaration's binder only.
-  let mut callee : Std.HashMap (Nat × Nat) (ContextInfo × Name) := {}
+  let mut callee : Std.HashMap (Nat × Nat) (ContextInfo × TermInfo) := {}
   for (ci, ti) in infos do
     let some range := ti.stx.getRange? | continue
-    let .const fn _ := ti.expr.getAppFn | continue
-    callee := callee.insert (range.start.byteIdx, range.stop.byteIdx) (ci, fn)
+    let fn := ti.expr.getAppFn
+    unless fn.isConst || fn.isFVar do continue
+    callee := callee.insert (range.start.byteIdx, range.stop.byteIdx) (ci, ti)
   let mut deferred : Array Edit := #[]
+  let mut candidates : Array Edit := #[]
   if only?.isNone then
     for cmd in commands do
       for (keyword, app) in namedArguments cmd do
@@ -2557,19 +2582,22 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
         unless old.length == 1 && old.front.isLower && letters.contains old.front do continue
         unless containedIn range.start range.stop within? do continue
         let some appRange := app.getRange? | continue
-        let some (ci, fn) := callee[(appRange.start.byteIdx, appRange.stop.byteIdx)]? |
+        let some (ci, call) := callee[(appRange.start.byteIdx, appRange.stop.byteIdx)]? |
           clashes := clashes.push s!"line {lineOf range.start}: `({old} := …)` stays — the \
-            elaborator names no constant for this call, so the callee's binder cannot be read"
+            elaborator records no term for this call, so the callee's binder cannot be read"
           continue
-        unless ← calleeBinderCapitalised objectClass ci fn old do continue
+        unless ← calleeBinderCapitalised objectClass ci call old do continue
         let edit : Edit :=
           { start := range.start, stop := range.stop, line := lineOf range.start,
             replacement := old.toUpper }
-        -- A callee declared in THIS file is renamed by the edits above, so its keyword is checkable
-        -- here; one from an import is not, and travels as a deferred edit.
-        if (ci.env.getModuleIdxFor? fn).isSome then deferred := deferred.push edit
-        else edits := edits.push edit
-  return ((independentEdits edits).1, clashes, #[], (independentEdits deferred).1)
+        match call.expr.getAppFn with
+        | .const fn _ =>
+            if (ci.env.getModuleIdxFor? fn).isSome then deferred := deferred.push edit
+            else edits := edits.push edit
+        | _ => candidates := candidates.push edit
+  return { edits := (independentEdits edits).1, clashes, outside := #[],
+           deferred := (independentEdits deferred).1,
+           candidates := (independentEdits candidates).1 }
 
 /-- The class that says a type is a category's objects.  `--class` may spell it in full; a bare name
     is resolved in the file's own environment, so `Cat` finds `Freyd.Cat`. -/
@@ -2602,7 +2630,7 @@ private def renameBinder (path declName old new : String) (class? : Option Strin
         return 1
   let some objectClass ← okOr "" (objectClassOf frontend.commandState.env class?) | return 2
   let some (range, _) ← okOr s!"{path}: " (declarationSite source frontend.commands declName) | return 1
-  let (edits, clashes, outside, _) ← objectBinderEdits objectClass "" source ctx.fileMap
+  let { edits, clashes, outside, .. } ← objectBinderEdits objectClass "" source ctx.fileMap
     frontend.commandState.infoState.trees frontend.commands (within? := some range) (only? := some old)
   for message in clashes do IO.eprintln s!"{path}: {message}"
   unless outside.isEmpty do
@@ -2643,19 +2671,35 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
   -- A file whose environment does not even have the class cannot bind one of its objects, so this
   -- is "not affected" (3), not a failure; only a `--class` no file at all knows fails the sweep.
   let .ok objectClass := objectClassOf frontend.commandState.env class? | return 3
-  let (edits, clashes, _, deferred) ← objectBinderEdits objectClass (letters?.getD "abcd") source
-    fileMap frontend.commandState.infoState.trees frontend.commands
+  let { edits, clashes, deferred, candidates, .. } ←
+    objectBinderEdits objectClass (letters?.getD "abcd") source fileMap
+      frontend.commandState.infoState.trees frontend.commands
   for message in clashes do IO.println s!"{path}: {message}"
-  if edits.isEmpty && deferred.isEmpty then return 3
+  if edits.isEmpty && deferred.isEmpty && candidates.isEmpty then return 3
+  -- The gate must catch what the RENAME breaks, not what the file already has: an attribute these
+  -- imports do not register makes a file unrenameable for good otherwise.  Every edit is one letter
+  -- for one letter, so an error at a position the untouched source also errs at is not ours.
+  let introduced (chosen : Array Edit) : IO (Array (Position × String)) := do
+    let errors ← elaborationErrors importEnv path (applyEdits source chosen)
+    if errors.isEmpty then return #[]
+    let baseline ← elaborationErrors importEnv path source
+    return errors.filter fun (p, _) => !baseline.any fun (q, _) => q == p
   -- The sweep is all-or-nothing across the repository, so one file the rename breaks would throw
-  -- away every file it got right.  Each file carries its own elaboration and drops out alone —
-  -- checking the edits this file's own imports can judge, which the deferred keywords are not.
-  unless ← elaboratesCleanly importEnv path (applyEdits source edits) do
+  -- away every file it got right.  Each file carries its own elaboration and drops out alone.
+  let mut kept := edits ++ candidates
+  let mut errors ← introduced kept
+  -- A candidate keyword names a LOCAL's binder, which may have been written in another file and so
+  -- not renamed here; nothing but this elaboration can tell, so they stand or fall as a group.
+  if !errors.isEmpty && !candidates.isEmpty then
+    kept := edits
+    errors ← introduced kept
+  unless errors.isEmpty do
     IO.println s!"{path}: NOT renamed — the file does not elaborate with its object binders \
-      capitalised; rename it by hand, or say why it cannot be"
+      capitalised ({errors.size} error(s)); rename it by hand, or say why it cannot be"
+    for (_, message) in errors.take 3 do IO.println message
     return 3
-  reportEdits path source (edits ++ deferred)
-  IO.FS.writeFile stagePath (applyEdits source (edits ++ deferred))
+  reportEdits path source (kept ++ deferred)
+  IO.FS.writeFile stagePath (applyEdits source (kept ++ deferred))
   return 0
 
 /-- One usage line: the command shape, then what it does, at a fixed column. -/
