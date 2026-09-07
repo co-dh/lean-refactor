@@ -2458,25 +2458,25 @@ private def calleeBinderCapitalised (objectClass : Name) (ci : ContextInfo) (cal
     let ty ← Meta.inferType fn
     Meta.forallTelescopeReducing ty fun binders _ => do
       let upper := keyword.toUpper
-      let mut object := false
       for binder in binders do
         let decl ← binder.fvarId!.getDecl
         let name := decl.userName.eraseMacroScopes.toString
-        -- A capital anywhere in the telescope is the clash that keeps the callee lowercase, whether
-        -- it is bound before this binder or after it.
+        -- The capital already bound where the callee's binder sits is the clash that keeps it
+        -- lowercase.  Decide at the FIRST binder of that name and stop: Lean resolves a named
+        -- argument against the first one too, and `P → Q` in the result type adds another `a`.
         if name == upper then return false
         if name == keyword && decl.binderInfo != .instImplicit then
           let hidden : Bool := match self? with
             | some i => i < binders.size && decl.type.containsFVar (Expr.fvarId! binders[i]!)
             | none => false
           if hidden then return false
-          object ← isObjectType objectClass decl.type
-      return object
+          return ← isObjectType objectClass decl.type
+      return false
 
 /-- One file's object-binder edits, split by WHO can check them.  `edits` this file's elaboration
     settles; `deferred` is right by an imported callee's type and unknowable here, since this file's
     imports still spell that binder the old way; `candidates` name a binder of a LOCAL callee, whose
-    type may have been written in another file, so the file's elaboration keeps or drops them. -/
+    type is as often an imported statement's, so they are staged with the file but never gate it. -/
 structure ObjectEdits where
   edits : Array Edit
   clashes : Array String
@@ -2697,13 +2697,11 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
     return errors.filter fun (p, _) => !baseline.any fun (q, _) => q == p
   -- The sweep is all-or-nothing across the repository, so one file the rename breaks would throw
   -- away every file it got right.  Each file carries its own elaboration and drops out alone.
-  let mut kept := edits ++ candidates
-  let mut errors ← introduced kept
-  -- A candidate keyword names a LOCAL's binder, which may have been written in another file and so
-  -- not renamed here; nothing but this elaboration can tell, so they stand or fall as a group.
-  if !errors.isEmpty && !candidates.isEmpty then
-    kept := edits
-    errors ← introduced kept
+  -- A candidate keyword names a LOCAL's binder, which a hypothesis often takes from an IMPORTED
+  -- statement: these imports still spell it the old way, so this elaboration would reject the one
+  -- edit the repository build then demands.  Gate on the rest, and let them ride with the file.
+  let kept := edits
+  let errors ← introduced kept
   unless errors.isEmpty do
     IO.println s!"{path}: NOT renamed — the file does not elaborate with its object binders \
       capitalised ({errors.size} error(s)); rename it by hand, or say why it cannot be"
@@ -2715,8 +2713,9 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
     reportEdits path source deferred
     IO.FS.writeFile stagePath (applyEdits source deferred)
     return 0
-  reportEdits path source (kept ++ deferred)
-  IO.FS.writeFile stagePath (applyEdits source (kept ++ deferred))
+  let staged := kept ++ candidates ++ deferred
+  reportEdits path source staged
+  IO.FS.writeFile stagePath (applyEdits source staged)
   return 0
 
 /-- One usage line: the command shape, then what it does, at a fixed column. -/
