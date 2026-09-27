@@ -46,7 +46,7 @@ public def cell (h : UInt64) : String :=
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
     the modules whose artefacts changed, so after a keying change the untouched modules would keep
     rows computed by the old algorithm and a grouping query would silently mix two generations. -/
-public def schemaVersion : String := "9"
+public def schemaVersion : String := "10"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
@@ -81,6 +81,7 @@ create table decl_range (
 -- what each one sees.  Masked below 2^63 like every other hash cell, so sqlite stores an integer.
 -- `skel_size` is the skeleton's distinct-node count: below a floor, a shared skeleton is an accident
 -- rather than a copy, and the report filters on it.
+-- `conc_head` is the constant heading the statement's conclusion under its `∀`s, '' for none.
 create table decl_info (
   name text, user_name text, module text,
   kind text,
@@ -89,6 +90,7 @@ create table decl_info (
   stmt_key int,
   skel int,
   skel_size int,
+  conc_head text,
   primary key (name, module)
 );
 
@@ -156,6 +158,9 @@ create index i_decl_range_pos on decl_range(module, sl1, sc1);
 -- alongside them, so an index is what turns each report into a lookup rather than a scan.
 create index i_decl_stmt_key on decl_info(stmt_key);
 create index i_decl_skel on decl_info(skel);
+-- A search for what can PROVE a statement asks by the head of its conclusion; without this that is a
+-- scan of every declaration whose statement merely uses the head.
+create index i_decl_conc_head on decl_info(conc_head);
 "
 
 /-- Spawn `sqlite3` with `extraArgs`, feeding it `sql` from the temp file `tmp` via `.read`.

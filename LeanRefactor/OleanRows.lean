@@ -182,6 +182,13 @@ private def oleanParts (buildDir : String) (mod : Name) : Array System.FilePath 
   let base := System.FilePath.mk (buildDir ++ "/" ++ (toString mod).replace "." "/")
   #[base.addExtension "olean", base.addExtension "olean.server", base.addExtension "olean.private"]
 
+/-- The constant heading a statement's CONCLUSION under its `∀` binders: what a declaration can be
+    applied to prove. -/
+private partial def concHead : Expr → Option Name
+  | .forallE _ _ b _ => concHead b
+  | .mdata _ b => concHead b
+  | t => t.getAppFn.constName?
+
 /-- The constants of one module from its parts, one entry per name. The parts overlap: the private
     part holds every constant, the exported and server parts the exported subset, with definitions
     weakened to axioms. The private part comes last, so the last occurrence wins and the weakened
@@ -235,7 +242,8 @@ public def ofModules (modules : Array Name) (buildDir : String := Db.buildDir) :
       declInfos := declInfos.push (String.intercalate Db.fieldSep
         [name, toString userName, toString mod, kind,
          if generatedName userName then "1" else "0", "",
-         toString (statementKey consts ci &&& 0x7fffffffffffffff), skel, skelSize])
+         toString (statementKey consts ci &&& 0x7fffffffffffffff), skel, skelSize,
+         (concHead ci.type).elim "" toString])
       -- An inductive publishes its constructors' types: `structure LawfulPMC` names `pmcCone` in a
       -- field, and `pmcCone` has to be public for the structure to be.  A constructor gets no row of
       -- its own (`kindOf` drops it), and the inductive's own type is only its arity, so without this
