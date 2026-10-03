@@ -2314,6 +2314,15 @@ private def fitsIn (env : Environment) (source : String) (done : Array Edit) (ed
       | some stx => hasNodeSpanning stx b0 (b0 + edit.replacement.utf8ByteSize)
       | none => fitsIn env source done edit rest
 
+/-- The environment `p`'s command was elaborated in: the `open`s and scoped notation in force there,
+    which the end-of-file environment has already popped. -/
+private def commandEnvAt (trees : Array Elab.InfoTree) (fallback : Environment) (p : String.Pos.Raw) :
+    Environment :=
+  (trees.findSome? fun
+    | .context (.commandCtx c) (.node info _) =>
+      info.stx.getRange?.bind fun r => if r.start ≤ p && p < r.stop then some c.env else none
+    | _ => none).getD fallback
+
 /-- Stage `path` with every application of `declName` written as `form`. -/
 private def notateStage (path declName form stagePath : String) : IO UInt32 := do
   let pieces ← match parseForm form with
@@ -2376,6 +2385,7 @@ private def notateStage (path declName form stagePath : String) : IO UInt32 := d
   let mut unparsed := false
   for (head, explicitMode, app?, paren?, above) in ordered do
     let some headRange := head.getRange? | continue
+    let env := commandEnvAt frontend.commandState.infoState.trees.toArray env headRange.start
     let args := (app?.bind appArgs).getD #[]
     if app?.any fun app => app[1].getArgs.size != args.size then
       IO.println s!"{siteAt headRange.start}: named argument; left as is"; continue
@@ -3397,4 +3407,8 @@ def main (args : List String) : IO UInt32 := do
 
 end LeanRefactor
 
-public def main (args : List String) : IO UInt32 := LeanRefactor.main args
+-- What `lean` itself does: an imported `initialize` (a user attribute such as `[diag_bridge]`) must
+-- run, or a file using it fails to elaborate here while it builds fine.
+public unsafe def main (args : List String) : IO UInt32 := do
+  enableInitializersExecution
+  LeanRefactor.main args
