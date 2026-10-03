@@ -143,7 +143,6 @@ private def enclosingParen (fileMap : FileMap) (site : ReferenceSite)
   let appRange ← app.getRange?
   let paren ← parents.find? fun parent =>
     parent.isOfKind ``Lean.Parser.Term.paren &&
-      (parent.getArgs.filter fun child => !child.isAtom && child.getRange?.isSome).size == 1 &&
       (match parent.getArgs[1]?.bind (·.getRange?) with
         | some inner => inner.start == appRange.start && inner.stop == appRange.stop
         | none => false)
@@ -2193,6 +2192,233 @@ private def infixGlob (pattern declName token : String) (apply : Bool) : IO UInt
     (fun path stage => spawnSelf #["infix-stage", path, declName, token, stage]) apply
     (mentioning := #[shortName declName])
 
+/-! ## Applied form to a written form
+
+`notate d --form 'P[$0]'` writes every application of `d` in a syntax form whose holes `$0`, `$1`, …
+are `d`'s explicit arguments.  The uses come from the info trees (`findModuleRefs`), so the dotted,
+the `open`ed and the `@`-explicit spellings are all the same constant; the syntax tree then gives
+the application around each use.  Whether an argument needs brackets in its hole, and whether the
+result needs brackets where the application stood, is asked of Lean's term parser, never guessed. -/
+
+private inductive FormPiece where
+  | text (s : String)
+  | hole (k : Nat)
+
+/-- The form's own reader: `$k` is hole `k`, `$$` a literal `$`.  The form is this tool's notation,
+    not Lean's, so no Lean parser knows it. -/
+private partial def parseForm (form : String) : Except String (Array FormPiece) :=
+  go form.toList "" #[]
+where
+  flush (lit : String) (out : Array FormPiece) : Array FormPiece :=
+    if lit.isEmpty then out else out.push (.text lit)
+  go : List Char → String → Array FormPiece → Except String (Array FormPiece)
+    | [], lit, out => .ok (flush lit out)
+    | '$' :: '$' :: cs, lit, out => go cs (lit.push '$') out
+    | '$' :: cs, lit, out =>
+      let digits := cs.takeWhile Char.isDigit
+      match (String.ofList digits).toNat? with
+      | some k => go (cs.drop digits.length) "" ((flush lit out).push (.hole k))
+      | none => .error "`$` in a form must be followed by an argument number, or be written `$$`"
+    | c :: cs, lit, out => go cs (lit.push c) out
+
+/-- The form with `args` in its holes, and the byte span each hole occurrence took. -/
+private def renderForm (pieces : Array FormPiece) (args : Array String) :
+    String × Array (Nat × Nat × Nat) := Id.run do
+  let mut out := ""
+  let mut spans := #[]
+  for piece in pieces do
+    match piece with
+    | .text s => out := out ++ s
+    | .hole k =>
+      let arg := args[k]?.getD ""
+      spans := spans.push (k, out.utf8ByteSize, out.utf8ByteSize + arg.utf8ByteSize)
+      out := out ++ arg
+  return (out, spans)
+
+private partial def hasNodeSpanning (stx : Syntax) (b0 b1 : Nat) : Bool :=
+  (match stx.getRange? with
+    | some r => r.start.byteIdx == b0 && r.stop.byteIdx == b1
+    | none => false) || stx.getArgs.any (hasNodeSpanning · b0 b1)
+
+/-- `text` parses as ONE argument: `f text g` is `f` applied to exactly `text` and `g`.  The trailing
+    `g` is what catches a `fun`/`match`, which would swallow anything after it. -/
+private def isAtomic (env : Environment) (text : String) : Bool :=
+  match Parser.runParserCategory env `term s!"f {text} g" with
+  | .ok stx => stx.isOfKind ``Lean.Parser.Term.app && stx[1].getArgs.size == 2 &&
+      hasNodeSpanning stx[1][0] 2 (2 + text.utf8ByteSize)
+  | .error _ => false
+
+/-- Fill the holes, bracketing exactly the arguments the parse does not read as one node in their
+    hole.  `none` when the form does not parse even with every argument bracketed: the form's
+    notation is not in scope in this file. -/
+private def fillForm (env : Environment) (pieces : Array FormPiece) (args : Array String) :
+    Option String := Id.run do
+  let mut wrap := Array.replicate args.size false
+  for _ in [0:args.size + 1] do
+    let texts := (args.zip wrap).map fun (t, w) => if w then s!"({t})" else t
+    let (out, spans) := renderForm pieces texts
+    let .ok stx := Parser.runParserCategory env `term out | break
+    let loose := spans.filter fun (k, b0, b1) => !wrap[k]! && !hasNodeSpanning stx b0 b1
+    if loose.isEmpty then return some out
+    for (k, _, _) in loose do wrap := wrap.set! k true
+  let bracketed := args.map (s!"({·})")
+  let (out, _) := renderForm pieces bracketed
+  match Parser.runParserCategory env `term out with
+  | .ok _ => some out
+  | .error _ => none
+
+/-- Positions, among all of `d`'s parameters, of its explicit ones, and how many parameters there are. -/
+private def explicitParams (type : Expr) : Array Nat × Nat :=
+  go type 0 #[]
+where
+  go : Expr → Nat → Array Nat → Array Nat × Nat
+    | .forallE _ _ body bi, i, acc => go body (i + 1) (if bi == .default then acc.push i else acc)
+    | .mdata _ body, i, acc => go body i acc
+    | _, i, acc => (acc, i)
+
+private def sameRange (a b : Syntax) : Bool :=
+  match a.getRange?, b.getRange? with
+  | some r, some s => r.start == s.start && r.stop == s.stop
+  | _, _ => false
+
+/-- `source` over `range`, with the edits already made strictly inside it spliced in. -/
+private def textWithEdits (source : String) (start stop : String.Pos.Raw) (done : Array Edit) : String :=
+  let inner := done.filter fun e => start ≤ e.start && e.stop ≤ stop && !(e.start == start && e.stop == stop)
+  let outer := inner.filter fun e => !inner.any fun o =>
+    o.start ≤ e.start && e.stop ≤ o.stop && !(o.start == e.start && o.stop == e.stop)
+  let shifted := outer.map fun e =>
+    { e with start := ⟨e.start.byteIdx - start.byteIdx⟩, stop := ⟨e.stop.byteIdx - start.byteIdx⟩ }
+  applyEdits (String.Pos.Raw.extract source start stop) shifted
+
+/-- Whether `edit`'s unbracketed replacement is read as one node by the nearest enclosing syntax that
+    parses as a term on its own — `powerObj A ⟶ B` takes `P A` bare, `𝟙 (powerObj B)` does not.  When
+    no ancestor parses (a scoped notation not in force at the end of the file, a command), only an
+    atomic replacement counts as fitting. -/
+private def fitsIn (env : Environment) (source : String) (done : Array Edit) (edit : Edit) :
+    List Syntax → Bool
+  | [] => isAtomic env edit.replacement
+  | ctx :: rest => match ctx.getRange? with
+    | none => fitsIn env source done edit rest
+    | some r =>
+      let edits := done.push edit
+      let text := textWithEdits source r.start r.stop edits
+      let b0 := (textWithEdits source r.start edit.start edits).utf8ByteSize
+      match Parser.runParserCategory env `term text with
+      | .ok stx => hasNodeSpanning stx b0 (b0 + edit.replacement.utf8ByteSize)
+      | .error _ => fitsIn env source done edit rest
+
+/-- Stage `path` with every application of `declName` written as `form`. -/
+private def notateStage (path declName form stagePath : String) : IO UInt32 := do
+  let pieces ← match parseForm form with
+    | .ok pieces => pure pieces
+    | .error message => IO.eprintln s!"form `{form}`: {message}"; return 2
+  claimElaboration path
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let source ← IO.FS.readFile path
+  initSearchPath (← findSysroot)
+  let (inputCtx, _, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
+    | .ok result => pure result
+    | .error e =>
+        for msg in e.messages.toList do IO.eprintln (← msg.toString)
+        return 1
+  if frontend.commandState.messages.hasErrors then
+    for msg in frontend.commandState.messages.toList do IO.eprintln (← msg.toString)
+    IO.eprintln s!"{path}: does not elaborate before the edit"
+    return 1
+  let env := frontend.commandState.env
+  let fileMap := inputCtx.fileMap
+  let some info := env.find? (parseName declName)
+    | IO.eprintln s!"{path}: `{declName}` is not a constant this file can see"; return 1
+  let (explicit, arity) := explicitParams info.type
+  let holes := pieces.filterMap fun | .hole k => some k | .text _ => none
+  if let some k := holes.find? (· ≥ explicit.size) then
+    IO.eprintln s!"form `{form}` has hole ${k}, but `{declName}` has {explicit.size} explicit argument(s)"
+    return 2
+  if let some k := (List.range explicit.size).find? (!holes.contains ·) then
+    IO.eprintln s!"form `{form}` drops explicit argument ${k} of `{declName}`"
+    return 2
+  let refs := Server.findModuleRefs fileMap frontend.commandState.infoState.trees.toArray (localVars := false)
+  let (references, _) ← refs.toLspModuleRefs
+  let starts := (sitesNamed references declName (·.usages)).map (fileMap.lspPosToUtf8Pos ·.range.start)
+  let starts := starts.foldl (fun acc p => if acc.contains p then acc else acc.push p) #[]
+  let siteAt (p : String.Pos.Raw) := s!"{path}:{(fileMap.toPosition p).line}"
+  -- Each use: the head (`d` or `@d`), the application it heads, and brackets holding only that.
+  let mut sites : Array (Syntax × Bool × Option Syntax × Option Syntax × List Syntax) := #[]
+  for p in starts do
+    let some (leaf, parents) := frontend.commands.findSome? (syntaxAt p)
+      | IO.println s!"{siteAt p}: use has no source syntax; left as is"; continue
+    unless leaf.isIdent && leaf.getPos? == some p do
+      IO.println s!"{siteAt p}: `{declName}` is written through notation or dot notation; left as is"; continue
+    let (head, rest, explicitMode) := match parents with
+      | q :: rest => if q.isOfKind ``Lean.Parser.Term.explicit then (q, rest, true) else (leaf, parents, false)
+      | [] => (leaf, [], false)
+    let (app?, above) := match rest with
+      | q :: above => if q.isOfKind ``Lean.Parser.Term.app && sameRange q[0] head then (some q, above) else (none, rest)
+      | [] => (none, [])
+    let paren? := match above with
+      | q :: _ => if q.isOfKind ``Lean.Parser.Term.paren &&
+            (match app?, q[1].getRange? with | some a, some _ => sameRange q[1] a | _, _ => false)
+          then some q else none
+      | [] => none
+    sites := sites.push (head, explicitMode, app?, paren?, above)
+  -- Innermost first, so an argument that is itself a use is already rewritten when it is read.
+  let span (s : Syntax × Bool × Option Syntax × Option Syntax × List Syntax) :=
+    match (s.2.2.1.getD s.1).getRange? with | some r => r.stop.byteIdx - r.start.byteIdx | none => 0
+  let ordered := sites.qsort fun a b => span a < span b
+  let mut done : Array Edit := #[]
+  let mut unparsed := false
+  for (head, explicitMode, app?, paren?, above) in ordered do
+    let some headRange := head.getRange? | continue
+    let args := (app?.bind appArgs).getD #[]
+    if app?.any fun app => app[1].getArgs.size != args.size then
+      IO.println s!"{siteAt headRange.start}: named argument; left as is"; continue
+    let (taken, extra) :=
+      if explicitMode then
+        (explicit.filterMap (args[·]?), args.extract arity args.size)
+      else (args.extract 0 explicit.size, args.extract explicit.size args.size)
+    if taken.size < explicit.size then
+      IO.println s!"{siteAt headRange.start}: `{declName}` applied to fewer than {explicit.size} explicit argument(s); left as is"
+      continue
+    let textOf (stx : Syntax) : String := match stx.getRange? with
+      | some r => textWithEdits source r.start r.stop done
+      | none => ""
+    let argTexts := taken.map (textOf ∘ unwrapOperand)
+    let filled ← match fillForm env pieces argTexts with
+      | some out => pure out
+      | none =>
+        unless unparsed do
+          IO.println s!"{path}: form `{form}` does not parse here; arguments bracketed unless atomic, \
+            the application's own brackets kept"
+        unparsed := true
+        let bracket (t : String) := if isAtomic env t then t else s!"({t})"
+        pure (renderForm pieces (argTexts.map bracket)).1
+    let whole := if extra.isEmpty then filled else
+      let headText := if isAtomic env filled then filled else s!"({filled})"
+      String.intercalate " " (headText :: (extra.map textOf).toList)
+    let some appRange := (app?.getD head).getRange? | continue
+    let ancestors := if paren?.isSome then above.drop 1 else above
+    let bare (r : Lean.Syntax.Range) : Edit := { start := r.start, stop := r.stop, line := 0, replacement := whole }
+    -- Without brackets where the brackets (or the application) stood, if the context still reads
+    -- it as one node; otherwise bracketed, keeping the author's brackets when there were some.
+    let edit := match paren?.bind (·.getRange?) with
+      | some pr => if fitsIn env source done (bare pr) ancestors then bare pr else bare appRange
+      | none => if fitsIn env source done (bare appRange) ancestors then bare appRange
+          else { bare appRange with replacement := s!"({whole})" }
+    done := done.push { edit with line := (fileMap.toPosition edit.start).line }
+  let outermost := done.filter fun e => !done.any fun o =>
+    o.start ≤ e.start && e.stop ≤ o.stop && !(o.start == e.start && o.stop == e.stop)
+  if outermost.isEmpty then IO.println s!"{path}: no application of `{declName}`"; return 3
+  for edit in outermost.qsort (·.start.byteIdx < ·.start.byteIdx) do
+    IO.println s!"{path}:{edit.line}: {repr (String.Pos.Raw.extract source edit.start edit.stop)} -> {repr edit.replacement}"
+  IO.FS.writeFile stagePath (applyEdits source outermost)
+  return 0
+
+private def notateGlob (pattern declName form : String) (apply : Bool) : IO UInt32 := do
+  if let .error message := parseForm form then IO.eprintln s!"form `{form}`: {message}"; return 2
+  stagedGlob pattern s!"wrote `{declName}` as `{form}`"
+    (fun path stage => spawnSelf #["notate-stage", path, declName, form, stage]) apply
+    (mentioning := #[shortName declName])
+
 /-- Every `.lean` file in the repository — what a command works on when the caller did not narrow
     with `--in`.  Renaming is repository-wide by nature, and the `mentioning` prefilter plus the
     index fast path are what make the default affordable: a file that does not contain the short
@@ -2815,6 +3041,7 @@ private def usage : String := String.intercalate "\n" [
   row "  --class C" "... which is the type C has an instance for (default Cat)",
   row "  --letters s" "... only these binder letters (default abcd, the object letters)",
   row "infix d token" "give d the infix notation token",
+  row "notate d --form f" "write every application of d as f; $0, $1, ... are its explicit arguments",
   "",
   "move",
   row "move d dest" "dest is another .lean file, or a declaration or section to sit before",
@@ -2918,6 +3145,7 @@ def main (args : List String) : IO UInt32 := do
   let (args, minNodes?) := stripFlag "--min-nodes" args
   let (args, class?) := stripFlag "--class" args
   let (args, letters?) := stripFlag "--letters" args
+  let (args, form?) := stripFlag "--form" args
   -- One place turns a flag's text into a number, so every command reports a bad one the same way.
   let natFlag (name : String) : Option String → Except String (Option Nat)
     | none => .ok none
@@ -2995,6 +3223,11 @@ def main (args : List String) : IO UInt32 := do
       return ← refactorSuggestedWarnings { path } apply (includeVariables := false)
   | ["infix", declName, token] =>
       return ← infixGlob (selector?.getD wholeRepository) declName token apply
+  | ["notate-stage", path, declName, form, stagePath] =>
+      return ← notateStage path declName form stagePath
+  | ["notate", declName] =>
+      let some form := form? | IO.eprintln "notate needs --form, e.g. --form 'P[$0]'"; return 2
+      return ← notateGlob (selector?.getD wholeRepository) declName form apply
   | ["move", declName, dest] =>
       let .ok path ← fileOf selector? declName | return 2
       -- A `.lean` destination is another file; anything else is an anchor within this one.  The

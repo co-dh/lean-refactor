@@ -1,0 +1,6 @@
+name = "fix"
+defaultTargets = ["Fix"]
+
+[[lean_lib]]
+name = "Fix"
+globs = ["Fix.+"]
