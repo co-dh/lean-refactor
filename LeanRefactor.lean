@@ -2143,7 +2143,9 @@ private def identNames (declName : String) (id : String) : Bool :=
     text the author wrote: whether THAT needs bracketing is a precedence question, and guessing it
     wrong changes the term. -/
 private partial def unwrapOperand (stx : Syntax) : Syntax :=
-  if stx.isOfKind ``Lean.Parser.Term.paren || stx.isOfKind nullKind then
+  -- The `(` of a paren is a `hygienicLParen` NODE, not an atom, so a child count cannot find its term.
+  if stx.isOfKind ``Lean.Parser.Term.paren then unwrapOperand stx[1]
+  else if stx.isOfKind nullKind then
     match stx.getArgs.filter fun child => !child.isAtom && child.getRange?.isSome with
     | #[inner] => unwrapOperand inner
     | _ => stx
@@ -2236,7 +2238,8 @@ private def renderForm (pieces : Array FormPiece) (args : Array String) :
   return (out, spans)
 
 private partial def hasNodeSpanning (stx : Syntax) (b0 b1 : Nat) : Bool :=
-  (match stx.getRange? with
+  -- A `null` node only groups (an application's argument list), so it is not one term.
+  (!stx.isOfKind nullKind && match stx.getRange? with
     | some r => r.start.byteIdx == b0 && r.stop.byteIdx == b1
     | none => false) || stx.getArgs.any (hasNodeSpanning · b0 b1)
 
@@ -2283,7 +2286,7 @@ private def sameRange (a b : Syntax) : Bool :=
 
 /-- `source` over `range`, with the edits already made strictly inside it spliced in. -/
 private def textWithEdits (source : String) (start stop : String.Pos.Raw) (done : Array Edit) : String :=
-  let inner := done.filter fun e => start ≤ e.start && e.stop ≤ stop && !(e.start == start && e.stop == stop)
+  let inner := done.filter fun e => start ≤ e.start && e.stop ≤ stop
   let outer := inner.filter fun e => !inner.any fun o =>
     o.start ≤ e.start && e.stop ≤ o.stop && !(o.start == e.start && o.stop == e.stop)
   let shifted := outer.map fun e =>
@@ -2300,12 +2303,16 @@ private def fitsIn (env : Environment) (source : String) (done : Array Edit) (ed
   | ctx :: rest => match ctx.getRange? with
     | none => fitsIn env source done edit rest
     | some r =>
+      -- A node no wider than the edit (the argument list of a sole argument) is no context.
+      if r.start == edit.start && r.stop == edit.stop then fitsIn env source done edit rest else
       let edits := done.push edit
       let text := textWithEdits source r.start r.stop edits
       let b0 := (textWithEdits source r.start edit.start edits).utf8ByteSize
-      match Parser.runParserCategory env `term text with
-      | .ok stx => hasNodeSpanning stx b0 (b0 + edit.replacement.utf8ByteSize)
-      | .error _ => fitsIn env source done edit rest
+      -- The top of the chain is a command, which the `term` category cannot read.
+      match (Parser.runParserCategory env `term text).toOption <|>
+          (Parser.runParserCategory env `command text).toOption with
+      | some stx => hasNodeSpanning stx b0 (b0 + edit.replacement.utf8ByteSize)
+      | none => fitsIn env source done edit rest
 
 /-- Stage `path` with every application of `declName` written as `form`. -/
 private def notateStage (path declName form stagePath : String) : IO UInt32 := do
@@ -2382,7 +2389,10 @@ private def notateStage (path declName form stagePath : String) : IO UInt32 := d
     let textOf (stx : Syntax) : String := match stx.getRange? with
       | some r => textWithEdits source r.start r.stop done
       | none => ""
-    let argTexts := taken.map (textOf ∘ unwrapOperand)
+    -- An argument whose own brackets an inner rewrite already replaced is read whole.
+    let argTexts := taken.map fun arg =>
+      if arg.getRange?.any (fun r => done.any fun e => e.start == r.start && e.stop == r.stop) then textOf arg
+      else textOf (unwrapOperand arg)
     let filled ← match fillForm env pieces argTexts with
       | some out => pure out
       | none =>

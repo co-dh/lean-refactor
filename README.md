@@ -67,6 +67,7 @@ rename
     --class C                             ... which is the type C has an instance for (default Cat)
     --letters s                           ... only these binder letters (default abcd, the object letters)
   infix d token                           give d the infix notation token
+  notate d --form f                       write every application of d as f; $0, $1, ... are its explicit arguments
 
 move
   move d dest                             dest is another .lean file, or a declaration or section to sit before
