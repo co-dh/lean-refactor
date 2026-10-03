@@ -441,7 +441,7 @@ private def sourceIsModule (source : String) : Bool :=
     pure waste, and scanning is the ENTIRE cost of a glob run: one file is a full Lean elaboration,
     0.2 s to 5 s.  Measured on this repository: `mono_comp` occurs in 8 of 500 files, so the filter
     is what turns a repository-wide rename from minutes into seconds.  Plain substring containment,
-    not `isIdentifierUse`, on purpose — it also covers notation tokens, and being too generous only
+    not identifier matching, on purpose — it also covers notation tokens, and being too generous only
     costs a scan that finds nothing, while being too clever would drop a real edit. -/
 private def selectedFiles (pattern : String) (mentioning : Array String := #[]) :
     IO (Array String) := do
@@ -1080,21 +1080,6 @@ private def collapseDeclaration (path declName replacement : String) (apply : Bo
   let updated := applyEdits source selectedEdits
   gatedWrite path source updated s!"collapsing `{declName}` into `{replacement}`"
 
-/-- Does `line` use `name` as a standalone identifier (not as part of a longer one)? -/
-private def isIdentifierUse (line name : String) : Bool := Id.run do
-  let isPart (c : Char) := c.isAlphanum || c == '_' || c == '\'' || c == '.'
-  let chars := line.toList
-  let target := name.toList
-  let mut rest := chars
-  let mut previous : Option Char := none
-  while !rest.isEmpty do
-    if rest.take target.length == target then
-      let after := rest.drop target.length
-      if !previous.any isPart && !(after.head?.any isPart) then return true
-    previous := rest.head?
-    rest := rest.drop 1
-  return false
-
 /-- One declaration to rename, and what to rename it to. -/
 private structure Rename where
   declName : String
@@ -1137,22 +1122,73 @@ private structure ScannedFile where
   source : String
   fileMap : FileMap
   commands : Array Syntax
+  /-- Constant AND local-variable references: a field's laws name it as a local bound at the field. -/
   references : Lsp.ModuleRefs
+  trees : Array Elab.InfoTree
   /-- The env of the file's IMPORTS, not of the file itself — `elaboratesCleanly` re-elaborates the
       candidate text against it, which the file's own declarations in scope would make impossible. -/
   env : Environment
 
-/-- A reference site spans the WHOLE identifier as written, qualifier included, so replacing it with
-    a bare new name deletes the namespace: `CartBicat.cop` became `delta`, which resolves nowhere.
-    When the replacement is a simple name, only the last component moves and the writer's chosen
-    qualification is kept.  A dotted replacement is taken verbatim — that is a caller asking for a
-    different namespace, not for a rename. -/
-private def qualifierPreserving (source declName : String) (edit : Edit) : Edit :=
-  if (edit.replacement.splitOn ".").length > 1 then edit else
-  let parts := (String.Pos.Raw.extract source edit.start edit.stop).splitOn "."
-  if parts.length > 1 && parts.getLastD "" == shortName declName then
-    { edit with replacement := String.intercalate "." (parts.dropLast ++ [edit.replacement]) }
-  else edit
+/-- Every `TermInfo` of `trees`, each with the context it was elaborated in. -/
+private def termInfos (trees : Array Elab.InfoTree) : Array (Elab.ContextInfo × Elab.TermInfo) :=
+  trees.foldl (init := #[]) fun acc tree =>
+    tree.foldInfo (fun ci info acc => match info with
+      | .ofTermInfo ti => acc.push (ci, ti)
+      | _ => acc) acc
+
+/-- The scope `p`'s command was elaborated in: its environment, namespace and `open`s, which the
+    end-of-file state has already popped. -/
+private def commandCtxAt? (trees : Array Elab.InfoTree) (p : String.Pos.Raw) :
+    Option Elab.CommandContextInfo :=
+  trees.findSome? fun
+    | .context (.commandCtx c) (.node info _) =>
+      info.stx.getRange?.bind fun r => if r.start ≤ p && p < r.stop then some c else none
+    | _ => none
+
+/-- The global constants `id` names in `c`'s scope over `env`; a reading that leaves trailing
+    components as projections is not a name for a constant. -/
+private def resolvedAt (c : Elab.CommandContextInfo) (env : Environment) (id : Name) : List Name :=
+  (ResolveName.resolveGlobalName env c.options c.currNamespace c.openDecls id).filterMap fun
+    | (n, []) => some n | _ => none
+
+/-- The identifier a site's text is, read by the term parser, and whether it is `@`-explicit. -/
+private def siteIdent? (env : Environment) (text : String) : Option (Bool × Name) := do
+  let stx ← (Parser.runParserCategory env `term text).toOption
+  if stx.isIdent then return (false, stx.getId)
+  if stx.isOfKind ``Lean.Parser.Term.explicit && stx[1].isIdent then return (true, stx[1].getId)
+  none
+
+private partial def identsIn (stx : Syntax) : Array Syntax :=
+  (if stx.isIdent then #[stx] else #[]) ++ stx.getArgs.flatMap identsIn
+
+/-- How the site whose text is `text` writes `new` in place of `old`.  Where the identifier resolves
+    to `old` in its command's scope, the answer is asked of name resolution in that scope with `new`
+    added: the source's own qualification if it resolves to `new` alone, else the shortest suffix of
+    `new` that does.  Anywhere else — a binder, a field access `x.f`, a local bound at a field —
+    the qualifier is relative to something resolution does not see, so only the last component
+    moves, which is sound only when `old` and `new` share their namespace. -/
+private def spellingFor (trees : Array Elab.InfoTree) (start : String.Pos.Raw) (line : Nat)
+    (old new : Name) (text : String) : Except String String := do
+  let some c := commandCtxAt? trees start | .error s!"line {line}: no command scope recorded"
+  let some (explicit, id) := siteIdent? c.env text
+    | .error s!"line {line}: `{text}` does not parse as an identifier"
+  let at_ (n : Name) := (if explicit then "@" else "") ++ n.toString
+  let sameNs := old.getPrefix == new.getPrefix
+  unless resolvedAt c c.env id == [old] do
+    if sameNs then return at_ (new.updatePrefix id.getPrefix)
+    .error s!"line {line}: `{text}` is not a global name for `{old}`, so it can only keep its \
+      qualifier, and `{new}` is in another namespace"
+  if c.env.contains new then .error s!"line {line}: `{new}` is already declared"
+  let env ← match c.env.addDeclCore 0
+      (.axiomDecl { name := new, levelParams := [], type := .sort .zero, isUnsafe := false }) none (doCheck := false) with
+    | Except.ok env => pure env
+    | .error _ => .error s!"line {line}: cannot add `{new}` to the scope there to resolve against"
+  let comps := new.components
+  let suffixes := (List.range comps.length).reverse.map fun i => (comps.drop i).foldl Name.append .anonymous
+  let candidates := (if sameNs then [new.updatePrefix id.getPrefix] else []) ++ suffixes
+  match candidates.find? (resolvedAt c env · == [new]) with
+  | some n => return at_ n
+  | none => .error s!"line {line}: no spelling of `{new}` resolves to it alone in this scope"
 
 /-- The semantic and syntactic passes both see a site that is both a reference and an identifier,
     so the union has to be taken by position or the same span is reported — and counted — twice. -/
@@ -1177,85 +1213,79 @@ private def scanFile (path moduleName : String) : IO (Except UInt32 ScannedFile)
     | .error e =>
         for msg in e.messages.toList do IO.eprintln (← msg.toString)
         return .error 1
-  let references := Server.findModuleRefs inputCtx.fileMap
-    frontend.commandState.infoState.trees.toArray (localVars := false)
-  let (liveReferences, _) ← references.toLspModuleRefs
+  let trees := frontend.commandState.infoState.trees.toArray
+  let (liveReferences, _) ← (Server.findModuleRefs inputCtx.fileMap trees).toLspModuleRefs
   return .ok { source, fileMap := inputCtx.fileMap, commands := frontend.commands,
-               references := liveReferences, env }
+               references := liveReferences, trees, env }
 
-/-- Every site in `scan` that names `r.declName`, resolved semantically: this module's own info trees
-    first, and only then identifier syntax.  `withDefinition` picks which edit is wanted — renaming a
-    USE is not renaming a DEFINITION.  `rename` moves the uses only (the binding site is a separate
-    edit the caller may not want); `rename-decl` moves both, which is what an actual rename of a
-    declaration is. -/
-private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool) : Array Edit :=
-  Id.run do
+/-- Every site in `scan` that names the CONSTANT `r.declName` — never an identifier that merely ends
+    the same way, which is how `A.bar` once rewrote every use of `B.bar`:
+    * the info trees' references to that constant (with `withDefinition`, its binding site too);
+    * with `withDefinition`, the locals bound AT that binding site: a field's laws name the field as a
+      local, not as the constant;
+    * any identifier the info trees recorded nothing for (`unfold`'s arguments, among others) that
+      resolves, in its own command's scope, to that constant and nothing else.
+    Each site is then respelled by `spellingFor`.  `withDefinition` picks which edit is wanted:
+    `rename --uses-only` moves the uses, a real rename moves the binding site as well. -/
+private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool) :
+    Except String (Array Edit) := do
+  let old := parseName r.declName
+  let new := parseName r.replacement
+  let defs := sitesNamed scan.references r.declName (·.definition?.toArray)
   let mut sites := sitesNamed scan.references r.declName (·.usages)
+  let mut recorded : Std.HashSet Nat := {}
+  for (_, info) in scan.references do
+    for loc in info.usages ++ info.definition?.toArray do
+      recorded := recorded.insert (scan.fileMap.lspPosToUtf8Pos loc.range.start).byteIdx
   if withDefinition then
-    sites := sites ++ sitesNamed scan.references r.declName (·.definition?.toArray)
-    -- A `class`/`structure` field is used by the very laws declared beside it, and inside that body
-    -- the field is a BINDER reference, not a `.const` — the info trees do not record it.  Without
-    -- the syntax pass, renaming a field leaves its own laws naming the old one, so the file no
-    -- longer elaborates.  Only `rename-decl` needs this: it is the operation that moves the
-    -- binding site, hence the only one for which the declaring body is in scope.
-    for cmd in scan.commands do
-      sites := sites ++ syntaxSitesNamed scan.fileMap r.declName cmd
-  if sites.isEmpty then
-    -- The fallback matches by NAME, so it cannot tell a binder from a use.  Left unfiltered it
-    -- re-admits the very definition `--uses-only` promised to leave alone, and the rename then
-    -- declares a SECOND declaration under the replacement's name -- silently, since the file still
-    -- elaborates.  Measured on qlean: a second `rename Ew.nan64 QLean.nanBits --uses-only` with no
-    -- use left rewrote `def nan64` itself.
-    let defs := sitesNamed scan.references r.declName (·.definition?.toArray)
-    for cmd in scan.commands do
-      for site in syntaxSitesNamed scan.fileMap r.declName cmd do
-        if withDefinition || !defs.any (·.range == site.range) then sites := sites.push site
-  let edits := sites.map fun site =>
-    { start := scan.fileMap.lspPosToUtf8Pos site.range.start,
-      stop := scan.fileMap.lspPosToUtf8Pos site.range.end,
-      line := site.range.start.line + 1, replacement := r.replacement }
-  return (dedupeEdits edits).map (qualifierPreserving scan.source r.declName)
+    sites := sites ++ defs
+    -- Inside the declaring command a structure's laws see the field as the local the structure
+    -- elaborator binds under the field's own name; the info trees record no binding site for it.
+    let field := old.updatePrefix .anonymous
+    for d in defs do
+      let p := scan.fileMap.lspPosToUtf8Pos d.range.start
+      let some cmd := scan.commands.find? fun c => c.getRange?.any fun r => r.start ≤ p && p < r.stop
+        | continue
+      let some cr := cmd.getRange? | continue
+      for (_, ti) in termInfos scan.trees do
+        let .fvar id := ti.expr | continue
+        let some r := ti.stx.getRange? | continue
+        if cr.start ≤ r.start && r.stop ≤ cr.stop && (ti.lctx.find? id).any (·.userName == field) then
+          sites := sites.push { range := ⟨scan.fileMap.utf8PosToLspPos r.start,
+            scan.fileMap.utf8PosToLspPos r.stop⟩, parent? := none }
+  for cmd in scan.commands do
+    for stx in identsIn cmd do
+      let some range := stx.getRange? | continue
+      unless recorded.contains range.start.byteIdx do
+        if let some c := commandCtxAt? scan.trees range.start then
+          if resolvedAt c c.env stx.getId == [old] then
+            sites := sites.push { range := ⟨scan.fileMap.utf8PosToLspPos range.start,
+              scan.fileMap.utf8PosToLspPos range.stop⟩, parent? := none }
+  let mut edits := #[]
+  for site in sites do
+    let start := scan.fileMap.lspPosToUtf8Pos site.range.start
+    let stop := scan.fileMap.lspPosToUtf8Pos site.range.end
+    let line := site.range.start.line + 1
+    let replacement ← spellingFor scan.trees start line old new (String.Pos.Raw.extract scan.source start stop)
+    edits := edits.push { start, stop, line, replacement }
+  return dedupeEdits edits
 
-/-- The same edits `renameEdits` builds, from sites the index already recorded rather than from a
-    fresh elaboration.  The tail — position conversion, de-duplication, qualifier preservation —
-    is the shared part and must stay identical, or the two paths stop agreeing. -/
-private def indexRenameEdits (fileMap : FileMap) (source : String) (r : Rename)
-    (sites : Array Query.Site) : Array Edit :=
-  (dedupeEdits (sites.map fun site =>
-    { start := fileMap.lspPosToUtf8Pos ⟨site.l1, site.c1⟩,
-      stop  := fileMap.lspPosToUtf8Pos ⟨site.l2, site.c2⟩,
-      line  := site.l1 + 1, replacement := r.replacement })).map (qualifierPreserving source r.declName)
-
-/-- The conflict check every batch of renames must pass.  Two renames can claim the SAME span:
-    `syntaxSitesNamed` matches a short name, so `A.bar` and `B.bar` both answer to `bar`.
-    Rewriting such a site to one of the two silently would be a wrong edit, so the batch is
-    refused and the caller told to run those two renames separately.  Identical claims are just
-    the duplicate they look like, and collapse. -/
-private def checkedBatch (renames : Array Rename) (editsFor : Rename → Array Edit) :
-    Except String (Array Edit) := Id.run do
+/-- The conflict check every batch of renames must pass: two renames claiming the SAME span with
+    different replacements is refused and the caller told to run them separately.  Identical
+    claims are just the duplicate they look like, and collapse. -/
+private def batchRenameEdits (scan : ScannedFile) (renames : Array Rename) (withDefinition : Bool) :
+    Except String (Array Edit) := do
   let mut kept : Array (Rename × Edit) := #[]
   for r in renames do
-    for edit in editsFor r do
+    for edit in ← renameEdits scan r withDefinition do
       match kept.find? fun (_, other) => other.start == edit.start && other.stop == edit.stop with
       | some (first, other) =>
           if other.replacement != edit.replacement then
-            return .error s!"`{first.declName}` and `{r.declName}` both rename the site on line \
+            throw s!"`{first.declName}` and `{r.declName}` both rename the site on line \
               {edit.line}, to `{other.replacement}` and `{edit.replacement}`; run those two \
               renames separately"
       | none => kept := kept.push (r, edit)
-  return .ok (kept.map (·.2))
-
-/-- The whole batch's edits for one scanned file, or a refusal: `checkedBatch` over a fresh
-    elaboration. -/
-private def batchRenameEdits (scan : ScannedFile) (renames : Array Rename) (withDefinition : Bool) :
-    Except String (Array Edit) :=
-  checkedBatch renames fun r => renameEdits scan r withDefinition
-
-/-- `checkedBatch` over index sites, so a batch the elaboration path refuses is refused here with
-    the same message. -/
-private def indexBatchRenameEdits (fileMap : FileMap) (source : String) (renames : Array Rename)
-    (sitesByDecl : Std.HashMap String (Array Query.Site)) : Except String (Array Edit) :=
-  checkedBatch renames fun r => indexRenameEdits fileMap source r (sitesByDecl.getD r.declName #[])
+  return kept.map (·.2)
 
 /-- The lines `reportEdits` prints, as data: the index path collects them into the output shape a
     forked child would have produced, so both paths print the identical report. -/
@@ -1265,17 +1295,6 @@ private def reportLines (path source : String) (edits : Array Edit) : Array Stri
 
 private def reportEdits (path source : String) (edits : Array Edit) : IO Unit := do
   for line in reportLines path source edits do IO.println line
-
-/-- The info trees do not record EVERY occurrence — `unfold`'s arguments, among others, resolve
-    without leaving a term reference — so a semantic pass can silently half-rename a file and only
-    break once the old declaration is deleted.  Say so rather than report a clean run. -/
-private def warnLeftovers (path updated declName : String) : IO Unit := do
-  let short := shortName declName
-  let leftovers := (updated.splitOn "\n").zipIdx.filterMap fun (line, i) =>
-    if isIdentifierUse line short then some (i + 1) else none
-  unless leftovers.isEmpty do
-    IO.eprintln s!"{path}: `{short}` still occurs on line(s) {leftovers} — the info trees did not"
-    IO.eprintln "  resolve those; check them by hand before deleting the declaration"
 
 /-- Rewrite every reference in `path` named by `renames`.  The declarations' own binding sites are
     left alone; use `rename-decl` to move both. -/
@@ -1296,7 +1315,6 @@ private def renameReferences (path moduleName : String) (renames : Array Rename)
       IO.eprintln s!"{path}: renaming {renameList renames} does not elaborate; restored"
       return 1
     IO.println s!"applied {edits.size} rename(s) to {path}"
-    for r in renames do warnLeftovers path updated r.declName
     return 0
 
 /-- Everything `lake` writes for the module compiled from `path`.  A build under a rolled-back edit
@@ -1393,7 +1411,7 @@ private def forkPerFile (pattern : String) (childArgs : String → Array String)
 
 /-- The freshness guard.  A source file EDITED BUT NOT REBUILT has an unchanged `.ilean` whose
     recorded positions have moved, so the index would point at stale text.  A file may use the
-    fast path only when its `.ilean` is at least as new as the source; a missing file of either
+    index only when its `.ilean` is at least as new as the source; a missing file of either
     side also fails the guard.  `metadata` throws for a missing file, and the throw is the guard. -/
 private def ileanAtLeastAsNew (path : String) : IO Bool := do
   let some moduleName := moduleNameOfPath path |>.toOption
@@ -1406,23 +1424,6 @@ private def ileanAtLeastAsNew (path : String) : IO Bool := do
       | .lt => false  -- source is newer than its `.ilean`: the positions may have moved
       | _ => true
   catch _ => return false
-
-/-- The whole fast-path file output, in the same shape a forked child would have produced: the
-    `reportEdits` lines and the preview note on stdout, a batch refusal on stderr, the same exit
-    codes as `renameReferences`.  No file is elaborated; the sites come from the index. -/
-private def fastRenameFileOutput (path : String) (renames : Array Rename)
-    (sitesByDecl : Std.HashMap String (Array Query.Site)) : IO IO.Process.Output := do
-  let source ← IO.FS.readFile path
-  let fileMap := (Parser.mkInputContext source path).fileMap
-  match indexBatchRenameEdits fileMap source renames sitesByDecl with
-  | .error message => return { stdout := "", stderr := s!"{path}: {message}", exitCode := 1 }
-  | .ok edits =>
-      if edits.isEmpty then
-        return { stdout := s!"{path}: no reference to {renameList renames}\n", stderr := "",
-                 exitCode := 0 }
-      let lines := (reportLines path source edits).map (· ++ "\n")
-      let lines := lines.push "preview only; pass --apply to write\n"
-      return { stdout := String.intercalate "" lines.toList, stderr := "", exitCode := 0 }
 
 /-- Refresh the target repository's index and return its database path.  Any failure — no build
     directory, the refresh throws — prints the one-line unavailability note on stderr and returns
@@ -1448,25 +1449,6 @@ private def refreshedIndex? : IO (Option String) := do
     IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
     pure none
 
-/-- The index half of the glob driver: a silent refresh at the target repository's
-    `.lake/build/refactor-index.db`, then every rename's use sites grouped by source path, with the
-    database path for the callers that need it.  Any failure — no build directory, refresh throws —
-    yields `none` and prints one line on stderr; the caller then falls back to the per-file
-    elaboration path, never aborting a rename because the index is unavailable. -/
-private def indexSitesByPath (renames : Array Rename) :
-    IO (Option (String × Std.HashMap String (Std.HashMap String (Array Query.Site)))) := do
-  try
-    let some dbPath ← refreshedIndex? | return none
-    let mut byPath : Std.HashMap String (Std.HashMap String (Array Query.Site)) := {}
-    for r in renames do
-      let sites ← Query.useSitesByFile dbPath r.declName
-      for (path, fileSites) in sites do
-        let perDecl := byPath.getD path {}
-        byPath := byPath.insert path (perDecl.insert r.declName fileSites)
-    pure (some (dbPath, byPath))
-  catch e =>
-    IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
-    pure none
 
 /-! ## What a name names
 
@@ -1748,7 +1730,7 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   let source ← IO.FS.readFile path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   -- The tree the index holds is as new as the `.olean` it was built with, and the staleness guard
-  -- the rename fast path uses is the same here: a source edited since the last build is elaborated
+  -- is `ileanAtLeastAsNew`: a source edited since the last build is elaborated
   -- in this process instead of being marked at positions that have moved.
   let nodes ← if ← ileanAtLeastAsNew path then SyntaxQuery.nodesOfModule dbPath moduleName
     else SyntaxQuery.nodesOfFile path moduleName
@@ -1879,32 +1861,16 @@ private def semanticDupReport (column what : String) (minSize : Nat) : IO UInt32
       IO.println "    no member is visible to all the others; the survivor has to `move` first"
   return 0
 
-/-- The glob driver.  In preview the index answers where the references are without elaborating
-    the files — a repository-wide rename spends its minutes recomputing what `lake build` already
-    wrote to `.ilean`, and the index holds exactly those positions.  A file takes the fast path
-    when the freshness guard passes, whether or not the index has sites there: a fresh index that
-    records nothing for the file is itself the "no reference" answer.  A file whose `.ilean` is
-    missing or older than its source is elaborated by a child as before — the index may be silent
-    where the elaborated file would speak.  `--apply` cannot use the fast path: applying
-    re-elaborates each file to verify the result, which is the elaboration the fast path skips. -/
-private def renameGlob (pattern : String) (renames : Array Rename) (apply noIndex : Bool) :
-    IO UInt32 := do
-  let mentioning := renames.map fun r => shortName r.declName
-  let fast? ← if apply || noIndex then pure none else indexSitesByPath renames
-  let selected ← selectedFiles pattern mentioning
+/-- The glob driver: one child elaborates each file.  The index cannot stand in for that, not even
+    in preview: which spelling of the new name a use site takes is a question for name resolution
+    in that site's own scope (its namespace, its `open`s), and only the elaborated file has it. -/
+private def renameGlob (pattern : String) (renames : Array Rename) (apply : Bool) : IO UInt32 := do
+  let selected ← selectedFiles pattern (renames.map fun r => shortName r.declName)
   if selected.isEmpty then return 1
-  let childArgs := fun path => #["rename-file", path] ++ renameArgs renames ++
-    (if apply then #["--apply"] else #[])
-  let outputs ← mapFilesParallel (← scanJobs) selected fun path => do
-    match fast? with
-    | some (_, byPath) =>
-        if ← ileanAtLeastAsNew path then
-          fastRenameFileOutput path renames (byPath.getD path {})
-        else
-          spawnSelf (childArgs path)
-    | none => spawnSelf (childArgs path)
+  let outputs ← mapFilesParallel (← scanJobs) selected fun path =>
+    spawnSelf (#["rename-file", path] ++ renameArgs renames ++ (if apply then #["--apply"] else #[]))
   let status ← reportOutputs outputs
-  if let some (dbPath, _) := fast? then
+  if let some dbPath ← refreshedIndex? then
     for r in renames do warnSilentDependents dbPath r.declName
   return status
 
@@ -1941,7 +1907,6 @@ private def renameDeclStage (path stagePath : String) (renames : Array Rename) :
     reportEdits path scan.source edits
     let updated := applyEdits scan.source (independentEdits edits).1
     IO.FS.writeFile stagePath updated
-    for r in renames do warnLeftovers path updated r.declName
     return 0
 
 /-- Fork a staging child per file, swap every staged file in at once, and check with ONE capped
@@ -2314,15 +2279,6 @@ private def fitsIn (env : Environment) (source : String) (done : Array Edit) (ed
       | some stx => hasNodeSpanning stx b0 (b0 + edit.replacement.utf8ByteSize)
       | none => fitsIn env source done edit rest
 
-/-- The environment `p`'s command was elaborated in: the `open`s and scoped notation in force there,
-    which the end-of-file environment has already popped. -/
-private def commandEnvAt (trees : Array Elab.InfoTree) (fallback : Environment) (p : String.Pos.Raw) :
-    Environment :=
-  (trees.findSome? fun
-    | .context (.commandCtx c) (.node info _) =>
-      info.stx.getRange?.bind fun r => if r.start ≤ p && p < r.stop then some c.env else none
-    | _ => none).getD fallback
-
 /-- Stage `path` with every application of `declName` written as `form`. -/
 private def notateStage (path declName form stagePath : String) : IO UInt32 := do
   let pieces ← match parseForm form with
@@ -2385,7 +2341,7 @@ private def notateStage (path declName form stagePath : String) : IO UInt32 := d
   let mut unparsed := false
   for (head, explicitMode, app?, paren?, above) in ordered do
     let some headRange := head.getRange? | continue
-    let env := commandEnvAt frontend.commandState.infoState.trees.toArray env headRange.start
+    let env := ((commandCtxAt? frontend.commandState.infoState.trees.toArray headRange.start).map (·.env)).getD env
     let args := (app?.bind appArgs).getD #[]
     if app?.any fun app => app[1].getArgs.size != args.size then
       IO.println s!"{siteAt headRange.start}: named argument; left as is"; continue
@@ -2440,8 +2396,8 @@ private def notateGlob (pattern declName form : String) (apply : Bool) : IO UInt
     (mentioning := #[shortName declName])
 
 /-- Every `.lean` file in the repository — what a command works on when the caller did not narrow
-    with `--in`.  Renaming is repository-wide by nature, and the `mentioning` prefilter plus the
-    index fast path are what make the default affordable: a file that does not contain the short
+    with `--in`.  Renaming is repository-wide by nature, and the `mentioning` prefilter is what
+    makes the default affordable: a file that does not contain the short
     name is never opened. -/
 private def wholeRepository : String := "**.lean"
 
@@ -2480,7 +2436,7 @@ private def renameAll (selector? : Option String) (renames : Array Rename)
       -- `--uses-only` leaves the binding site alone, so each file still elaborates on its own and
       -- the cheap per-file path applies.  A real rename moves the binding site too, which no
       -- ordering of per-file edits keeps valid, so it stages every file and builds once.
-      if usesOnly then renameGlob pattern renames apply noIndex
+      if usesOnly then renameGlob pattern renames apply
       else renameDeclGlob pattern renames apply
   | .token _ =>
       let mut status : UInt32 := 0
@@ -2635,13 +2591,6 @@ it denotes, so a shadowing `a` inside a proof is a different variable and is lef
 text is read only to CONFIRM a range before it is overwritten, never to find one. -/
 
 open Elab in
-/-- Every `TermInfo` of `trees`, each with the context it was elaborated in. -/
-private def termInfos (trees : PersistentArray InfoTree) : Array (ContextInfo × TermInfo) :=
-  trees.foldl (init := #[]) fun acc tree =>
-    tree.foldInfo (fun ci info acc => match info with
-      | .ofTermInfo ti => acc.push (ci, ti)
-      | _ => acc) acc
-
 /-- Is `type` the objects of a category?  Decided by instance SYNTHESIS, so a carrier whose only
     instance is a class extending `objectClass` answers yes; a sort and an element of a hom-set
     answer no.  The caller supplies the context: a binder's own, or a callee telescope's. -/
@@ -2752,7 +2701,7 @@ private def objectBinderEdits (objectClass : Name) (letters : String) (source : 
     (fileMap : FileMap) (trees : PersistentArray InfoTree) (commands : Array Syntax)
     (within? : Option (String.Pos.Raw × String.Pos.Raw) := none)
     (only? : Option String := none) (rename? : Option String := none) : IO ObjectEdits := do
-  let infos := termInfos trees
+  let infos := termInfos trees.toArray
   let lineOf (p : String.Pos.Raw) : Nat := (fileMap.toPosition p).line
   -- Every binder already spelled with a capital, and the context it was introduced in.  A clash is
   -- not only a capital ALREADY bound where this binder sits: one introduced LATER in the same
