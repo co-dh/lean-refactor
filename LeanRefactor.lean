@@ -1016,70 +1016,6 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
   IO.eprintln s!"whole-repository build failed after moving `{declName}`; both files restored"
   return 1
 
-/-! ## Collapsing a duplicate declaration
-
-`collapse` replaces every syntax-resolved use of a declaration in its own file, removes the
-declaration (including its docstring), and retains the transaction only when the file and capped
-repository build pass.  Walking identifier syntax in addition to `.ilean` references is essential:
-tactic arguments such as `unfold foo` are resolved by Lean but absent from the reference data. -/
-
-private partial def identifierEditsNamed (source : String) (fileMap : FileMap)
-    (declName replacement : String) (stx : Syntax) (dropAsDuplicate := false) : Array Edit := Id.run do
-  let mut found := #[]
-  let identText := if stx.isIdent then stx.getId.toString else ""
-  -- Longest spelling first, so the `.suffix` is measured from the one the source actually wrote:
-  -- `Freyd.Alg.foo.bar` must drop thirteen characters, not the three of `foo`.
-  let suffix? := (spellingsOf declName).findSome? fun spelling =>
-    if identText == spelling then some ""
-    else if identText.startsWith (spelling ++ ".") then some (identText.drop spelling.length).toString
-    else none
-  if stx.isIdent && suffix?.isSome then
-    if let some range := stx.getRange? then
-      let start := if dropAsDuplicate then spacesBefore source range.start else range.start
-      found := found.push {
-        start, stop := range.stop
-        line := (fileMap.toPosition range.start).line + 1
-        replacement := if dropAsDuplicate then "" else replacement ++ suffix?.getD ""
-      }
-  let childIsDuplicate := dropAsDuplicate ||
-    (stx.isOfKind ``Lean.Parser.Tactic.unfold && syntaxHasIdent replacement stx)
-  for child in stx.getArgs do
-    found := found ++ identifierEditsNamed source fileMap declName replacement child childIsDuplicate
-  return found
-
-private def collapseDeclaration (path declName replacement : String) (apply : Bool)
-    (dropCallArg? : Option Nat := none) : IO UInt32 := do
-  initSearchPath (← findSysroot)
-  let (source, fileMap, commands, _) ← elaborateFile path
-  let some ((declStart, declStop), _) ←
-    okOr s!"{path}: " (declarationSite source commands declName) | return 1
-  let mut candidateEdits := #[{ start := declStart, stop := declStop, line := 0 }]
-  for cmd in commands do
-    for edit in identifierEditsNamed source fileMap declName replacement cmd do
-      -- Exclude the declaration being deleted, including its binding identifier and body.
-      unless declStart ≤ edit.start && edit.stop ≤ declStop do
-        candidateEdits := candidateEdits.push edit
-  if let some argIndex := dropCallArg? then
-    let mut sites := #[]
-    for cmd in commands do
-      sites := sites ++ syntaxSitesNamed fileMap declName cmd
-    for site in sites do
-      let pos := fileMap.lspPosToUtf8Pos site.range.start
-      unless declStart ≤ pos && pos < declStop do
-        let some edit ←
-          okOr s!"{path}: " (editForSite fileMap site commands (argIndex - 1) source) | return 1
-        candidateEdits := candidateEdits.push edit
-  let (selectedEdits, deferred) := independentEdits candidateEdits
-  if deferred != 0 then
-    IO.eprintln s!"{path}: refusing {deferred} overlapping collapse edit(s)"
-    return 1
-  IO.println s!"collapse `{declName}` into `{replacement}` in {path}: {selectedEdits.size - 1} use(s)"
-  for edit in selectedEdits do
-    if edit.line != 0 then IO.println s!"  line {edit.line}"
-  unless apply do IO.println "preview only; pass --apply to write"; return 0
-  let updated := applyEdits source selectedEdits
-  gatedWrite path source updated s!"collapsing `{declName}` into `{replacement}`"
-
 /-- One declaration to rename, and what to rename it to. -/
 private structure Rename where
   declName : String
@@ -1168,7 +1104,7 @@ private partial def identsIn (stx : Syntax) : Array Syntax :=
     the qualifier is relative to something resolution does not see, so only the last component
     moves, which is sound only when `old` and `new` share their namespace. -/
 private def spellingFor (trees : Array Elab.InfoTree) (start : String.Pos.Raw) (line : Nat)
-    (old new : Name) (text : String) : Except String String := do
+    (old new : Name) (text : String) (survivor := false) : Except String String := do
   let some c := commandCtxAt? trees start | .error s!"line {line}: no command scope recorded"
   let some (explicit, id) := siteIdent? c.env text
     | .error s!"line {line}: `{text}` does not parse as an identifier"
@@ -1178,11 +1114,17 @@ private def spellingFor (trees : Array Elab.InfoTree) (start : String.Pos.Raw) (
     if sameNs then return at_ (new.updatePrefix id.getPrefix)
     .error s!"line {line}: `{text}` is not a global name for `{old}`, so it can only keep its \
       qualifier, and `{new}` is in another namespace"
-  if c.env.contains new then .error s!"line {line}: `{new}` is already declared"
-  let env ← match c.env.addDeclCore 0
-      (.axiomDecl { name := new, levelParams := [], type := .sort .zero, isUnsafe := false }) none (doCheck := false) with
-    | Except.ok env => pure env
-    | .error _ => .error s!"line {line}: cannot add `{new}` to the scope there to resolve against"
+  -- A rename's `new` must not exist yet and is added to resolve against; a collapse's survivor
+  -- must already be in scope at the site, or the rewritten use could not elaborate.
+  let added := c.env.addDeclCore 0
+    (.axiomDecl { name := new, levelParams := [], type := .sort .zero, isUnsafe := false }) none (doCheck := false)
+  let env ← if survivor then
+      if c.env.contains new then pure c.env
+      else .error s!"line {line}: the survivor `{new}` is not in scope here"
+    else if c.env.contains new then .error s!"line {line}: `{new}` is already declared"
+    else match added with
+      | Except.ok env => pure env
+      | .error _ => .error s!"line {line}: cannot add `{new}` to the scope there to resolve against"
   let comps := new.components
   let suffixes := (List.range comps.length).reverse.map fun i => (comps.drop i).foldl Name.append .anonymous
   let candidates := (if sameNs then [new.updatePrefix id.getPrefix] else []) ++ suffixes
@@ -1227,7 +1169,7 @@ private def scanFile (path moduleName : String) : IO (Except UInt32 ScannedFile)
       resolves, in its own command's scope, to that constant and nothing else.
     Each site is then respelled by `spellingFor`.  `withDefinition` picks which edit is wanted:
     `rename --uses-only` moves the uses, a real rename moves the binding site as well. -/
-private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool) :
+private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool) (survivor := false) :
     Except String (Array Edit) := do
   let old := parseName r.declName
   let new := parseName r.replacement
@@ -1266,7 +1208,7 @@ private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool
     let start := scan.fileMap.lspPosToUtf8Pos site.range.start
     let stop := scan.fileMap.lspPosToUtf8Pos site.range.end
     let line := site.range.start.line + 1
-    let replacement ← spellingFor scan.trees start line old new (String.Pos.Raw.extract scan.source start stop)
+    let replacement ← spellingFor scan.trees start line old new (String.Pos.Raw.extract scan.source start stop) survivor
     edits := edits.push { start, stop, line, replacement }
   return dedupeEdits edits
 
@@ -1974,6 +1916,69 @@ private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : 
     (mentioning := renames.map fun r => shortName r.declName)
   if let some dbPath := dbPath? then
     for r in renames do warnSilentDependents dbPath r.declName
+  return status
+
+/-! ## Collapsing a duplicate declaration
+
+`collapse d r` moves every use of `d` in the repository onto the survivor `r` and deletes `d`.  The
+uses are `renameEdits`' sites — the constant as the info trees and name resolution see it, so an
+identifier inside attribute syntax (`@[app_unexpander d]`, `attribute [simp] d`) counts like any
+other — each written in the shortest spelling that resolves to `r` in its own scope.  Deleting `d`
+breaks every file still naming it, so the edit is staged per file and checked by one build. -/
+
+/-- `unfold r d` would become `unfold r r`, which Lean rejects; inside an `unfold` that already
+    names the survivor, the use is deleted instead of respelled. -/
+private partial def unfoldsNaming (trees : Array Elab.InfoTree) (survivor : Name) (stx : Syntax) :
+    Array Syntax :=
+  let here := if stx.isOfKind ``Lean.Parser.Tactic.unfold && (identsIn stx).any (fun id =>
+      id.getRange?.any fun r => (commandCtxAt? trees r.start).any fun c =>
+        resolvedAt c c.env id.getId == [survivor]) then #[stx] else #[]
+  here ++ stx.getArgs.flatMap (unfoldsNaming trees survivor)
+
+/-- Stage one file of a collapse.  Exit 3 means the file names `declName` nowhere. -/
+private def collapseStage (path stagePath declName replacement : String) (dropCallArg? : Option Nat) :
+    IO UInt32 := do
+  let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
+  let scan ← match ← scanFile path moduleName with | .ok scan => pure scan | .error code => return code
+  let some uses ← okOr s!"{path}: "
+      (renameEdits scan { declName, replacement } (withDefinition := false) (survivor := true)) | return 1
+  let declares := !(sitesNamed scan.references declName (·.definition?.toArray)).isEmpty
+  let mut edits := #[]
+  let mut span? := none
+  if declares then
+    let some ((s, e), _) ← okOr s!"{path}: " (declarationSite scan.source scan.commands declName) | return 1
+    span? := some (s, e)
+    edits := edits.push { start := s, stop := e, line := (scan.fileMap.toPosition s).line + 1 }
+  let unfolds := scan.commands.flatMap (unfoldsNaming scan.trees (parseName replacement))
+  for edit in uses do
+    -- The deleted declaration's own recursive uses go with it.
+    if span?.any fun (s, e) => s ≤ edit.start && edit.stop ≤ e then continue
+    let dup := unfolds.any fun u => u.getRange?.any fun r => r.start ≤ edit.start && edit.stop ≤ r.stop
+    edits := edits.push (if dup then { edit with start := spacesBefore scan.source edit.start, replacement := "" }
+      else edit)
+    if let some argIndex := dropCallArg? then
+      let site : ReferenceSite := { range := ⟨scan.fileMap.utf8PosToLspPos edit.start,
+        scan.fileMap.utf8PosToLspPos edit.stop⟩, parent? := none }
+      let some dropped ← okOr s!"{path}: "
+          (editForSite scan.fileMap site scan.commands (argIndex - 1) scan.source) | return 1
+      edits := edits.push dropped
+  if edits.isEmpty then return 3
+  let (selected, deferred) := independentEdits edits
+  if deferred != 0 then IO.eprintln s!"{path}: refusing {deferred} overlapping collapse edit(s)"; return 1
+  reportEdits path scan.source (selected.filter fun e => span?.all fun (s, _) => e.start != s)
+  if let some (s, _) := span? then
+    IO.println s!"{path}:{(scan.fileMap.toPosition s).line + 1}: delete `{declName}`"
+  IO.FS.writeFile stagePath (applyEdits scan.source selected)
+  return 0
+
+private def collapseGlob (pattern declName replacement : String) (dropCallArg? : Option Nat)
+    (apply : Bool) : IO UInt32 := do
+  let dbPath? ← refreshedIndex?
+  let status ← stagedGlob pattern s!"collapsed `{declName}` into `{replacement}`"
+    (fun path stage => spawnSelf (#["collapse-stage", path, stage, declName, replacement] ++
+      (dropCallArg?.map (#[toString ·])).getD #[])) apply
+    (mentioning := #[shortName declName])
+  if let some dbPath := dbPath? then warnSilentDependents dbPath declName
   return status
 
 /-- The command tree of a file the index cannot answer for, from a `syntax-rows` child — the same
@@ -3177,6 +3182,12 @@ def main (args : List String) : IO UInt32 := do
       match parseRenames rest with
       | .error message => IO.eprintln message; return 2
       | .ok renames => return ← renameReferences path moduleName renames apply
+  | ["collapse-stage", path, stagePath, declName, replacement] =>
+      return ← collapseStage path stagePath declName replacement none
+  | ["collapse-stage", path, stagePath, declName, replacement, argIndex] =>
+      let some n := argIndex.toNat?
+        | IO.eprintln s!"collapse-stage: `{argIndex}` is not an argument index"; return 2
+      return ← collapseStage path stagePath declName replacement (some n)
   | "rename-decl-stage" :: path :: stagePath :: pairs =>
       match parseRenames pairs with
       | .error message => IO.eprintln message; return 2
@@ -3205,9 +3216,8 @@ def main (args : List String) : IO UInt32 := do
         return ← moveDeclaration path declName dest apply omitBinders? into?
       return ← relocateDeclarationBefore path declName dest apply
   | ["collapse", declName, replacement] =>
-      let .ok path ← fileOf selector? declName | return 2
       if dropArg? == some 0 then IO.eprintln "`--drop-arg` is 1-based"; return 2
-      return ← collapseDeclaration path declName replacement apply dropArg?
+      return ← collapseGlob (selector?.getD wholeRepository) declName replacement dropArg? apply
   | ["replace", declName, text] =>
       let .ok path ← fileOf selector? declName | return 2
       if body then return ← replaceDeclarationBody path declName text apply
