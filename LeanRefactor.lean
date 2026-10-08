@@ -1635,6 +1635,10 @@ declaration sat in — the namespaces and sections, with the `open`s, `variable`
 `set_option`s and `local` notations in force there — and imports the source with `import all`, so
 private helpers and unexposed bodies stay reachable.  Fully qualified names do not change. -/
 
+/-- Every `import` node of a parsed header, whatever its modifiers. -/
+private partial def importNodes (stx : Syntax) : Array Syntax :=
+  if stx.isOfKind ``Parser.Module.import then #[stx] else stx.getArgs.foldl (· ++ importNodes ·) #[]
+
 private partial def hasAtom (val : String) (stx : Syntax) : Bool :=
   (stx.isAtom && stx.getAtomVal == val) || stx.getArgs.any (hasAtom val)
 
@@ -1699,8 +1703,11 @@ private def cutsFor (source : String) (commands : Array Syntax) (wanted : Array 
     because a public statement may not name a privately imported constant; Lean refuses the two
     combined as `public import all`), then the cuts in source order,
     consecutive cuts that share their scopes reopened once. -/
-private def destinationText (header sourceModule : String) (isModule : Bool) (cuts : Array Cut) : String := Id.run do
-  let mut out := header.trimAsciiEnd.toString ++ "\n" ++ (if isModule then s!"public import {sourceModule}\nimport all {sourceModule}\n" else s!"import {sourceModule}\n")
+private def destinationText (header sourceModule : String) (isModule : Bool) (siblings : Array String)
+    (cuts : Array Cut) : String := Id.run do
+  let imp := if isModule then "public import" else "import"
+  let mut out := header.trimAsciiEnd.toString ++ "\n" ++ (if isModule then s!"public import {sourceModule}\nimport all {sourceModule}\n" else s!"import {sourceModule}\n") ++
+    siblings.foldl (fun acc m => acc ++ s!"{imp} {m}\n") ""
   let mut i := 0
   while i < cuts.size do
     let c := cuts[i]!
@@ -1728,8 +1735,20 @@ private def moveDecls (pairs : Array (String × String)) (apply : Bool) : IO UIn
       return 2
   let some sourceModule ← okOr "" (moduleNameOfPath sourcePath) | return 2
   initSearchPath (← findSysroot)
-  let (source, fileMap, commands, _) ← elaborateFile sourcePath
+  let (source, fileMap, commands, env) ← elaborateFile sourcePath
   let some cuts ← okOr s!"{sourcePath}: " (cutsFor source commands (pairs.map (parseName ·.2))) | return 1
+  -- A constant belongs to the destination of the cut whose name prefixes it, so projections,
+  -- auxiliary definitions and private names follow their declaration.
+  let ownerOf (n : Name) : Option String :=
+    let base := (privateToUserName? n).getD n
+    (cuts.find? (·.name.isPrefixOf base)).bind fun c => (pairs.find? fun (_, d) => parseName d == c.name).map (·.1)
+  -- Each destination imports every other destination one of its constants uses.
+  let mut siblings : Std.HashMap String (Array String) := {}
+  for (n, ci) in env.constants.map₂.toList do
+    let some d := ownerOf n | continue
+    for u in ci.getUsedConstantsAsSet do
+      let some d' := ownerOf u | continue
+      unless d' == d || (siblings.getD d #[]).contains d' do siblings := siblings.insert d ((siblings.getD d #[]).push d')
   let inputCtx := Parser.mkInputContext source sourcePath
   let (header, _, _) ← Parser.parseHeader inputCtx
   let headerText := match header.raw.getPos?, header.raw.getTailPos? with
@@ -1744,18 +1763,42 @@ private def moveDecls (pairs : Array (String × String)) (apply : Bool) : IO UIn
     let mine := cuts.filter fun c => pairs.any fun (m, d) => m == dest && parseName d == c.name
     for c in mine do
       IO.println s!"{sourcePath}:{(fileMap.toPosition c.range.1).line}: move `{c.name}` → {path}"
-    written := written.push (path, destinationText headerText sourceModule (sourceIsModule source) mine)
+    for s in siblings.getD dest #[] do IO.println s!"{path}: import {s}"
+    written := written.push (path, destinationText headerText sourceModule (sourceIsModule source) (siblings.getD dest #[]) mine)
+  -- A module that imported the source keeps seeing every declaration it saw: it imports each
+  -- destination too, right after its import of the source.  Narrowing these is a later pass.
+  let mut importers : Array (String × String × Array Edit) := #[]
+  for (m, imported) in (← Query.importEdges Db.indexPath).toList do
+    unless imported.contains sourceModule do continue
+    let some path ← okOr "" (modulePath m) | return 2
+    let text ← IO.FS.readFile path
+    let inputCtx := Parser.mkInputContext text path
+    let (hdr, _, _) ← Parser.parseHeader inputCtx
+    let some node := (importNodes hdr).find? fun n => n.getArgs.any fun a => a.isIdent && a.getId.toString == sourceModule
+      | IO.eprintln s!"{path}: the index says it imports {sourceModule}, its header does not"; return 1
+    let some r := node.getRange? | IO.eprintln s!"{path}: `import {sourceModule}` has no source range"; return 1
+    let next := inputCtx.fileMap.ofPosition ⟨(inputCtx.fileMap.toPosition r.start).line + 1, 0⟩
+    -- Same visibility as the import it sits beside: a `public` re-export the importer never had
+    -- would widen what its own importers see, and with it what rebuilds them.
+    let imp := if hasAtom "public" node then "public import" else "import"
+    IO.println s!"{path}: {imp} {dests.toList}"
+    let added := dests.foldl (fun acc d => acc ++ s!"{imp} {d}\n") ""
+    importers := importers.push (path, text, #[({ start := next, stop := next, line := 0, replacement := added } : Edit)])
   unless apply do
-    IO.println s!"{cuts.size} declaration(s) into {written.size} new file(s); preview only, pass --apply to write"
+    IO.println s!"{cuts.size} declaration(s) into {written.size} new file(s), {importers.size} importer(s); preview only, pass --apply to write"
     return 0
   IO.FS.writeFile sourcePath (applyEdits source (cuts.map fun c => { start := c.range.1, stop := c.range.2, line := 0 }))
-  for (path, text) in written do IO.FS.writeFile path text
+  for (path, text) in written do
+    if let some dir := (path : System.FilePath).parent then IO.FS.createDirAll dir
+    IO.FS.writeFile path text
+  for (path, text, edits) in importers do IO.FS.writeFile path (applyEdits text edits)
   IO.println s!"moved {cuts.size} declaration(s); building {dests.toList} and then the capped repository..."
   (← IO.getStdout).flush
   let destBuild ← IO.Process.output { cmd := ← capPath, args := #["lake", "build"] ++ dests }
   let build ← if destBuild.exitCode == 0 then repositoryBuild else pure destBuild
   if build.exitCode == 0 then IO.println "destination and whole-repository builds passed after the move"; return 0
   IO.FS.writeFile sourcePath source
+  for (path, text, _) in importers do IO.FS.writeFile path text
   for (path, _) in written do IO.FS.removeFile path
   dropBuildArtefacts (written.map (·.1))
   unless build.stdout.isEmpty do IO.eprintln build.stdout
@@ -1770,9 +1813,6 @@ private def moveDecls (pairs : Array (String × String)) (apply : Bool) : IO UIn
 header parser — the `import` node whose module name is the one named — never by matching text, so
 `public import`, `meta import`, `import all` and a trailing comment are all the same node.  The
 deletion is the node's whole line, and only when the parser's trivia say nothing else is on it. -/
-
-private partial def importNodes (stx : Syntax) : Array Syntax :=
-  if stx.isOfKind ``Parser.Module.import then #[stx] else stx.getArgs.foldl (· ++ importNodes ·) #[]
 
 /-- The edits deleting `targets` from the header of `source`, one whole line each. -/
 private def removeImportEdits (path source : String) (targets : Array Name) :
