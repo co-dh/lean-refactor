@@ -266,8 +266,11 @@ order by s, l;
 -- `open`, an any-of need: one row per module declaring the namespace `grp`, and one suffices.
 --   const  — a declaration of `src` uses a constant declared in `dst` (`dep`)
 --   syntax — `src` uses a syntax kind whose parser `dst` declares
---   eval   — `src`'s elaboration names a constant of `dst` that no declaration keeps (`#eval` …)
---   open   — `src` opens namespace `grp`, which `dst` declares; dropped when `src` declares it too
+--   eval   — `src`'s elaboration names a constant of `dst` that no declaration keeps (`#eval` …);
+--            a constant a declaration also keeps is already a `const` row for the same pair
+--   open   — `src` opens namespace `grp`, which `dst` declares.  Kept even when `src` declares `grp`
+--            itself: an `open Freyd` above the file's own `namespace Freyd` still needs an import,
+--            and the rows do not say which came first, so the need errs on the side of keeping it.
 drop view if exists module_need;
 create view module_need as
 select p.module as src, i.module as dst, 'const' as kind, null as grp
@@ -282,9 +285,7 @@ select r.module, r.dst, 'eval', null from src_ref r
   where r.module <> r.dst and r.dst in (select name from module)
     and not exists (select 1 from dep p where p.module = r.module and p.dst = r.name)
 union
-select o.module, o.dst, 'open', o.ns from open_ns o
-  where o.module <> o.dst
-    and not exists (select 1 from open_ns s where s.module = o.module and s.ns = o.ns and s.dst = o.module);
+select o.module, o.dst, 'open', o.ns from open_ns o where o.module <> o.dst;
 "
 
 /-- True when the database already carries `schemaVersion` in `meta`.
