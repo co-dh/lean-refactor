@@ -14,8 +14,9 @@ public structure Rows where
   deps      : Array String
   imports   : Array String
 
-/-- Kind string for a constant, or `none` for constructors, recursors and quotients, which belong to
-    their inductive and get no row of their own. -/
+/-- Kind string for a constant, or `none` for recursors and quotients, which belong to their inductive
+    and get no row of their own.  A constructor gets one: a note cites `ConsList.wrap` by name and key
+    like any def, and with no row the cite and the type cell had nothing to resolve it to. -/
 private def kindOf (ci : ConstantInfo) : Option String :=
   match ci with
   | .thmInfo _    => some "thm"
@@ -23,7 +24,7 @@ private def kindOf (ci : ConstantInfo) : Option String :=
   | .axiomInfo _  => some "axiom"
   | .inductInfo _ => some "ind"
   | .opaqueInfo _ => some "opaque"
-  | .ctorInfo _   => none
+  | .ctorInfo _   => some "ctor"
   | .recInfo _    => none
   | .quotInfo _   => none
 
@@ -58,10 +59,9 @@ private def generatedName (n : Name) : Bool :=
     let s := toString component
     auxiliaryPrefix s ||
     numbered "match_" s || numbered "proof_" s || numbered "eq_" s ||
-      -- No `mk`: a real constructor never reaches here, `kindOf` having dropped it, so the only
-      -- names the component matched were hand-written `def mk`s — and hiding one of those from
-      -- `modularize` left `Freyd.UF.Ultraproduct.mk` unmarked while the `sound` that names it was
-      -- public. The `X.mk.injEq` family is already caught by its own last component.
+      -- No `mk`: a structure's `mk` is a real constructor a person may cite, and a hand-written
+      -- `def mk` hidden from `modularize` left `Freyd.UF.Ultraproduct.mk` unmarked while the `sound`
+      -- that names it was public. The `X.mk.injEq` family is already caught by its own last component.
       -- `_default` is a structure field's default value, which the compiler writes; two fields with
       -- the same default are not a duplicate anyone can act on.
       ["eq_def", "splitter", "inj", "injEq", "noConfusion", "noConfusionType", "sizeOf_spec",
