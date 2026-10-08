@@ -1627,6 +1627,141 @@ private def graphPage (outPath : String) : IO UInt32 := do
   IO.println s!"{outPath}: {nodes} declarations, {edges} edges, {hubs} hub(s) left out"
   return 0
 
+/-! ## Moving declarations into a new module
+
+`move-decl` splits a module: each named declaration's whole command (doc comment, attributes, an
+`open … in` wrapper) leaves its file for a NEW module.  That module reopens exactly the scopes the
+declaration sat in — the namespaces and sections, with the `open`s, `variable`s, `universe`s,
+`set_option`s and `local` notations in force there — and imports the source with `import all`, so
+private helpers and unexposed bodies stay reachable.  Fully qualified names do not change. -/
+
+private partial def hasAtom (val : String) (stx : Syntax) : Bool :=
+  (stx.isAtom && stx.getAtomVal == val) || stx.getArgs.any (hasAtom val)
+
+private partial def firstIdent? (stx : Syntax) : Option Name :=
+  if stx.isIdent then some stx.getId else stx.getArgs.findSome? firstIdent?
+
+/-- A command that only changes the scope later commands elaborate in, so a declaration moved out
+    of that scope needs it replayed.  A `local` notation or attribute counts; a global one would be
+    declared twice. -/
+private def isScopeCommand (cmd : Syntax) : Bool :=
+  [``Lean.Parser.Command.open, ``Lean.Parser.Command.variable, ``Lean.Parser.Command.universe,
+    ``Lean.Parser.Command.set_option, ``Lean.Parser.Command.include, ``Lean.Parser.Command.omit].any
+    cmd.isOfKind ||
+  ((declIdName? cmd).isNone &&
+    ((firstSyntaxOfKind? ``Lean.Parser.Term.attrKind cmd).map (hasAtom "local")).getD false)
+
+/-- One enclosing scope: the command that opened it, the `end` that closes it, and the scope
+    commands issued inside it so far. -/
+private structure Frame where
+  opener : String
+  closer : String
+  scope : Array String := #[]
+
+/-- One declaration to move: its cut in the source, its text, and the scopes to reopen around it. -/
+private structure Cut where
+  name : Name
+  range : String.Pos.Raw × String.Pos.Raw
+  text : String
+  opening : String
+  closing : String
+  deriving Inhabited
+
+private def cutsFor (source : String) (commands : Array Syntax) (wanted : Array Name) :
+    Except String (Array Cut) := Id.run do
+  let text (cmd : Syntax) : String := match cmd.getRange? with
+    | some r => String.Pos.Raw.extract source r.start r.stop
+    | none => ""
+  let line (s : String) : String := if s.isEmpty then "" else s ++ "\n"
+  let mut state := (Name.anonymous, ([] : List Name))
+  let mut frames : Array Frame := #[{ opener := "", closer := "" }]
+  let mut cuts : Array Cut := #[]
+  for cmd in commands do
+    if let some short := declIdName? cmd then
+      let full := state.1 ++ short
+      if wanted.contains full then
+        let some range := cmd.getRange? | return .error s!"`{full}` has no source range"
+        cuts := cuts.push { name := full, range := wholeLines source range, text := (text cmd).trimAscii.toString
+                            opening := frames.foldl (fun acc f => acc ++ line f.opener ++ f.scope.foldl (· ++ line ·) "") ""
+                            closing := frames.foldr (fun f acc => acc ++ line f.closer) "" }
+    if cmd.isOfKind ``Lean.Parser.Command.namespace || cmd.isOfKind ``Lean.Parser.Command.section then
+      frames := frames.push { opener := text cmd, closer := "end" ++ ((firstIdent? cmd).map (s!" {·}")).getD "" }
+    else if cmd.isOfKind ``Lean.Parser.Command.end then
+      if frames.size > 1 then frames := frames.pop
+    else if isScopeCommand cmd then
+      frames := frames.modify (frames.size - 1) fun f => { f with scope := f.scope.push (text cmd) }
+    state := scopeStep state cmd
+  let missing := wanted.filter fun n => !cuts.any (·.name == n)
+  unless missing.isEmpty do return .error s!"no declaration named {missing.toList} in this file"
+  return .ok cuts
+
+/-- The new module's text: the source's header, `public import all` of the source (public, because a
+    public statement may not name a privately imported constant), then the cuts in source order,
+    consecutive cuts that share their scopes reopened once. -/
+private def destinationText (header sourceModule : String) (isModule : Bool) (cuts : Array Cut) : String := Id.run do
+  let mut out := header.trimAsciiEnd.toString ++ "\n" ++ (if isModule then "public import all " else "import ") ++
+    sourceModule ++ "\n"
+  let mut i := 0
+  while i < cuts.size do
+    let c := cuts[i]!
+    let mut j := i + 1
+    while j < cuts.size && cuts[j]!.opening == c.opening do j := j + 1
+    out := out ++ "\n" ++ c.opening ++ "\n" ++
+      String.intercalate "\n\n" ((cuts.extract i j).toList.map (·.text)) ++ "\n\n" ++ c.closing
+    i := j
+  return out
+
+/-- `lean-refactor move-decl (dest decl)...`: move each declaration into its NEW destination module.
+    All declarations must come from one source file.  Applying writes every file, builds the
+    destinations and then the repository under `cap`, and restores everything if either fails. -/
+private def moveDecls (pairs : Array (String × String)) (apply : Bool) : IO UInt32 := do
+  if pairs.isEmpty then IO.eprintln "expected at least one <dest-module> <decl> pair"; return 2
+  let mut sources : Array String := #[]
+  for (_, d) in pairs do
+    match ← fileOf none d with
+    | .ok p => unless sources.contains p do sources := sources.push p
+    | .error code => return code
+  let #[sourcePath] := sources
+    | IO.eprintln s!"the declarations come from {sources.size} files {sources}; one run splits one source"
+      return 2
+  let some sourceModule ← okOr "" (moduleNameOfPath sourcePath) | return 2
+  initSearchPath (← findSysroot)
+  let (source, fileMap, commands, _) ← elaborateFile sourcePath
+  let some cuts ← okOr s!"{sourcePath}: " (cutsFor source commands (pairs.map (parseName ·.2))) | return 1
+  let inputCtx := Parser.mkInputContext source sourcePath
+  let (header, _, _) ← Parser.parseHeader inputCtx
+  let headerText := match header.raw.getPos?, header.raw.getTailPos? with
+    | some s, some e => String.Pos.Raw.extract source s e
+    | _, _ => ""
+  let dests := pairs.foldl (fun acc (m, _) => if acc.contains m then acc else acc.push m) #[]
+  let mut written : Array (String × String) := #[]
+  for dest in dests do
+    let some path ← okOr "" (modulePath dest) | return 2
+    if ← System.FilePath.pathExists path then
+      IO.eprintln s!"{dest}: {path} already exists; move-decl creates its destination"; return 2
+    let mine := cuts.filter fun c => pairs.any fun (m, d) => m == dest && parseName d == c.name
+    for c in mine do
+      IO.println s!"{sourcePath}:{(fileMap.toPosition c.range.1).line}: move `{c.name}` → {path}"
+    written := written.push (path, destinationText headerText sourceModule (sourceIsModule source) mine)
+  unless apply do
+    IO.println s!"{cuts.size} declaration(s) into {written.size} new file(s); preview only, pass --apply to write"
+    return 0
+  IO.FS.writeFile sourcePath (applyEdits source (cuts.map fun c => { start := c.range.1, stop := c.range.2, line := 0 }))
+  for (path, text) in written do IO.FS.writeFile path text
+  IO.println s!"moved {cuts.size} declaration(s); building {dests.toList} and then the capped repository..."
+  (← IO.getStdout).flush
+  let destBuild ← IO.Process.output { cmd := ← capPath, args := #["lake", "build"] ++ dests }
+  let build ← if destBuild.exitCode == 0 then repositoryBuild else pure destBuild
+  if build.exitCode == 0 then IO.println "destination and whole-repository builds passed after the move"; return 0
+  IO.FS.writeFile sourcePath source
+  for (path, _) in written do IO.FS.removeFile path
+  dropBuildArtefacts (written.map (·.1))
+  unless build.stdout.isEmpty do IO.eprintln build.stdout
+  unless build.stderr.isEmpty do IO.eprintln build.stderr
+  discard repositoryBuild
+  IO.eprintln "build failed after moving the declarations; source restored and new files deleted"
+  return 1
+
 /-! ## Removing imports
 
 `remove-import` deletes named imports from named modules.  Each import is found by Lean's own
@@ -3226,7 +3361,9 @@ private def usage : String := String.intercalate "\n" [
   row "unused-simp" "remove unused `simp` arguments",
   row "modularize" "convert to the Lean module system",
   row "remove-import (module import)..." "delete each named import, found by the header parser",
-  row "remove-import file" "... the pairs read from a file"]
+  row "remove-import file" "... the pairs read from a file",
+  row "move-decl dest d..." "move each d into the new module dest, reopening its scopes",
+  row "move-decl file" "... the (dest d) pairs read from a file"]
 
 /-- One file's call sites of `declName`, printed exactly as the single-file report always has.
     Also the body the `inspect-file` child runs: one elaboration per process, so `inspectReport`'s
@@ -3367,6 +3504,11 @@ def main (args : List String) : IO UInt32 := do
       let words := ((← IO.FS.readFile file).split Char.isWhitespace).filter (!·.isEmpty)
       return ← removeImports (words.map (toString ·)).toList apply
   | "remove-import" :: pairs => return ← removeImports pairs apply
+  | ["move-decl", file] =>
+      let words := ((← IO.FS.readFile file).split Char.isWhitespace).filter (!·.isEmpty) |>.map (toString ·) |>.toList
+      if words.length % 2 != 0 then IO.eprintln s!"{file}: expected (dest-module decl) pairs"; return 2
+      return ← moveDecls ((List.range (words.length / 2)).map fun k => (words[2*k]!, words[2*k+1]!)).toArray apply
+  | "move-decl" :: dest :: decls => return ← moveDecls (decls.map (dest, ·)).toArray apply
   -- The staging children of the batch drivers.  Not in the usage: each is one file of a run the
   -- parent is orchestrating, and running one by hand stages an edit nothing then applies.
   | ["inspect-file", path, declModule, declName] => return ← inspectOneFile declModule declName path
