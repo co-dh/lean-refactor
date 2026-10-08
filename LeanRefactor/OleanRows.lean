@@ -224,8 +224,10 @@ public def ofModules (modules : Array Name) (buildDir : String := Db.buildDir) :
     -- The header the module was compiled with, already in hand: it is what decides whether one
     -- declaration can even SEE another, which no dependency edge answers — `dep` records what a
     -- module used, and a module can see far more than it used.
-    for imp in datas[0]!.imports do
-      imports := imports.push s!"{toString mod}{Db.fieldSep}{toString imp.module}"
+    -- One edge per imported module: `public import X` with `import all X` is two header entries
+    -- for one edge, and the table's key refuses the second.
+    for dst in (datas[0]!.imports.map (·.module)).toList.eraseDups do
+      imports := imports.push s!"{toString mod}{Db.fieldSep}{toString dst}"
     let consts := moduleConstants datas
     for ci in consts.valuesArray do
       let some kind := kindOf ci | continue

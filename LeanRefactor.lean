@@ -1695,19 +1695,21 @@ private def cutsFor (source : String) (commands : Array Syntax) (wanted : Array 
   unless missing.isEmpty do return .error s!"no declaration named {missing.toList} in this file"
   return .ok cuts
 
-/-- The new module's text: the source's header, `public import all` of the source (public, because a
-    public statement may not name a privately imported constant), then the cuts in source order,
+/-- The new module's text: the source's header, `public import` and `import all` of the source (public,
+    because a public statement may not name a privately imported constant; Lean refuses the two
+    combined as `public import all`), then the cuts in source order,
     consecutive cuts that share their scopes reopened once. -/
 private def destinationText (header sourceModule : String) (isModule : Bool) (cuts : Array Cut) : String := Id.run do
-  let mut out := header.trimAsciiEnd.toString ++ "\n" ++ (if isModule then "public import all " else "import ") ++
-    sourceModule ++ "\n"
+  let mut out := header.trimAsciiEnd.toString ++ "\n" ++ (if isModule then s!"public import {sourceModule}\nimport all {sourceModule}\n" else s!"import {sourceModule}\n")
   let mut i := 0
   while i < cuts.size do
     let c := cuts[i]!
     let mut j := i + 1
     while j < cuts.size && cuts[j]!.opening == c.opening do j := j + 1
-    out := out ++ "\n" ++ c.opening ++ "\n" ++
-      String.intercalate "\n\n" ((cuts.extract i j).toList.map (·.text)) ++ "\n\n" ++ c.closing
+    -- The outer `section` scopes the root frame's `universe`/`open`s to this block, so the next
+    -- block may replay them without redeclaring.
+    out := out ++ "\nsection\n" ++ c.opening ++ "\n" ++
+      String.intercalate "\n\n" ((cuts.extract i j).toList.map (·.text)) ++ "\n\n" ++ c.closing ++ "end\n"
     i := j
   return out
 
