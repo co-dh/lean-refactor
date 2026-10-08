@@ -2174,7 +2174,7 @@ private def nodesOfChild (path : String) : IO (Array SyntaxRows.Node) := do
   let child ← spawnSelf #["syntax-rows", path]
   if child.exitCode != 0 then
     throw <| IO.userError s!"{path}: the `syntax-rows` child failed: {child.stderr}"
-  pure (SyntaxQuery.nodesOfRows (Db.childGroups child.stdout).1)
+  pure (SyntaxQuery.nodesOfRows (Db.childGroups child.stdout)[0]!)
 
 /-- `lean-refactor modularize --glob`: put every file matching the pattern on the module system
     together, staging per file and swapping all in at once — the shape `rename-decl` uses for
@@ -3329,10 +3329,10 @@ def main (args : List String) : IO UInt32 := do
   | "syntax-rows" :: path :: _ =>
       let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
       let rows ← SyntaxRows.ofFile path (toString moduleName)
-      -- `groupSep` unconditionally, so a reader always sees exactly two groups; a child that failed
-      -- prints nothing at all, and that is the case `Db.childGroups` tells apart.
-      IO.print (String.intercalate Db.recordSep rows.nodes.toList ++ Db.groupSep ++
-        String.intercalate Db.recordSep rows.stmts.toList)
+      -- `groupSep` unconditionally, so a reader always sees `Db.childGroupCount` groups; a child
+      -- that failed prints nothing at all, and that is the case `Db.childGroups` tells apart.
+      IO.print (Db.groupSep.intercalate ([rows.nodes, rows.stmts, rows.refs, rows.opens].map
+        (Db.recordSep.intercalate ·.toList)))
       return 0
   | ["uses", declName] => return ← usesReport declName
   | ["inspect", declName] => return ← inspectReport selector? declName

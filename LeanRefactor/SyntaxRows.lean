@@ -26,6 +26,10 @@ namespace LeanRefactor.SyntaxRows
 public structure Rows where
   nodes : Array String
   stmts : Array String
+  /-- `src_ref` records: every constant the info trees name, with its declaring module. -/
+  refs  : Array String
+  /-- `open_ns` records: every namespace in force, with each module that declares it. -/
+  opens : Array String
 
 /-- One node of the flattened tree. `id` is the node's index in preorder, `parent` the id of the
     enclosing node (-1 for a root command), so a subtree is a contiguous id range and "the innermost
@@ -129,6 +133,46 @@ private partial def sigs (stx : Syntax) : Array Sig :=
   let here := match sigOf stx with | some s => #[s] | none => #[]
   stx.getArgs.foldl (fun acc child => acc ++ sigs child) here
 
+/-- Every proper prefix of `n`, innermost first; `anonymous` included, which no `open` can name. -/
+private def ancestors : Name → List Name
+  | .anonymous => []
+  | .str p _ | .num p _ => p :: ancestors p
+
+/-- What the file NEEDS beyond its declarations' terms, read off the info trees the elaboration left.
+    `dep` is per declaration, so a constant named only by `#eval`/`#check`/`#guard` (or a `simp` lemma
+    the proof then dropped) is invisible to it, yet the file stops elaborating without its module.
+    And `open N` needs a module declaring `N`: the namespaces come from each info node's
+    `ContextInfo.openDecls` — Lean's own resolution, so a namespace-relative `open` is already the
+    full name — plus the final scopes, for an `open` no later node sits under.  A namespace has no
+    single home, so every module declaring it is a row: a constant under it, or its registration. -/
+private def needRows (moduleName : String) (cmd : Elab.Command.State) : Array String × Array String :=
+  Id.run do
+  let env := cmd.env
+  let modOf (n : Name) : Name := match env.getModuleIdxFor? n with
+    | some i => env.header.moduleNames[i.toNat]!
+    | none => moduleName.toName
+  let simple (s : NameSet) (ds : List OpenDecl) : NameSet :=
+    ds.foldl (fun s d => match d with | .simple ns _ => s.insert ns | _ => s) s
+  let (consts, opened) := cmd.infoState.trees.foldl (fun acc t => t.foldInfo (fun ci info (cs, os) =>
+    let cs := match info with
+      | .ofTermInfo ti => match ti.expr with | .const n _ => cs.insert n | _ => cs
+      | _ => cs
+    (cs, simple os ci.openDecls)) acc) ((∅ : NameSet), (∅ : NameSet))
+  let opened := cmd.scopes.foldl (fun s sc => simple s sc.openDecls) opened
+  let refs := consts.toArray.filterMap fun n =>
+    (env.getModuleIdxFor? n).map fun _ => Db.row #[moduleName, toString n, toString (modOf n)]
+  let mut homes : Std.HashSet (Name × Name) := {}
+  for (n, _) in env.constants.toList do
+    let n := (privateToUserName? n).getD n
+    for p in ancestors n do
+      if opened.contains p then homes := homes.insert (p, modOf n)
+  for i in [0:env.header.moduleNames.size] do
+    for ns in namespacesExt.getModuleEntries env i do
+      if opened.contains ns then homes := homes.insert (ns, env.header.moduleNames[i]!)
+  for ns in namespacesExt.getEntries env do
+    if opened.contains ns then homes := homes.insert (ns, moduleName.toName)
+  return (refs, homes.toArray.map fun (ns, m) => Db.row #[moduleName, toString ns, toString m])
+
 /-- Elaborate `path` against its imports and flatten every command it parsed.
 
     One file, one process: the caller forks. Elaborating in a loop retains an `Environment` per file
@@ -149,7 +193,8 @@ public def ofFile (path moduleName : String) : IO Rows := do
     let pos := inputCtx.fileMap.utf8PosToLspPos s.name
     Db.row #[moduleName, toString pos.line, toString pos.character,
              String.Pos.Raw.extract source s.b0 s.b1]
-  return { stmts, nodes := (nodesOfCommands frontend.commands).map (fun n =>
+  let (refs, opens) := needRows moduleName frontend.commandState
+  return { stmts, refs, opens, nodes := (nodesOfCommands frontend.commands).map (fun n =>
     Db.row #[moduleName, toString n.id, toString n.parent, n.kind, toString n.b0, toString n.b1,
              Db.cell n.hash, toString n.nodes]) }
 

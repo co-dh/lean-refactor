@@ -100,6 +100,8 @@ private def deletePartitions (dbPath : String) (modules : Array String) : IO Uni
         s!"delete from use_site where use_module = '{m}';\n" ++
         s!"delete from dep where module = '{m}';\n" ++
         s!"delete from import_edge where src = '{m}';\n" ++
+        s!"delete from src_ref where module = '{m}';\n" ++
+        s!"delete from open_ns where module = '{m}';\n" ++
         -- Before the `module` row it points at, or the id is gone and the nodes are orphans.
         s!"delete from syntax_node where module in (select id from module where name = '{m}');\n" ++
         s!"delete from module where name = '{m}';\n"
@@ -184,13 +186,12 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   let self := (← IO.appPath).toString
   let outputs ← mapFilesParallel (← scanJobs) (stale.map (·.source)) fun path =>
     IO.Process.output { cmd := self, args := #["syntax-rows", path] }
-  let mut syntaxRows := #[]
-  let mut stmtRows := #[]
+  let mut groups : Array (Array String) := Array.replicate Db.childGroupCount #[]
   for output in outputs do
-    let (nodes, stmts) := Db.childGroups output.stdout
-    syntaxRows := syntaxRows ++ nodes
-    stmtRows := stmtRows ++ stmts
+    groups := (groups.zip (Db.childGroups output.stdout)).map fun (a, b) => a ++ b
     unless output.stderr.isEmpty do IO.eprint output.stderr
+  let syntaxRows := groups[0]!
+  let stmtRows := groups[1]!
   Db.importRows dbPath "decl_range" declRanges
   Db.importRows dbPath "use_site" useSites
   Db.importRows dbPath "decl_info" oleanRows.declInfos
@@ -204,6 +205,8 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
     Db.row #[toString (firstId + i), m.name, m.source, m.ileanHash, m.oleanHash])
   Db.importRows dbPath "syntax_node_in" syntaxRows
   Db.importRows dbPath "decl_stmt_in" stmtRows
+  Db.importRows dbPath "src_ref" groups[2]!
+  Db.importRows dbPath "open_ns" groups[3]!
   internStagedNodes dbPath
   attachStatements dbPath
   -- A full extract stages every module's nodes and then deletes them, which leaves a quarter of a

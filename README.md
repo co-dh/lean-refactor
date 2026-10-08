@@ -305,6 +305,20 @@ group the others can collapse onto.
 `WITHOUT ROWID`, clustering by module. `hash` has no index deliberately — adding one measured
 158 MB for no speedup, since the query that groups on it also filters on `nodes` and scans anyway.
 
+### `src_ref`, `open_ns` and the `module_need` view — what a module needs imported
+
+`src_ref(module, name, dst)` is every constant a module's elaboration names in its info trees, with
+the module `dst` declaring it — a superset of `dep`, which misses what `#eval`, `#check` or `#guard`
+names. `open_ns(module, ns, dst)` is every namespace an `open` put in force (resolved by Lean, read
+from `ContextInfo.openDecls`), once per module `dst` declaring it. Both come from the `syntax-rows`
+child, which already elaborates the file.
+
+`module_need(src, dst, kind, grp)` is a view over them, `dep` and `syntax_node`: `kind` is `const`,
+`syntax`, `eval` or `open`, and `grp` is NULL except for `open`, where it names the namespace and any
+one row of the group suffices. It is a view (≈1 s), so it is never stale. For multi-step analysis
+first `create temp table t as select * from module_need` and query `t`: putting `in (select …)`
+filters around the view's joins makes sqlite pick a plan ~100× slower (measured: 130 s against 1 s).
+
 ### Queries
 
 What the tool asks the index, and what a person usefully asks it beyond the commands. Every one runs

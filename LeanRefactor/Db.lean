@@ -20,13 +20,17 @@ public def indexPath : String := ".lake/build/refactor-index.db"
     declaration statements.  One stream and one fork: a second run would re-elaborate the file. -/
 public def groupSep : String := "\x1d"
 
+/-- The groups a `syntax-rows` child prints, in order: `syntax_node_in`, `decl_stmt_in`, `src_ref`,
+    `open_ns`. -/
+public def childGroupCount : Nat := 4
+
 /-- The records of each group a `syntax-rows` child printed.  A child that failed prints nothing,
-    and both groups then come back empty rather than as one malformed group. -/
-public def childGroups (stdout : String) : Array String × Array String :=
+    and every group then comes back empty rather than as one malformed group. -/
+public def childGroups (stdout : String) : Array (Array String) :=
   let records (s : String) : Array String := ((s.splitOn recordSep).filter (· != "")).toArray
-  match stdout.splitOn groupSep with
-  | [nodes, stmts] => (records nodes, records stmts)
-  | _ => (#[], #[])
+  let groups := stdout.splitOn groupSep
+  if groups.length == childGroupCount then (groups.map records).toArray
+  else Array.replicate childGroupCount #[]
 
 /-- One row: the cell values joined by `fieldSep`. -/
 public def row (cells : Array String) : String :=
@@ -46,7 +50,7 @@ public def cell (h : UInt64) : String :=
     `ensureSchema` reacts by deleting the database, and that is the point: a refresh re-extracts only
     the modules whose artefacts changed, so after a keying change the untouched modules would keep
     rows computed by the old algorithm and a grouping query would silently mix two generations. -/
-public def schemaVersion : String := "10"
+public def schemaVersion : String := "11"
 
 /-- The complete DDL (given below verbatim). -/
 public def schemaSql : String :=
@@ -146,10 +150,23 @@ create table syntax_node_in (
 -- the refresh joins them through `decl_range` onto the mangled name `decl_info` goes by.
 create table decl_stmt_in (module text, sl1 int, sc1 int, stmt text);
 
+-- Every constant `module`'s elaboration names in its info trees, and the module `dst` declaring it.
+-- A superset of what `dep` keeps: `#eval`, `#check`, `#guard` and a dropped `simp` lemma name a
+-- constant no declaration's term holds, and the file still fails to elaborate without its module.
+create table src_ref (module text, name text, dst text);
+
+-- A namespace `ns` that `open` (or `open … in`) put in force in `module`, once per module `dst` that
+-- declares it — a constant under `ns` or the namespace's registration.  Any one of them suffices.
+create table open_ns (module text, ns text, dst text);
+
 create index i_use_name   on use_site(name);
 create index i_use_module on use_site(use_module);
 create index i_dep_dst    on dep(dst);
 create index i_dep_src    on dep(src);
+-- `module_need` asks, per reference, whether a declaration of the same module already keeps it.
+create index i_dep_module_dst on dep(module, dst);
+create index i_src_ref_module on src_ref(module);
+create index i_open_ns_module on open_ns(module, ns);
 create unique index i_module_id on module(id);
 -- The statement join's key: a `syntax-rows` child reports positions, and this is what turns one
 -- into the name `decl_info` is keyed by.
@@ -244,6 +261,30 @@ select n, k, s, l, t from (
 )
 where rn = 1
 order by s, l;
+
+-- Module `src` needs module `dst`, and why.  A view so it is never stale.  `grp` is NULL except for
+-- `open`, an any-of need: one row per module declaring the namespace `grp`, and one suffices.
+--   const  — a declaration of `src` uses a constant declared in `dst` (`dep`)
+--   syntax — `src` uses a syntax kind whose parser `dst` declares
+--   eval   — `src`'s elaboration names a constant of `dst` that no declaration keeps (`#eval` …)
+--   open   — `src` opens namespace `grp`, which `dst` declares; dropped when `src` declares it too
+drop view if exists module_need;
+create view module_need as
+select p.module as src, i.module as dst, 'const' as kind, null as grp
+  from dep p join decl_info i on i.name = p.dst where p.module <> i.module
+union
+select mm.name, d.module, 'syntax', null
+  from syntax_node n join module mm on mm.id = n.module
+  join syntax_kind k on k.id = n.kind join decl_info d on d.name = k.name
+  where mm.name <> d.module
+union
+select r.module, r.dst, 'eval', null from src_ref r
+  where r.module <> r.dst and r.dst in (select name from module)
+    and not exists (select 1 from dep p where p.module = r.module and p.dst = r.name)
+union
+select o.module, o.dst, 'open', o.ns from open_ns o
+  where o.module <> o.dst
+    and not exists (select 1 from open_ns s where s.module = o.module and s.ns = o.ns and s.dst = o.module);
 "
 
 /-- True when the database already carries `schemaVersion` in `meta`.
