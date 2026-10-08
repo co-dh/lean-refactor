@@ -1,5 +1,6 @@
 module
 
+import Lake
 import Lean
 import LeanRefactor.Elaborate
 import LeanRefactor.Fork
@@ -1353,18 +1354,30 @@ private def forkPerFile (pattern : String) (childArgs : String → Array String)
 
 /-- The freshness guard.  A source file EDITED BUT NOT REBUILT has an unchanged `.ilean` whose
     recorded positions have moved, so the index would point at stale text.  A file may use the
-    index only when its `.ilean` is at least as new as the source; a missing file of either
-    side also fails the guard.  `metadata` throws for a missing file, and the throw is the guard. -/
-private def ileanAtLeastAsNew (path : String) : IO Bool := do
-  let some moduleName := moduleNameOfPath path |>.toOption
-    | return false
-  let ileanPath := ileanPath moduleName
+    index only when its build artefacts were made FROM THE SOURCE AS IT IS NOW: Lake's
+    `<Module>.trace` records the hash of the source it compiled (a top-level input keyed by the
+    source path) and the `.ilean` it produced (`outputs.i`); the source is re-hashed with Lake's own
+    function and the `.ilean` on disk must be that output.  Not file times: Lake's artifact cache
+    restores an `.ilean` with the time it was first produced, so a module rebuilt correctly after a
+    checkout read as older than its source.  The trace names the checkout that BUILT it, which a
+    copied `.lake` does not share, so the key is matched by its trailing path components.  Any
+    missing or unreadable piece fails the guard, and a failed guard only means elaborating the file. -/
+private def builtFromSource (path : String) : IO Bool := do
+  let .ok moduleName := moduleNameOfPath path | return false
+  let base := System.FilePath.mk Db.buildDir / System.FilePath.mk (moduleName.replace "." "/")
   try
-    let sourceModified := (← (System.FilePath.mk path).metadata).modified
-    let ileanModified := (← ileanPath.metadata).modified
-    return match compare ileanModified sourceModified with
-      | .lt => false  -- source is newer than its `.ilean`: the positions may have moved
-      | _ => true
+    let .ok trace := Json.parse (← IO.FS.readFile (base.addExtension "trace")) | return false
+    let .ok (inputs : Array Json) := trace.getObjValAs? (Array Json) "inputs" | return false
+    let source := (System.FilePath.mk path).components
+    let recorded? := inputs.findSome? fun entry => do
+      let key ← (entry.getArrVal? 0 >>= (·.getStr?)).toOption
+      let parts := (System.FilePath.mk key).components
+      if parts.drop (parts.length - source.length) == source then (entry.getArrVal? 1 >>= (·.getStr?)).toOption
+      else none
+    let some recorded := recorded? | return false
+    let .ok ilean := trace.getObjVal? "outputs" >>= (·.getObjValAs? String "i") | return false
+    let onDisk := (← IO.FS.readFile (base.addExtension "ilean.hash")).trimAscii.toString
+    return (← Lake.computeTextFileHash path).hex == recorded && (System.FilePath.mk ilean).fileStem == some onDisk
   catch _ => return false
 
 /-- Refresh the target repository's index and return its database path.  Any failure — no build
@@ -1390,6 +1403,90 @@ private def refreshedIndex? : IO (Option String) := do
   catch e =>
     IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
     pure none
+
+/-- The files a rename of `declNames` can edit, read off the index instead of elaborating every file
+    whose text holds the short name — measured on a two-name rename, 46 of 76 such files (61% of the
+    bytes) were elaborated only to report "no reference".  A module the index covers is staged when
+    * it records a use of a name, declares it, or depends on it without naming it (`uses`); or
+    * it has an identifier leaf with the short name as a component at a position where no reference
+      was recorded: `renameEdits` resolves such identifiers itself (`unfold`'s arguments), and only
+      an elaboration can say what they resolve to.  Mirroring that clause is what keeps the index
+      from missing a site the elaboration would have edited.
+    A file the index cannot speak for — never built, its source newer than its `.ilean`, or no
+    syntax rows — keeps the text filter, which over-selects but never misses. -/
+private def indexedFiles (dbPath pattern : String) (declNames : Array String) : IO (Array String) := do
+  let matched ← selectedFiles pattern
+  if matched.isEmpty then return matched
+  -- `toName` is the reader the identifier leaves go through below, so both sides unescape alike.
+  let lastNames := declNames.map fun d =>
+    match (match d.toName with | .anonymous => parseName d | n => n) with
+    | .str _ s => s | _ => d
+  let lastIds := lastNames.map Name.mkSimple
+  let mentions (source : String) := lastNames.any fun last => source.contains last
+  let sources ← Query.moduleSources dbPath
+  let mut named : Std.HashSet String := {}
+  for d in declNames do
+    for (m, _) in ← Query.useModules dbPath d do named := named.insert m
+    for (m, _) in ← Query.declaringModules dbPath d do named := named.insert m
+    for m in ← Query.silentDependents dbPath d do named := named.insert m
+  let mut byIndex := #[]
+  let mut byText := #[]
+  let mut candidates : Array (String × String × String) := #[]
+  for path in matched do
+    let covered ← match moduleNameOfPath path with
+      | .ok m => pure (if sources.contains m && (← builtFromSource path) then some m else none)
+      | .error _ => pure none
+    match covered with
+    | none => if mentions (← IO.FS.readFile path) then byText := byText.push path
+    | some m =>
+      if named.contains m then byIndex := byIndex.push path
+      else
+        -- An identifier naming the short name holds it as text, so the text is a sound prefilter.
+        let source ← IO.FS.readFile path
+        if mentions source then candidates := candidates.push (path, m, source)
+  let mut byIdent := #[]
+  unless candidates.isEmpty do
+    let list := String.intercalate ", " (candidates.toList.map fun (_, m, _) => s!"'{Db.escaped m}'")
+    let shortest := lastNames.foldl (fun k s => min k s.utf8ByteSize) (lastNames.foldl (· + ·.utf8ByteSize) 0)
+    let withRows ← Db.queryRows dbPath s!"select m.name as m from module m where m.name in ({list})
+and exists (select 1 from syntax_node n where n.module = m.id)" (·.getObjValAs? String "m" |>.toOption)
+    let idents ← Db.queryRows dbPath s!"select m.name as m, n.b0 as b0, n.b1 as b1 from syntax_node n
+join module m on m.id = n.module join syntax_kind k on k.id = n.kind
+where k.name = 'ident' and n.b1 - n.b0 >= {shortest} and m.name in ({list})" fun row => do
+      pure ((← (row.getObjValAs? String "m").toOption), (← (row.getObjValAs? Nat "b0").toOption),
+        (← (row.getObjValAs? Nat "b1").toOption))
+    let recorded ← Db.queryRows dbPath s!"select use_module as m, l1, c1 from use_site
+where use_module in ({list})" fun row => do
+      pure ((← (row.getObjValAs? String "m").toOption), (← (row.getObjValAs? Nat "l1").toOption),
+        (← (row.getObjValAs? Nat "c1").toOption))
+    let recordedAt : Std.HashSet (String × Nat × Nat) := recorded.foldl (·.insert ·) {}
+    let identsOf : Std.HashMap String (Array (Nat × Nat)) := idents.foldl
+      (fun map (m, b0, b1) => map.insert m ((map.getD m #[]).push (b0, b1))) {}
+    for (path, m, source) in candidates do
+      unless withRows.contains m do byText := byText.push path; continue
+      let fileMap := FileMap.ofString source
+      let unrecorded := (identsOf.getD m #[]).any fun (b0, b1) =>
+        let n := (String.Pos.Raw.extract source ⟨b0⟩ ⟨b1⟩).toName
+        let p := fileMap.utf8PosToLspPos ⟨b0⟩
+        -- An identifier `toName` cannot read is kept: an unreadable name is no evidence of absence.
+        (n.isAnonymous || n.components.any (lastIds.contains ·)) && !recordedAt.contains (m, p.line, p.character)
+      if unrecorded then byIdent := byIdent.push path
+  let keep : Std.HashSet String := (byIndex ++ byIdent ++ byText).foldl (·.insert ·) {}
+  let selected := matched.filter keep.contains
+  IO.println s!"staging {selected.size} of {matched.size} file(s) matching `{pattern}`: {byIndex.size} \
+    the index records a use, declaration or dependency in, {byIdent.size} with an identifier the index \
+    recorded no reference for, {byText.size} by text (not covered by the index: unbuilt or edited since)"
+  if selected.isEmpty then
+    IO.eprintln s!"no file matching `{pattern}` refers to {String.intercalate ", " declNames.toList}"
+  return selected
+
+/-- The files a declaration rename stages: from the index when there is one, by text under
+    `--no-index` or when the index is unavailable (`refreshedIndex?` has said why). -/
+private def renameSelection (dbPath? : Option String) (pattern : String) (renames : Array Rename) :
+    IO (Array String) :=
+  match dbPath? with
+  | some dbPath => indexedFiles dbPath pattern (renames.map (·.declName))
+  | none => selectedFiles pattern (renames.map fun r => shortName r.declName)
 
 
 /-! ## What a name names
@@ -1672,9 +1769,9 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   let source ← IO.FS.readFile path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   -- The tree the index holds is as new as the `.olean` it was built with, and the staleness guard
-  -- is `ileanAtLeastAsNew`: a source edited since the last build is elaborated
+  -- is `builtFromSource`: a source edited since the last build is elaborated
   -- in this process instead of being marked at positions that have moved.
-  let nodes ← if ← ileanAtLeastAsNew path then SyntaxQuery.nodesOfModule dbPath moduleName
+  let nodes ← if ← builtFromSource path then SyntaxQuery.nodesOfModule dbPath moduleName
     else SyntaxQuery.nodesOfFile path moduleName
   let decls := SyntaxQuery.declarationsOf nodes source
   let sites ← Query.publicDeclSites dbPath moduleName (SyntaxQuery.instanceLinesOf decls source)
@@ -1806,13 +1903,14 @@ private def semanticDupReport (column what : String) (minSize : Nat) : IO UInt32
 /-- The glob driver: one child elaborates each file.  The index cannot stand in for that, not even
     in preview: which spelling of the new name a use site takes is a question for name resolution
     in that site's own scope (its namespace, its `open`s), and only the elaborated file has it. -/
-private def renameGlob (pattern : String) (renames : Array Rename) (apply : Bool) : IO UInt32 := do
-  let selected ← selectedFiles pattern (renames.map fun r => shortName r.declName)
+private def renameGlob (dbPath? : Option String) (pattern : String) (renames : Array Rename)
+    (apply : Bool) : IO UInt32 := do
+  let selected ← renameSelection dbPath? pattern renames
   if selected.isEmpty then return 1
   let outputs ← mapFilesParallel (← scanJobs) selected fun path =>
     spawnSelf (#["rename-file", path] ++ renameArgs renames ++ (if apply then #["--apply"] else #[]))
   let status ← reportOutputs outputs
-  if let some dbPath ← refreshedIndex? then
+  if let some dbPath := dbPath? then
     for r in renames do warnSilentDependents dbPath r.declName
   return status
 
@@ -1857,11 +1955,17 @@ private def renameDeclStage (path stagePath : String) (renames : Array Rename) :
     not affected, which is not a failure. -/
 private def stagedGlob (pattern description : String)
     (stage : String → String → IO IO.Process.Output)
-    (apply : Bool) (mentioning : Array String := #[]) : IO UInt32 := do
+    (apply : Bool) (mentioning : Array String := #[]) (selection? : Option (Array String) := none) :
+    IO UInt32 := do
   if ← staleSplitParts then return 1
-  let selected ← selectedFiles pattern mentioning
+  let selected ← match selection? with
+    | some files => pure files
+    | none => selectedFiles pattern mentioning
   if selected.isEmpty then return 1
-  let outputs ← mapFilesParallel (← scanJobs) selected fun path => stage path (stagePathFor path)
+  let jobs ← scanJobs
+  let started ← IO.monoMsNow
+  let outputs ← mapFilesParallel jobs selected fun path => stage path (stagePathFor path)
+  IO.println s!"staged {selected.size} file(s) on {jobs} worker(s) in {(← IO.monoMsNow) - started} ms"
   let mut staged : Array String := #[]
   let mut failed := false
   for (path, output) in selected.zip outputs do
@@ -1887,7 +1991,9 @@ private def stagedGlob (pattern description : String)
     IO.FS.writeFile path (← IO.FS.readFile (stagePathFor path))
   dropStagedFiles stagedFiles
   let restore := backups
+  let buildStarted ← IO.monoMsNow
   let build ← repositoryBuild
+  IO.println s!"repository build in {(← IO.monoMsNow) - buildStarted} ms"
   unless build.stdout.isEmpty do IO.eprint build.stdout
   unless build.stderr.isEmpty do IO.eprint build.stderr
   if build.exitCode != 0 then
@@ -1907,16 +2013,22 @@ private def stagedGlob (pattern description : String)
     IO.eprintln s!"whole-repository build failed ({description}); restored"
     return build.exitCode
   IO.println s!"{description}: {stagedFiles.size} file(s); build passed"
+  -- The index keys each module by its artefacts' hashes, which this build just rewrote: re-extract
+  -- them here, where the work is already being waited on, rather than in whatever command runs next.
+  -- A refresh that fails says so itself; the edit it follows stands, since the build passed.
+  let refreshStarted ← IO.monoMsNow
+  if (← refreshedIndex?).isSome then
+    IO.println s!"index refreshed for the rebuilt modules in {(← IO.monoMsNow) - refreshStarted} ms"
   return 0
 
-private def renameDeclGlob (pattern : String) (renames : Array Rename) (apply : Bool) : IO UInt32 := do
-  let dbPath? ← refreshedIndex?
-  let status ← stagedGlob pattern s!"renamed {renameList renames}"
-    (fun path stage => spawnSelf (#["rename-decl-stage", path, stage] ++ renameArgs renames)) apply
-    (mentioning := renames.map fun r => shortName r.declName)
+/-- The silent-dependents warning comes first: after `--apply` the index no longer knows the names. -/
+private def renameDeclGlob (dbPath? : Option String) (pattern : String) (renames : Array Rename)
+    (apply : Bool) : IO UInt32 := do
   if let some dbPath := dbPath? then
     for r in renames do warnSilentDependents dbPath r.declName
-  return status
+  stagedGlob pattern s!"renamed {renameList renames}"
+    (fun path stage => spawnSelf (#["rename-decl-stage", path, stage] ++ renameArgs renames)) apply
+    (selection? := some (← renameSelection dbPath? pattern renames))
 
 /-! ## Collapsing a duplicate declaration
 
@@ -2012,7 +2124,7 @@ private def modularizeGlob (pattern : String) (apply : Bool) : IO UInt32 := do
     -- outside the build blocks nothing — and nothing imports it either, or it would be built.
     if indexed.contains moduleName then
       let source ← IO.FS.readFile path
-      let nodes ← if ← ileanAtLeastAsNew path then SyntaxQuery.nodesOfModule dbPath moduleName
+      let nodes ← if ← builtFromSource path then SyntaxQuery.nodesOfModule dbPath moduleName
         else nodesOfChild path
       let decls := SyntaxQuery.declarationsOf nodes source
       declsOf := declsOf.insert path decls
@@ -2441,8 +2553,8 @@ private def renameAll (selector? : Option String) (renames : Array Rename)
       -- `--uses-only` leaves the binding site alone, so each file still elaborates on its own and
       -- the cheap per-file path applies.  A real rename moves the binding site too, which no
       -- ordering of per-file edits keeps valid, so it stages every file and builds once.
-      if usesOnly then renameGlob pattern renames apply
-      else renameDeclGlob pattern renames apply
+      if usesOnly then renameGlob dbPath? pattern renames apply
+      else renameDeclGlob dbPath? pattern renames apply
   | .token _ =>
       let mut status : UInt32 := 0
       for r in renames do
