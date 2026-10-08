@@ -1627,6 +1627,79 @@ private def graphPage (outPath : String) : IO UInt32 := do
   IO.println s!"{outPath}: {nodes} declarations, {edges} edges, {hubs} hub(s) left out"
   return 0
 
+/-! ## Removing imports
+
+`remove-import` deletes named imports from named modules.  Each import is found by Lean's own
+header parser — the `import` node whose module name is the one named — never by matching text, so
+`public import`, `meta import`, `import all` and a trailing comment are all the same node.  The
+deletion is the node's whole line, and only when the parser's trivia say nothing else is on it. -/
+
+private partial def importNodes (stx : Syntax) : Array Syntax :=
+  if stx.isOfKind ``Parser.Module.import then #[stx] else stx.getArgs.foldl (· ++ importNodes ·) #[]
+
+/-- The edits deleting `targets` from the header of `source`, one whole line each. -/
+private def removeImportEdits (path source : String) (targets : Array Name) :
+    IO (Except String (Array Edit)) := do
+  let inputCtx := Parser.mkInputContext source path
+  let (header, _, messages) ← Parser.parseHeader inputCtx
+  if messages.hasErrors then
+    let rendered ← messages.toList.mapM (·.toString)
+    return .error s!"{path}: the header does not parse\n{String.intercalate "" rendered}"
+  let fileMap := inputCtx.fileMap
+  let nodes := importNodes header
+  let mut edits : Array Edit := #[]
+  for target in targets do
+    let some node := nodes.find? fun n => n.getArgs.any fun a => a.isIdent && a.getId == target
+      | return .error s!"{path}: no `import {target}` in its header"
+    let some r := node.getRange? | return .error s!"{path}: `import {target}` has no source range"
+    let pos := fileMap.toPosition r.start
+    let next := fileMap.ofPosition ⟨pos.line + 1, 0⟩
+    -- The trailing trivia of the node's last token must reach the next line, so nothing but
+    -- whitespace or a comment about this import shares its line; column 0 says nothing precedes it.
+    let reaches := match node.getTailInfo with
+      | .original _ _ trailing _ => trailing.stopPos.byteIdx ≥ next.byteIdx
+      | _ => false
+    unless pos.column == 0 && reaches do
+      return .error s!"{path}:{pos.line}: `import {target}` shares its line with other syntax"
+    edits := edits.push { start := r.start, stop := next, line := pos.line, replacement := "" }
+  return .ok edits
+
+/-- `lean-refactor remove-import (module import)...`: delete each named import, then verify with the
+    capped repository build and restore every file if it fails. -/
+private def removeImports (pairs : List String) (apply : Bool) : IO UInt32 := do
+  let rec group : List String → Except String (Array (String × Array Name))
+    | [] => .ok #[]
+    | [m] => .error s!"`{m}` has no import to remove; arguments are (module import) pairs"
+    | m :: i :: rest => do
+        let acc ← group rest
+        match acc.findIdx? (·.1 == m) with
+        | some k => pure (acc.modify k fun (m, is) => (m, #[parseName i] ++ is))
+        | none => pure (#[(m, #[parseName i])] ++ acc)
+  let some groups ← okOr "" (group pairs) | return 2
+  if groups.isEmpty then IO.eprintln "expected at least one <module> <import> pair"; return 2
+  let mut staged : Array (String × String × Array Edit) := #[]
+  for (moduleName, targets) in groups do
+    let some path ← okOr "" (modulePath moduleName) | return 2
+    unless ← System.FilePath.pathExists path do IO.eprintln s!"{moduleName}: {path} does not exist"; return 2
+    let source ← IO.FS.readFile path
+    let some edits ← okOr "" (← removeImportEdits path source targets) | return 1
+    for e in edits do
+      IO.println s!"{path}:{e.line}: remove {repr (String.Pos.Raw.extract source e.start e.stop)}"
+    staged := staged.push (path, source, edits)
+  let count := staged.foldl (· + ·.2.2.size) 0
+  unless apply do IO.println s!"{count} import(s) in {staged.size} file(s); preview only, pass --apply to write"; return 0
+  for (path, source, edits) in staged do IO.FS.writeFile path (applyEdits source edits)
+  IO.println s!"removed {count} import(s) from {staged.size} file(s); verifying the capped repository build..."
+  (← IO.getStdout).flush
+  let build ← repositoryBuild
+  if build.exitCode == 0 then IO.println "whole-repository build passed after removing the imports"; return 0
+  for (path, source, _) in staged do IO.FS.writeFile path source
+  unless build.stdout.isEmpty do IO.eprintln build.stdout
+  unless build.stderr.isEmpty do IO.eprintln build.stderr
+  discard repositoryBuild
+  IO.eprintln "whole-repository build failed after removing the imports; every file restored"
+  return 1
+
 /-! ## Adopting the module system
 
 `module` is opt-in per file, and adopting it takes three edits at once: the `module` keyword, every
@@ -3151,7 +3224,9 @@ private def usage : String := String.intercalate "\n" [
   "cleanup",
   row "unused [f:line:col]" "remove unused binders",
   row "unused-simp" "remove unused `simp` arguments",
-  row "modularize" "convert to the Lean module system"]
+  row "modularize" "convert to the Lean module system",
+  row "remove-import (module import)..." "delete each named import, found by the header parser",
+  row "remove-import file" "... the pairs read from a file"]
 
 /-- One file's call sites of `declName`, printed exactly as the single-file report always has.
     Also the body the `inspect-file` child runs: one elaboration per process, so `inspectReport`'s
@@ -3286,6 +3361,12 @@ def main (args : List String) : IO UInt32 := do
       match parseRenames rest with
       | .error message => IO.eprintln message; return 2
       | .ok renames => return ← renameAll selector? renames apply usesOnly noIndex
+  -- One argument is a file of the pairs: a sweep's list is too long to type and the shell's
+  -- splitting tools are not to be trusted with it.
+  | ["remove-import", file] =>
+      let words := ((← IO.FS.readFile file).split Char.isWhitespace).filter (!·.isEmpty)
+      return ← removeImports (words.map (toString ·)).toList apply
+  | "remove-import" :: pairs => return ← removeImports pairs apply
   -- The staging children of the batch drivers.  Not in the usage: each is one file of a run the
   -- parent is orchestrating, and running one by hand stages an edit nothing then applies.
   | ["inspect-file", path, declModule, declName] => return ← inspectOneFile declModule declName path
