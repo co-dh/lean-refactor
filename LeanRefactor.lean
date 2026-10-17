@@ -3303,7 +3303,7 @@ open Elab in
     reducible transparency) with the ELABORATED term, never by reading the text, so the same object on
     both sides is the unifier's business.  The innermost node wins, so `(F.obj X ⟶ X)` keeps its
     parentheses. -/
-private def foldAbbrevEdits (d : Name) (source : String) (fileMap : FileMap)
+private def foldAbbrevEdits (d : Name) (inst? : Option String) (source : String) (fileMap : FileMap)
     (trees : PersistentArray InfoTree) : IO (Array Edit × Array String) := do
   let infos := termInfos trees.toArray
   let some (ci₀, _) := infos[0]? | return (#[], #[])
@@ -3320,6 +3320,15 @@ private def foldAbbrevEdits (d : Name) (source : String) (fileMap : FileMap)
     let text? ← withLocalContext ci ti.lctx do
       let ty ← instantiateMVars ti.expr
       if ty.hasMVar then return none
+      -- Only a TYPE is folded: a term or pattern position (`(xs, ys)`) is never a candidate.
+      unless ← (try Meta.isType ty catch _ => pure false) do return none
+      -- `--inst "Str A"`: fold only types defeq to that instance, elaborated in this node's own
+      -- context; a node where it does not elaborate (its variables are not in scope) is no match.
+      if let some instText := inst? then
+        let some stx := (Parser.runParserCategory (← getEnv) `term instText).toOption | return none
+        let some target ← (try some <$> (Term.elabType stx <* Term.synthesizeSyntheticMVarsNoPostponing).run'
+          catch _ => pure none) | return none
+        unless ← Meta.isDefEq (← instantiateMVars target) ty do return none
       let levels ← info.levelParams.mapM fun _ => Meta.mkFreshLevelMVar
       let (args, binders, body) ← Meta.lambdaMetaTelescope (value.instantiateLevelParams info.levelParams levels)
       unless ← Meta.withReducible (Meta.isDefEq body ty) do return none
@@ -3366,7 +3375,7 @@ private def foldAbbrevEdits (d : Name) (source : String) (fileMap : FileMap)
   return (inner, refused.foldl (init := #[]) fun acc r => if acc.contains r then acc else acc.push r)
 
 /-- The staging child of `fold-abbrev`: one file, with `d` written in at every match. -/
-private def foldAbbrevStage (path stagePath declName : String) : IO UInt32 := do
+private def foldAbbrevStage (path stagePath declName : String) (inst? : Option String) : IO UInt32 := do
   initSearchPath (← findSysroot)
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
@@ -3381,7 +3390,7 @@ private def foldAbbrevStage (path stagePath declName : String) : IO UInt32 := do
   let d := parseName declName
   -- A file whose environment lacks `d` cannot write it; that is "not affected", not a failure.
   unless frontend.commandState.env.contains d do return 3
-  let (found, refused) ← foldAbbrevEdits d source ctx.fileMap frontend.commandState.infoState.trees
+  let (found, refused) ← foldAbbrevEdits d inst? source ctx.fileMap frontend.commandState.infoState.trees
   for why in refused do IO.println s!"{path}: {why}"
   let edits := (independentEdits found).1
   if edits.isEmpty then return 3
@@ -3474,6 +3483,7 @@ private def usage : String := String.intercalate "\n" [
   row "  --class C" "... which is the type C has an instance for (default Cat)",
   row "  --letters s" "... only these binder letters (default abcd, the object letters)",
   row "fold-abbrev d" "write the abbreviation d wherever a type is an instance of its body",
+  row "  --inst \"d a\"" "  ... only types defeq to this application, elaborated where each type sits",
   row "infix d token" "give d the infix notation token",
   row "notate d --form f" "write every application of d as f; $0, $1, ... are its explicit arguments",
   "",
@@ -3584,6 +3594,7 @@ def main (args : List String) : IO UInt32 := do
   let (args, class?) := stripFlag "--class" args
   let (args, letters?) := stripFlag "--letters" args
   let (args, form?) := stripFlag "--form" args
+  let (args, inst?) := stripFlag "--inst" args
   -- One place turns a flag's text into a number, so every command reports a bad one the same way.
   let natFlag (name : String) : Option String → Except String (Option Nat)
     | none => .ok none
@@ -3720,10 +3731,11 @@ def main (args : List String) : IO UInt32 := do
   | ["rename-objects-stage", path, stagePath] =>
       return ← renameObjectsStage path stagePath class? letters?
   | ["fold-abbrev-stage", path, stagePath, declName] =>
-      return ← foldAbbrevStage path stagePath declName
+      return ← foldAbbrevStage path stagePath declName inst?
   | ["fold-abbrev", declName] =>
       return ← stagedGlob (selector?.getD wholeRepository) s!"`{declName}` folded in"
-        (fun path stage => spawnSelf #["fold-abbrev-stage", path, stage, declName]) apply
+        (fun path stage => spawnSelf (#["fold-abbrev-stage", path, stage, declName] ++
+          (match inst? with | some i => #["--inst", i] | none => #[]))) apply
   | ["rename-var-stage", path, stagePath, old, new] =>
       return ← renameVarStage path stagePath old new class?
   -- Same staging as `rename-objects`, and for the same reason: the `variable` line and every
