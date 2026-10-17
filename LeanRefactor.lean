@@ -3322,6 +3322,15 @@ private def foldAbbrevEdits (d : Name) (inst? : Option String) (source : String)
       if ty.hasMVar then return none
       -- Only a TYPE is folded: a term or pattern position (`(xs, ys)`) is never a candidate.
       unless ← (try Meta.isType ty catch _ => pure false) do return none
+      -- A pattern's node carries the type it was ELABORATED AGAINST as `expr`, so `expr` being a type
+      -- is not enough: the node's own syntax, elaborated as a type here, must denote that type.
+      let some own ← (try some <$> (Term.elabType ti.stx <* Term.synthesizeSyntheticMVarsNoPostponing).run'
+        catch _ => pure none) | return none
+      -- Elaboration recovers from an error with `sorry`, which is defeq to anything: it is no match.
+      let own ← instantiateMVars own
+      -- A hole or a pattern variable elaborates to a metavariable, which unifies with every type.
+      if own.hasSorry || own.hasMVar then return none
+      unless ← Meta.isDefEq own ty do return none
       -- `--inst "Str A"`: fold only types defeq to that instance, elaborated in this node's own
       -- context; a node where it does not elaborate (its variables are not in scope) is no match.
       if let some instText := inst? then
