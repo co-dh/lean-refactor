@@ -3297,6 +3297,103 @@ private def renameObjectsStage (path stagePath : String) (class? letters? : Opti
   IO.FS.writeFile stagePath (applyEdits source staged)
   return 0
 
+open Elab in
+/-- Edits writing the abbreviation `d` wherever the source writes a type that is an instance of its
+    body — `Alg F X` for `F.obj X ⟶ X`.  Decided by unifying the body (its parameters as metavariables,
+    reducible transparency) with the ELABORATED term, never by reading the text, so the same object on
+    both sides is the unifier's business.  The innermost node wins, so `(F.obj X ⟶ X)` keeps its
+    parentheses. -/
+private def foldAbbrevEdits (d : Name) (source : String) (fileMap : FileMap)
+    (trees : PersistentArray InfoTree) : IO (Array Edit × Array String) := do
+  let infos := termInfos trees.toArray
+  let some (ci₀, _) := infos[0]? | return (#[], #[])
+  let some info := ci₀.env.find? d | return (#[], #[])
+  let some value := info.value? | throw (IO.userError s!"`{d}` has no definition body to fold")
+  let rec strip : Expr → Expr | .lam _ _ b _ => strip b | e => e
+  let head := (strip value).getAppFn.constName?
+  let mut found : Array Edit := #[]
+  let mut refused : Array String := #[]
+  for (ci, ti) in infos do
+    if ti.isBinder || ti.expr.getAppFn.constName? != head then continue
+    let some range := ti.stx.getRange? | continue
+    let line := (fileMap.toPosition range.start).line
+    let text? ← withLocalContext ci ti.lctx do
+      let ty ← instantiateMVars ti.expr
+      if ty.hasMVar then return none
+      let levels ← info.levelParams.mapM fun _ => Meta.mkFreshLevelMVar
+      let (args, binders, body) ← Meta.lambdaMetaTelescope (value.instantiateLevelParams info.levelParams levels)
+      unless ← Meta.withReducible (Meta.isDefEq body ty) do return none
+      let mut shown : Array String := #[]
+      for arg in args, bi in binders do
+        unless bi.isExplicit do continue
+        let e ← instantiateMVars arg
+        if e.hasMVar then return none
+        -- The source's own spelling of the argument when the replaced node contains it: the
+        -- printer may drop a coercion or an argument the reader wrote.
+        let mut spelled : Option (Nat × String) := none
+        for (_, sub) in infos do
+          let some r := sub.stx.getRange? | continue
+          unless range.start.byteIdx ≤ r.start.byteIdx && r.stop.byteIdx ≤ range.stop.byteIdx do continue
+          unless (← instantiateMVars sub.expr) == e do continue
+          let size := r.stop.byteIdx - r.start.byteIdx
+          if spelled.all (·.1 < size) then
+            spelled := some (size, String.Pos.Raw.extract source r.start r.stop)
+        let s ← match spelled with
+          | some (_, t) => pure t
+          | none => pure (toString (← Meta.ppExpr e))
+        let wrapped := s.startsWith "(" && s.endsWith ")"
+        shown := shown.push (if s.any (·.isWhitespace) && !wrapped then s!"({s})" else s)
+      let text := String.intercalate " " (toString (← unresolveNameGlobal d) :: shown.toList)
+      -- The printer hides coercions and implicit arguments, so a printed argument can denote another
+      -- term: the fold is made only when its text elaborates back to the very type it replaces.
+      let back ← match Parser.runParserCategory (← getEnv) `term text with
+        | .error e => pure (Except.error e)
+        | .ok stx => try
+            let e ← (Term.elabType stx <* Term.synthesizeSyntheticMVarsNoPostponing).run'
+            pure (.ok (← instantiateMVars e))
+          catch ex => pure (.error (← ex.toMessageData.toString))
+      match back with
+      | .ok e => if ← Meta.isDefEq e ty then return some (Except.ok text)
+                 else return some (.error s!"`{text}` elaborates to `{← Meta.ppExpr e}`")
+      | .error msg => return some (.error s!"`{text}` does not elaborate: {msg}")
+    match text? with
+    | none => continue
+    | some (.error why) => refused := refused.push s!"line {line}: stays — {why}"
+    | some (.ok text) =>
+        found := found.push { start := range.start, stop := range.stop, line, replacement := text }
+  let inner := found.filter fun e => !found.any fun o => (o.start != e.start || o.stop != e.stop) &&
+    e.start.byteIdx ≤ o.start.byteIdx && o.stop.byteIdx ≤ e.stop.byteIdx
+  return (inner, refused.foldl (init := #[]) fun acc r => if acc.contains r then acc else acc.push r)
+
+/-- The staging child of `fold-abbrev`: one file, with `d` written in at every match. -/
+private def foldAbbrevStage (path stagePath declName : String) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  claimElaboration path
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let source ← IO.FS.readFile path
+  let (ctx, importEnv, frontend) ←
+    match ← Elaborate.frontendOf path source (parseName moduleName) with
+    | .ok result => pure result
+    | .error e =>
+        IO.eprintln s!"{path}: does not elaborate as it stands; fix it before folding"
+        for msg in e.messages.toList.take 3 do IO.eprintln (← msg.toString)
+        return 1
+  let d := parseName declName
+  -- A file whose environment lacks `d` cannot write it; that is "not affected", not a failure.
+  unless frontend.commandState.env.contains d do return 3
+  let (found, refused) ← foldAbbrevEdits d source ctx.fileMap frontend.commandState.infoState.trees
+  for why in refused do IO.println s!"{path}: {why}"
+  let edits := (independentEdits found).1
+  if edits.isEmpty then return 3
+  reportEdits path source edits
+  let errors ← errorsIntroduced importEnv path source edits
+  unless errors.isEmpty do
+    IO.println s!"{path}: NOT folded — {errors.size} error(s) with `{declName}` written in"
+    for (_, message) in errors.take 5 do IO.println message
+    return 1
+  IO.FS.writeFile stagePath (applyEdits source edits)
+  return 0
+
 /-- The staging child of `rename-var`: one file, in which every occurrence of the variable `old` —
     its `variable` line, every signature and proof under it, and every named argument spelling it —
     becomes `new`.  Renamed by the elaborator's fvars, so a shadowing `old` inside a proof, and the
@@ -3376,6 +3473,7 @@ private def usage : String := String.intercalate "\n" [
   row "rename-objects" "capitalise every binder that is an object of a category",
   row "  --class C" "... which is the type C has an instance for (default Cat)",
   row "  --letters s" "... only these binder letters (default abcd, the object letters)",
+  row "fold-abbrev d" "write the abbreviation d wherever a type is an instance of its body",
   row "infix d token" "give d the infix notation token",
   row "notate d --form f" "write every application of d as f; $0, $1, ... are its explicit arguments",
   "",
@@ -3621,6 +3719,11 @@ def main (args : List String) : IO UInt32 := do
       return ← renameBinder path declName old new class? apply
   | ["rename-objects-stage", path, stagePath] =>
       return ← renameObjectsStage path stagePath class? letters?
+  | ["fold-abbrev-stage", path, stagePath, declName] =>
+      return ← foldAbbrevStage path stagePath declName
+  | ["fold-abbrev", declName] =>
+      return ← stagedGlob (selector?.getD wholeRepository) s!"`{declName}` folded in"
+        (fun path stage => spawnSelf #["fold-abbrev-stage", path, stage, declName]) apply
   | ["rename-var-stage", path, stagePath, old, new] =>
       return ← renameVarStage path stagePath old new class?
   -- Same staging as `rename-objects`, and for the same reason: the `variable` line and every
