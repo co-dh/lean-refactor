@@ -1111,12 +1111,20 @@ private partial def referenceIdents (stx : Syntax) : Array Syntax :=
     the qualifier is relative to something resolution does not see, so only the last component
     moves, which is sound only when `old` and `new` share their namespace. -/
 private def spellingFor (trees : Array Elab.InfoTree) (start : String.Pos.Raw) (line : Nat)
-    (old new : Name) (text : String) (survivor := false) : Except String String := do
+    (old new : Name) (text : String) (survivor := false) (underOpen := false) : Except String String := do
   let some c := commandCtxAt? trees start | .error s!"line {line}: no command scope recorded"
   let some (explicit, id) := siteIdent? c.env text
     | .error s!"line {line}: `{text}` does not parse as an identifier"
-  let at_ (n : Name) := (if explicit then "@" else "") ++ n.toString
+  -- A part that is a token of the scope (`prefix`) is written `«prefix»`, or the edit does not parse.
+  let tokens := Lean.Parser.getTokenTable c.env
+  let at_ (n : Name) := (if explicit then "@" else "") ++ n.toStringWithToken (isToken := fun s => (tokens.find? s).isSome)
   let sameNs := old.getPrefix == new.getPrefix
+  if underOpen then
+    -- `old` is `N ++ id`; the site names `new` relative to the same `N`.
+    let n := (old.components.take (old.components.length - id.components.length)).foldl Name.append .anonymous
+    unless n.isPrefixOf new do
+      .error s!"line {line}: `{text}` is listed relative to `{n}`, and `{new}` is not in it"
+    return at_ (new.replacePrefix n .anonymous)
   unless resolvedAt c c.env id == [old] do
     if sameNs then return at_ (new.updatePrefix id.getPrefix)
     .error s!"line {line}: `{text}` is not a global name for `{old}`, so it can only keep its \
@@ -1216,7 +1224,13 @@ private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool
     let start := scan.fileMap.lspPosToUtf8Pos site.range.start
     let stop := scan.fileMap.lspPosToUtf8Pos site.range.end
     let line := site.range.start.line + 1
-    let replacement ← spellingFor scan.trees start line old new (String.Pos.Raw.extract scan.source start stop) survivor
+    -- A name listed by `open N (…)`, `open N hiding …`, `open N renaming …` or `export N (…)` is
+    -- written relative to `N`, not to the scope, so it keeps the qualifier it had relative to `N`.
+    let underOpen := match scan.commands.findSome? (syntaxAt start) with
+      | some (_, ps) => ps.any fun p => [``Lean.Parser.Command.openOnly, ``Lean.Parser.Command.openHiding,
+          ``Lean.Parser.Command.openRenaming, ``Lean.Parser.Command.export].contains p.getKind
+      | none => false
+    let replacement ← spellingFor scan.trees start line old new (String.Pos.Raw.extract scan.source start stop) survivor underOpen
     edits := edits.push { start, stop, line, replacement }
   return dedupeEdits edits
 
