@@ -66,6 +66,8 @@ rename
   rename-objects                          capitalise every binder that is an object of a category
     --class C                             ... which is the type C has an instance for (default Cat)
     --letters s                           ... only these binder letters (default abcd, the object letters)
+  fold-abbrev d                           write the abbreviation d wherever a type is an instance of its body
+    --inst "d a"                            ... only types defeq to this application, elaborated where each type sits
   infix d token                           give d the infix notation token
   notate d --form f                       write every application of d as f; $0, $1, ... are its explicit arguments
 
@@ -83,7 +85,7 @@ replace
 
 arguments
   remove-arg d n                          remove argument n at every call of d
-    --syntax                              match calls by name where elaboration cannot
+    --syntax                              read calls off this file's elaboration, not the built .ilean
     --token tok                           also match calls written as the notation tok
   insert-arg d n term                     insert term before argument n
   remove-param d binder n                 remove a parameter Lean reports unused
@@ -92,6 +94,10 @@ cleanup
   unused [f:line:col]                     remove unused binders
   unused-simp                             remove unused `simp` arguments
   modularize                              convert to the Lean module system
+  remove-import (module import)...        delete each named import, found by the header parser
+  remove-import file                      ... the pairs read from a file
+  move-decl dest d...                     move each d into the new module dest, reopening its scopes
+  move-decl file                          ... the (dest d) pairs read from a file
 ```
 
 <!-- usage:end -->

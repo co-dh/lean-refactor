@@ -80,20 +80,9 @@ private def sitesNamed (references : Lsp.ModuleRefs) (declName : String)
       if name == declName then sites := sites ++ (part info).map siteOf
   return sites
 
-private partial def syntaxSitesNamed (fileMap : FileMap) (declName : String) (stx : Syntax) : Array ReferenceSite := Id.run do
-  let mut sites := #[]
-  if stx.isIdent && (stx.getId.toString == declName || stx.getId.toString == shortName declName) then
-    if let some range := stx.getRange? then
-      sites := sites.push {
-        range := ⟨fileMap.utf8PosToLspPos range.start, fileMap.utf8PosToLspPos range.stop⟩
-        parent? := none
-      }
-  for child in stx.getArgs do sites := sites ++ syntaxSitesNamed fileMap declName child
-  return sites
-
 /-- Uses written through NOTATION.  `∇ n` is `CartBicat.«∇» n` after expansion, but the source has
-    no identifier to match — the head is an atom the notation declared — so neither the semantic
-    passes nor `syntaxSitesNamed` sees it, and a call-argument edit would silently skip every such
+    no identifier to match — the head is an atom the notation declared — so the semantic passes do
+    not see it, and a call-argument edit would silently skip every such
     use.  Matching the atom finds them; the enclosing application is then read as usual. -/
 private partial def tokenSitesNamed (fileMap : FileMap) (token : String) (stx : Syntax) :
     Array ReferenceSite := Id.run do
@@ -128,11 +117,16 @@ where
 private def parseName (s : String) : Name :=
   (s.splitOn ".").foldl (fun n part => Name.str n part) Name.anonymous
 
+/-- The application whose FUNCTION is the use at `site`.  The innermost application around a use is
+    not enough: in `h f` the use `f` is `h`'s argument, and taking that node removed `h`'s argument. -/
 private def enclosingApp (fileMap : FileMap) (site : ReferenceSite)
     (commands : Array Syntax) : Option Syntax := do
   let pos := fileMap.lspPosToUtf8Pos site.range.start
   let (_, parents) ← commands.findSome? (syntaxAt pos)
-  parents.find? (·.isOfKind ``Lean.Parser.Term.app)
+  let app ← parents.find? (·.isOfKind ``Lean.Parser.Term.app)
+  let fn ← app[0].getRange?
+  guard (fn.start ≤ pos && pos < fn.stop)
+  some app
 
 /-- The `(f a)` that wraps the application, when the parentheses hold nothing else.  Removing an
     application's SOLE argument leaves the parentheses redundant — `(Δ n)` must become `Δ`, not
@@ -257,7 +251,7 @@ private def declarationAtPosition? (ilean : Ilean) (pos : Lsp.Position) : Option
 private def editForSite (fileMap : FileMap) (site : ReferenceSite)
     (commands : Array Syntax) (argIndex : Nat) (source : String) : Except String Edit := do
   let some app := enclosingApp fileMap site commands
-    | throw s!"line {site.range.start.line + 1}: resolved reference is not inside an application"
+    | throw s!"line {site.range.start.line + 1}: the use is not the function of an application"
   let some args := appArgs app
     | throw s!"line {site.range.start.line + 1}: unsupported application syntax"
   let some target := args[argIndex]?
@@ -305,7 +299,7 @@ private def editForSite (fileMap : FileMap) (site : ReferenceSite)
 private def insertionForSite (fileMap : FileMap) (site : ReferenceSite)
     (commands : Array Syntax) (beforeIndex : Nat) (term : String) : Except String Edit := do
   let some app := enclosingApp fileMap site commands
-    | throw s!"line {site.range.start.line + 1}: resolved reference is not inside an application"
+    | throw s!"line {site.range.start.line + 1}: the use is not the function of an application"
   let some args := appArgs app | throw "unsupported application syntax"
   let some target := args[beforeIndex]?
     | throw s!"line {site.range.start.line + 1}: application has only {args.size} positional argument(s)"
@@ -1098,6 +1092,18 @@ private def siteIdent? (env : Environment) (text : String) : Option (Bool × Nam
 private partial def identsIn (stx : Syntax) : Array Syntax :=
   (if stx.isIdent then #[stx] else #[]) ++ stx.getArgs.flatMap identsIn
 
+/-- The identifiers of `stx` in a slot that can REFER to a declaration.  The grammar has slots whose
+    identifier is a KEY into something else — `(Q := e)` names a binder of the callee, `{ Q := e }`
+    and `s with Q := e` a field of the structure — so resolving that text in scope finds whatever
+    unrelated constant happens to be called `Q`.  The value `e` in each is still a term. -/
+private partial def referenceIdents (stx : Syntax) : Array Syntax :=
+  if stx.isIdent then #[stx]
+  else if stx.isOfKind ``Lean.Parser.Term.namedArgument then referenceIdents stx[3]
+  else if stx.isOfKind ``Lean.Parser.Term.structInstLVal then
+    -- Only an array index `[i]` in a field path is a term; every name in it is a field.
+    (stx[1].getArgs.filter (·.isOfKind ``Lean.Parser.Term.structInstArrayRef)).flatMap referenceIdents
+  else stx.getArgs.flatMap referenceIdents
+
 /-- How the site whose text is `text` writes `new` in place of `old`.  Where the identifier resolves
     to `old` in its command's scope, the answer is asked of name resolution in that scope with `new`
     added: the source's own qualification if it resolves to `new` alone, else the shortest suffix of
@@ -1166,8 +1172,9 @@ private def scanFile (path moduleName : String) : IO (Except UInt32 ScannedFile)
     * the info trees' references to that constant (with `withDefinition`, its binding site too);
     * with `withDefinition`, the locals bound AT that binding site: a field's laws name the field as a
       local, not as the constant;
-    * any identifier the info trees recorded nothing for (`unfold`'s arguments, among others) that
-      resolves, in its own command's scope, to that constant and nothing else.
+    * any identifier in a reference slot (`referenceIdents`: not a named argument's or a field's
+      key) the info trees recorded nothing for (`unfold`'s arguments, among others) that resolves,
+      in its own command's scope, to that constant and nothing else.
     Each site is then respelled by `spellingFor`.  `withDefinition` picks which edit is wanted:
     `rename --uses-only` moves the uses, a real rename moves the binding site as well. -/
 private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool) (survivor := false) :
@@ -1197,7 +1204,7 @@ private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool
           sites := sites.push { range := ⟨scan.fileMap.utf8PosToLspPos r.start,
             scan.fileMap.utf8PosToLspPos r.stop⟩, parent? := none }
   for cmd in scan.commands do
-    for stx in identsIn cmd do
+    for stx in referenceIdents cmd do
       let some range := stx.getRange? | continue
       unless recorded.contains range.start.byteIdx do
         if let some c := commandCtxAt? scan.trees range.start then
@@ -3510,7 +3517,7 @@ private def usage : String := String.intercalate "\n" [
   "",
   "arguments",
   row "remove-arg d n" "remove argument n at every call of d",
-  row "  --syntax" "match calls by name where elaboration cannot",
+  row "  --syntax" "read calls off this file's elaboration, not the built .ilean",
   row "  --token tok" "also match calls written as the notation tok",
   row "insert-arg d n term" "insert term before argument n",
   row "remove-param d binder n" "remove a parameter Lean reports unused",
@@ -3769,7 +3776,7 @@ def main (args : List String) : IO UInt32 := do
   -- name alone stand in when it cannot.
   let (mode, declName, binderName?, argIndex?, insertText?) ← match args with
     | ["remove-arg", declName, index] =>
-        pure (if syntaxMatch then "remove-syntax" else "remove", declName, none, index.toNat?, none)
+        pure (if syntaxMatch then "remove-live" else "remove", declName, none, index.toNat?, none)
     | ["insert-arg", declName, index, term] =>
         pure ("insert", declName, none, index.toNat?, some term)
     | ["remove-param", declName, binderName, index] =>
@@ -3795,26 +3802,25 @@ def main (args : List String) : IO UInt32 := do
         for msg in e.messages.toList do IO.eprintln (← msg.toString)
         return 1
   unless !frontend.commandState.messages.hasErrors do
-    if mode != "remove" && mode != "remove-syntax" && mode != "insert" then
+    if mode != "remove" && mode != "remove-live" && mode != "insert" then
       for msg in frontend.commandState.messages.toList do IO.eprintln (← msg.toString)
       return 1
   let commands := frontend.commands
   let ileanPath := ileanPath moduleName
   let ilean ← Ilean.load ileanPath
-  let mut sites := if mode == "remove-syntax" then #[] else
+  -- A use is a node the elaborator resolved to the CONSTANT `declName`, read from the info trees,
+  -- never an identifier spelled like it: a local or binder named `R` is not the declaration `R`.
+  if mode == "remove-live" && !env.contains (parseName declName) then
+    IO.eprintln s!"`{declName}` is not a constant in scope in {sourcePath}; give its full name"
+    return 2
+  let mut sites := if mode == "remove-live" then #[] else
     usageSitesIn ilean.references declModule declName
-  if mode == "remove-syntax" then
-    for command in frontend.commands do
-      sites := sites ++ syntaxSitesNamed inputCtx.fileMap declName command
-  if sites.isEmpty && (mode == "remove" || mode == "insert") then
+  if sites.isEmpty && (mode == "remove" || mode == "remove-live" || mode == "insert") then
     let refs := Server.findModuleRefs inputCtx.fileMap
       frontend.commandState.infoState.trees.toArray (localVars := false)
     let (liveReferences, _) ← refs.toLspModuleRefs
     sites := usageSitesIn liveReferences declModule declName
     if sites.isEmpty then sites := sitesNamed liveReferences declName (·.usages)
-    if sites.isEmpty && env.contains (parseName declName) then
-      for command in frontend.commands do
-        sites := sites ++ syntaxSitesNamed inputCtx.fileMap declName command
   if let some token := token? then
     for command in frontend.commands do
       sites := sites ++ tokenSitesNamed inputCtx.fileMap token command
@@ -3828,9 +3834,9 @@ def main (args : List String) : IO UInt32 := do
     else editForSite inputCtx.fileMap site commands (oneBased - 1) source
     match result with
     | .error message =>
-        -- `--syntax` matches by name, so the declaration's own binder line answers to it and is
-        -- not an application: report and carry on rather than abandoning the file.
-        unless mode == "remove-syntax" do
+        -- `--syntax` is used on files mid-change, where an unapplied use (`h f`, `[f]`) is
+        -- expected: report and carry on rather than abandoning the file.
+        unless mode == "remove-live" do
           IO.eprintln message
           return 1
         IO.println s!"skipped: {message}"
@@ -3851,6 +3857,16 @@ def main (args : List String) : IO UInt32 := do
     match declarationBinderEdit source inputCtx.fileMap definitionSite commands binderName with
     | .error message => IO.eprintln message; return 1
     | .ok edit => edits := edits.push edit
+  -- Two records of one use give the same edit twice, and `applyEdits` splices by the ORIGINAL
+  -- offsets, so a second copy cut text the first had already moved (`(cost tc) : dT` lost 9 bytes).
+  -- Identical edits collapse; overlapping ones (an argument inside another call) are refused, since
+  -- a re-run would remove a second argument from the calls already edited.
+  let (kept, overlapping) := independentEdits edits
+  if overlapping > 0 then
+    IO.eprintln s!"refusing: {overlapping} edit(s) overlap another (a call of `{declName}` inside \
+      the argument being edited); edit those calls by hand first"
+    return 1
+  edits := kept
   -- `insert-call-arg` produces a zero-width edit, which spans no text to report as removed; the
   -- preview is the only thing the caller sees before `--apply`, so it must name the real operation.
   for edit in edits do
