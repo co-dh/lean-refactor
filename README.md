@@ -77,7 +77,7 @@ move
 replace
   collapse d r                            replace duplicate d by its survivor r
     --drop-arg n                          ... dropping argument n at every call
-  replace d text                          replace d entirely
+  replace (d text)...                     replace each d entirely, in one file and one build
     --body                                ... replace only the body of d
   remove d                                remove d
 

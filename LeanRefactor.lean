@@ -848,49 +848,48 @@ private partial def syntaxHasIdent (name : String) (stx : Syntax) : Bool :=
   (stx.isIdent && stx.getId.toString == name) ||
     stx.getArgs.any (syntaxHasIdent name)
 
-/-- Replace only the parsed term after `:=` in a declaration.  The operation previews by default and
-    restores the source after either an elaboration failure or a capped repository-build failure. -/
-private def replaceDeclarationBody (path declName replacement : String) (apply : Bool) : IO UInt32 := do
+/-- The edit that replaces `declName`'s parsed term after `:=` (`body`) or its whole command. -/
+private def replacementEdit (path source : String) (fileMap : FileMap) (commands : Array Syntax)
+    (body : Bool) (declName replacement : String) : Except String Edit := do
+  unless body do
+    let ((start, stop), _) ← (declarationSite source commands declName).mapError (s!"{path}: " ++ ·)
+    -- the command's range runs on to the next command, so the blank lines that separate the two
+    -- are part of it: they are kept, or every replaced declaration ran into the one after it
+    let old := String.Pos.Raw.extract source start stop
+    let gap := old.drop (old.trimAsciiEnd.toString.length)
+    return { start, stop, line := (fileMap.toPosition start).line + 1,
+             replacement := replacement.trimAscii.toString ++ gap.toString }
+  let declaration ← (declarationSyntax commands declName).mapError (s!"{path}: " ++ ·)
+  let some declVal := firstSyntaxOfKind? ``Lean.Parser.Command.declValSimple declaration
+    | throw s!"{path}: `{declName}` has no simple `:=` body"
+  let some term := declVal.getArgs[1]?
+    | throw s!"{path}: `{declName}` has a malformed simple body"
+  let some range := term.getRange?
+    | throw s!"{path}: `{declName}` body has no source range"
+  return { start := range.start, stop := range.stop,
+           line := (fileMap.toPosition range.start).line + 1, replacement }
+
+/-- Replace declarations of one file, each its whole command or (`body`) only the parsed term after
+    `:=`.  Several pairs are one transaction: every replacement is applied to the one elaboration of
+    the file and the result is gated once, so a change that spans declarations -- a helper and its
+    callers -- costs one repository build and lands or is restored whole.  Preview by default. -/
+private def replaceDeclarations (path : String) (pairs : Array (String × String)) (body : Bool)
+    (apply : Bool) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let (source, fileMap, commands, _) ← elaborateFile path
-  let some declaration ← okOr s!"{path}: " (declarationSyntax commands declName) | return 1
-  let some declVal := firstSyntaxOfKind? ``Lean.Parser.Command.declValSimple declaration
-    | IO.eprintln s!"{path}: `{declName}` has no simple `:=` body"
-      return 1
-  let some body := declVal.getArgs[1]?
-    | IO.eprintln s!"{path}: `{declName}` has a malformed simple body"
-      return 1
-  let some range := body.getRange?
-    | IO.eprintln s!"{path}: `{declName}` body has no source range"
-      return 1
-  let line := (fileMap.toPosition range.start).line + 1
-  let edit : Edit := {
-    start := range.start
-    stop := range.stop
-    line := (fileMap.toPosition range.start).line + 1
-    replacement := replacement
-  }
-  let updated := applyEdits source #[edit]
-  IO.println s!"replace body of `{declName}` in {path} (line {line})"
+  let what := if body then "body of " else "declaration "
+  let mut edits := #[]
+  for (declName, replacement) in pairs do
+    match replacementEdit path source fileMap commands body declName replacement with
+    | .error message => IO.eprintln message; return 1
+    | .ok edit =>
+        IO.println s!"replace {what}`{declName}` in {path} (line {edit.line})"
+        edits := edits.push edit
   unless apply do
     IO.println "preview only; pass --apply to write"
     return 0
-  gatedWrite path source updated s!"replacing the body of `{declName}`"
-
-/-- Replace one complete parsed declaration command. This is the structural counterpart of
-    `replace --body`: it is intended for changing a theorem's statement together with its proof while
-    retaining AST-selected boundaries, preview-by-default behavior, and transactional validation. -/
-private def replaceDeclaration (path declName replacement : String) (apply : Bool) : IO UInt32 := do
-  initSearchPath (← findSysroot)
-  let (source, _, commands, _) ← elaborateFile path
-  let some ((start, stop), _) ← okOr s!"{path}: " (declarationSite source commands declName) | return 1
-  let edit : Edit := { start, stop, line := 0, replacement := replacement.trimAscii.toString ++ "\n" }
-  let updated := applyEdits source #[edit]
-  IO.println s!"replace declaration `{declName}` in {path}"
-  unless apply do
-    IO.println "preview only; pass --apply to write"
-    return 0
-  gatedWrite path source updated s!"replacing declaration `{declName}`"
+  let names := ", ".intercalate (pairs.map (s!"`{·.1}`")).toList
+  gatedWrite path source (applyEdits source edits) s!"replacing the {what}{names}"
 
 /-- Remove one complete parsed declaration command. Preview by default; on application, restore the
     source if either the edited file or the capped repository build fails. -/
@@ -3527,7 +3526,7 @@ private def usage : String := String.intercalate "\n" [
   "replace",
   row "collapse d r" "replace duplicate d by its survivor r",
   row "  --drop-arg n" "... dropping argument n at every call",
-  row "replace d text" "replace d entirely",
+  row "replace (d text)..." "replace each d entirely, in one file and one build",
   row "  --body" "... replace only the body of d",
   row "remove d" "remove d",
   "",
@@ -3736,10 +3735,14 @@ def main (args : List String) : IO UInt32 := do
   | ["collapse", declName, replacement] =>
       if dropArg? == some 0 then IO.eprintln "`--drop-arg` is 1-based"; return 2
       return ← collapseGlob (selector?.getD wholeRepository) declName replacement dropArg? apply
-  | ["replace", declName, text] =>
+  | "replace" :: declName :: text :: more =>
+      let rec pairsOf : List String → Option (List (String × String))
+        | [] => some []
+        | d :: t :: rest => ((d, t) :: ·) <$> pairsOf rest
+        | [_] => none
+      let some rest := pairsOf more | IO.eprintln usage; return 2
       let .ok path ← fileOf selector? declName | return 2
-      if body then return ← replaceDeclarationBody path declName text apply
-      return ← replaceDeclaration path declName text apply
+      return ← replaceDeclarations path ((declName, text) :: rest).toArray body apply
   | ["remove", declName] =>
       let .ok path ← fileOf selector? declName | return 2
       return ← removeDeclaration path declName apply

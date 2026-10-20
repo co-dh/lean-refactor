@@ -195,22 +195,26 @@ interior as (
   where t.roots = 0 and t.kinds = 1 and g.c >= t.n
 )
 select b.nodes as nodes,
-       group_concat(m.source, char(31)) as ss,
-       group_concat(b.b0, char(31)) as b0s,
-       group_concat(b.b1, char(31)) as b1s
+       json_group_array(m.source) as ss,
+       json_group_array(b.b0) as b0s,
+       json_group_array(b.b1) as b1s
 from big b join grp on grp.h = b.h join module m on m.id = b.md
 where b.h not in (select h from interior)
 group by b.h order by b.nodes desc, count(*) desc"
   Db.queryRows dbPath sql fun row => do
     let nodes := (row.getObjValAs? Nat "nodes").toOption.getD 0
-    let sources := ((row.getObjValAs? String "ss").toOption.getD "").splitOn Db.fieldSep
-    let b0s := ((row.getObjValAs? String "b0s").toOption.getD "").splitOn Db.fieldSep
-    let b1s := ((row.getObjValAs? String "b1s").toOption.getD "").splitOn Db.fieldSep
+    -- Each list is a JSON array, not cells joined by `Db.fieldSep`: sqlite3 3.45's `-json` writes a
+    -- control character as `u001f` with no backslash, so a joined list came back one unsplittable
+    -- string and every group reported no occurrence at all.
+    let list (α) [FromJson α] (col : String) : Option (List α) := do
+      let text ← (row.getObjValAs? String col).toOption
+      (Json.parse text >>= fromJson?).toOption
+    let sources ← list String "ss"
+    let b0s ← list Nat "b0s"
+    let b1s ← list Nat "b1s"
     guard (sources.length == b0s.length && sources.length == b1s.length)
-    let sites := (sources.zip (b0s.zip b1s)).toArray.filterMap fun (s, b0, b1) =>
-      match b0.toNat?, b1.toNat? with
-      | some b0, some b1 => some { source := s, b0, b1 : CloneSite }
-      | _, _ => none
+    let sites := (sources.zip (b0s.zip b1s)).toArray.map fun (s, b0, b1) =>
+      { source := s, b0, b1 : CloneSite }
     -- File order, so the occurrences of one clone read as a list a reader can walk down.
     pure { nodes, sites := sites.qsort fun a b =>
       a.source < b.source || (a.source == b.source && a.b0 < b.b0) }
