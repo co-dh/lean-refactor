@@ -976,6 +976,15 @@ private def insertionPoint? (commands : Array Syntax) (ns : Name) : Option Strin
     state := scopeStep state cmd
   return best
 
+/-- A `private` declaration moved to another file is out of reach of every use it leaves behind in
+    its own, so it arrives without the modifier: the first line of its header that starts with
+    `private`, after any doc comment and attributes, loses it. -/
+private def public_ (text : String) : String :=
+  let lines := text.splitOn "\n"
+  match lines.findIdx? (·.startsWith "private ") with
+  | some i => "\n".intercalate (lines.set i ((lines[i]!.drop "private ".length).toString))
+  | none => text
+
 private def moveDeclaration (sourcePath declName targetPath : String) (apply : Bool)
     (omitBinders? : Option String := none) (targetNamespace? : Option String := none) : IO UInt32 := do
   initSearchPath (← findSysroot)
@@ -983,6 +992,7 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
   let some ((start, stop), ns) ←
     okOr s!"{sourcePath}: " (declarationSite source sourceCommands declName) | return 1
   let declarationText := (String.Pos.Raw.extract source start stop).trimAscii.toString
+  let declarationText := if sourcePath == targetPath then declarationText else public_ declarationText
   let text := match omitBinders? with
     | some binders => "omit " ++ binders ++ " in\n" ++ declarationText
     | none => declarationText
