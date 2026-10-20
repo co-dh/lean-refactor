@@ -68,6 +68,16 @@ private def usageSitesIn (references : Lsp.ModuleRefs) (declModule declName : St
   | none => #[]
   | some info => info.usages.map siteOf
 
+/-- The name a reference record's constant is written by. A `private` declaration's records carry
+    `_private.<module>.0.<name>`, which no source spells, so without this every site of one is
+    invisible to a command given the name the source declares it by. -/
+private def userNameOf (name : String) : String :=
+  if name.startsWith "_private." then
+    match name.splitOn ".0." with
+    | _ :: rest@(_ :: _) => ".0.".intercalate rest
+    | _ => name
+  else name
+
 /-- The sites of `declName` whatever module declared it, with `part` picking which end of the record
     is wanted: `usages` where the name is used, `definition?` the BINDING site where it is introduced.
     They are separate edits — moving the uses alone leaves the file naming a declaration that no
@@ -77,7 +87,7 @@ private def sitesNamed (references : Lsp.ModuleRefs) (declName : String)
   let mut sites := #[]
   for (ident, info) in references do
     if let .const _ name := ident then
-      if name == declName then sites := sites ++ (part info).map siteOf
+      if userNameOf name == declName then sites := sites ++ (part info).map siteOf
   return sites
 
 private partial def syntaxSitesNamed (fileMap : FileMap) (declName : String) (stx : Syntax) : Array ReferenceSite := Id.run do
@@ -1082,11 +1092,12 @@ private def commandCtxAt? (trees : Array Elab.InfoTree) (p : String.Pos.Raw) :
       info.stx.getRange?.bind fun r => if r.start ≤ p && p < r.stop then some c else none
     | _ => none
 
-/-- The global constants `id` names in `c`'s scope over `env`; a reading that leaves trailing
+/-- The global constants `id` names in `c`'s scope over `env`, by the names their sources declare
+    them by (a `private` one's, not its `_private` mangling); a reading that leaves trailing
     components as projections is not a name for a constant. -/
 private def resolvedAt (c : Elab.CommandContextInfo) (env : Environment) (id : Name) : List Name :=
   (ResolveName.resolveGlobalName env c.options c.currNamespace c.openDecls id).filterMap fun
-    | (n, []) => some n | _ => none
+    | (n, []) => some ((privateToUserName? n).getD n) | _ => none
 
 /-- The identifier a site's text is, read by the term parser, and whether it is `@`-explicit. -/
 private def siteIdent? (env : Environment) (text : String) : Option (Bool × Name) := do
