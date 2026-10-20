@@ -86,7 +86,7 @@ arguments
     --syntax                              match calls by name where elaboration cannot
     --token tok                           also match calls written as the notation tok
   insert-arg d n term                     insert term before argument n
-  remove-param d binder n                 remove a parameter Lean reports unused
+  remove-param d binder n                 remove a parameter that is unused, or only passed on to d itself
 
 cleanup
   unused [f:line:col]                     remove unused binders

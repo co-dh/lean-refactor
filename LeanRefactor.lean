@@ -3536,7 +3536,7 @@ private def usage : String := String.intercalate "\n" [
   row "  --syntax" "match calls by name where elaboration cannot",
   row "  --token tok" "also match calls written as the notation tok",
   row "insert-arg d n term" "insert term before argument n",
-  row "remove-param d binder n" "remove a parameter Lean reports unused",
+  row "remove-param d binder n" "remove a parameter that is unused, or only passed on to d itself",
   "",
   "cleanup",
   row "unused [f:line:col]" "remove unused binders",
@@ -3864,9 +3864,6 @@ def main (args : List String) : IO UInt32 := do
     let mut hasUnusedWarning := false
     for msg in frontend.commandState.messages.toList do
       if (toString (← msg.data.format)).contains warningNeedle then hasUnusedWarning := true
-    unless hasUnusedWarning do
-      IO.eprintln s!"refusing: Lean did not report `{binderName}` as unused"
-      return 1
     let declInfo? := ilean.references.get? (.const declModule declName)
     let some definitionSite := declInfo?.bind (·.definition?) |>.map siteOf
       | IO.eprintln "declaration definition is absent from this module's semantic references"
@@ -3874,6 +3871,13 @@ def main (args : List String) : IO UInt32 := do
     match declarationBinderEdit source inputCtx.fileMap definitionSite commands binderName with
     | .error message => IO.eprintln message; return 1
     | .ok edit => edits := edits.push edit
+    -- Lean counts a parameter as used when the declaration only hands it on to its own recursive
+    -- calls; those calls are among `sites`, so the file without the binder and without those
+    -- arguments still elaborating is what says no other use was left.
+    unless hasUnusedWarning do
+      unless (← elaborationErrors env sourcePath (applyEdits source edits)).isEmpty do
+        IO.eprintln s!"refusing: `{binderName}` is used beyond being passed on to `{declName}` itself"
+        return 1
   -- `insert-call-arg` produces a zero-width edit, which spans no text to report as removed; the
   -- preview is the only thing the caller sees before `--apply`, so it must name the real operation.
   for edit in edits do
@@ -3881,6 +3885,10 @@ def main (args : List String) : IO UInt32 := do
       IO.println s!"line {edit.line}: insert {repr edit.replacement}"
     else
       IO.println s!"line {edit.line}: remove {repr (String.Pos.Raw.extract source edit.start edit.stop)}"
+  if apply && mode == "parameter" then
+    -- the signature changes, so the callers in other files (taken first with `remove-arg --in`)
+    -- are held to it by the build
+    return ← gatedWrite sourcePath source (applyEdits source edits) s!"removing `{binderName?.getD ""}` from `{declName}`"
   if apply then
     IO.FS.writeFile sourcePath (applyEdits source edits)
     IO.println s!"applied {edits.size} edit(s) to {sourcePath}"
