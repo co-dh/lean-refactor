@@ -1140,10 +1140,12 @@ private def spellingFor (trees : Array Elab.InfoTree) (start : String.Pos.Raw) (
   -- must already be in scope at the site, or the rewritten use could not elaborate.
   let added := c.env.addDeclCore 0
     (.axiomDecl { name := new, levelParams := [], type := .sort .zero, isUnsafe := false }) none (doCheck := false)
+  -- a `private` survivor, or a `private` name already taken, is in the environment by its mangling
+  let declared := c.env.contains new || c.env.contains (mkPrivateName c.env new)
   let env ← if survivor then
-      if c.env.contains new then pure c.env
+      if declared then pure c.env
       else .error s!"line {line}: the survivor `{new}` is not in scope here"
-    else if c.env.contains new then .error s!"line {line}: `{new}` is already declared"
+    else if declared then .error s!"line {line}: `{new}` is already declared"
     else match added with
       | Except.ok env => pure env
       | .error _ => .error s!"line {line}: cannot add `{new}` to the scope there to resolve against"
