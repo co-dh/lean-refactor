@@ -22,8 +22,15 @@ public def frontendOf (path source : String) (mainModule : Name) :
   let inputCtx := Parser.mkInputContext source path
   let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
   if headerMessages.hasErrors then return .error { parsed := false, messages := headerMessages }
+  -- The native code Lake hands `lean` for this module, which `lean` loads from the same file: a
+  -- target built with `precompileModules` runs its own `@[extern]` kernels while elaborating
+  -- (`#eval`, `#guard`), and without its dynlibs and plugins the interpreter aborts the whole tool
+  -- on the first such symbol. A module Lake has not built has no setup file and loads nothing.
+  let setupPath := modToFilePath ".lake/build/ir" mainModule "setup.json"
+  let setup ← if ← setupPath.pathExists then ModuleSetup.load setupPath else pure { name := mainModule }
+  setup.dynlibs.forM loadDynlib
   let (env, headerMessages) ← Elab.processHeader header {} headerMessages inputCtx
-    (mainModule := mainModule)
+    (plugins := setup.plugins) (mainModule := mainModule)
   if headerMessages.hasErrors then return .error { parsed := true, messages := headerMessages }
   let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
   return .ok (inputCtx, env, frontend)
