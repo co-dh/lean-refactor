@@ -388,6 +388,16 @@ where
     | p :: ps, c :: cs => p == c && go ps cs
     | _ :: _, [] => false
 
+/-- The module path `lake env` would give, for a run outside it: the target repository's own build
+    and each of its packages', read from the `.lake` of the current directory. -/
+private def targetSearchPath : IO SearchPath := do
+  if (← IO.getEnv "LEAN_PATH").isSome then return []
+  let root := (← IO.currentDir) / ".lake"
+  let pkgs := root / "packages"
+  let deps ← if ← pkgs.isDir then (← pkgs.readDir).toList.mapM fun e => pure (e.path / ".lake" / "build" / "lib" / "lean")
+    else pure []
+  return (root / "build" / "lib" / "lean") :: deps
+
 private partial def leanFilesUnder (dir : System.FilePath) : IO (Array String) := do
   let mut files := #[]
   for entry in ← dir.readDir do
@@ -441,7 +451,8 @@ private def selectedFiles (pattern : String) (mentioning : Array String := #[]) 
   let excludes := excluded.map (·.drop 1 |>.toString)
   let matched := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
     |>.filter fun path =>
-      patterns.any (globMatches · path) && !excludes.any (globMatches · path)
+      -- Lake's package configuration is no module of the package: it is elaborated by Lake alone.
+      path != "lakefile.lean" && patterns.any (globMatches · path) && !excludes.any (globMatches · path)
   if matched.isEmpty then
     IO.eprintln s!"`--in {pattern}` matched no Lean file"
     return matched
@@ -825,7 +836,7 @@ private partial def syntaxHasIdent (name : String) (stx : Syntax) : Bool :=
 /-- Replace only the parsed term after `:=` in a declaration.  The operation previews by default and
     restores the source after either an elaboration failure or a capped repository-build failure. -/
 private def replaceDeclarationBody (path declName replacement : String) (apply : Bool) : IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, fileMap, commands, _) ← elaborateFile path
   let some declaration ← okOr s!"{path}: " (declarationSyntax commands declName) | return 1
   let some declVal := firstSyntaxOfKind? ``Lean.Parser.Command.declValSimple declaration
@@ -855,7 +866,7 @@ private def replaceDeclarationBody (path declName replacement : String) (apply :
     `replace --body`: it is intended for changing a theorem's statement together with its proof while
     retaining AST-selected boundaries, preview-by-default behavior, and transactional validation. -/
 private def replaceDeclaration (path declName replacement : String) (apply : Bool) : IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, _, commands, _) ← elaborateFile path
   let some ((start, stop), _) ← okOr s!"{path}: " (declarationSite source commands declName) | return 1
   let edit : Edit := { start, stop, line := 0, replacement := replacement.trimAscii.toString ++ "\n" }
@@ -869,7 +880,7 @@ private def replaceDeclaration (path declName replacement : String) (apply : Boo
 /-- Remove one complete parsed declaration command. Preview by default; on application, restore the
     source if either the edited file or the capped repository build fails. -/
 private def removeDeclaration (path declName : String) (apply : Bool) : IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, _, commands, _) ← elaborateFile path
   let some ((start, stop), _) ← okOr s!"{path}: " (declarationSite source commands declName) | return 1
   let edit : Edit := { start, stop, line := 0, replacement := "" }
@@ -902,7 +913,7 @@ private def sectionSite (source : String) (commands : Array Syntax) (sectionName
     transaction contract as the other structural operations. -/
 private def relocateDeclarationBefore (path declName anchorName : String) (apply : Bool) :
     IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, _, commands, _) ← elaborateFile path
   let some ((start, stop), ns) ← okOr s!"{path}: " (declarationSite source commands declName) | return 1
   let (anchorKind, (anchorStart, _), anchorNs) ← match sectionSite source commands anchorName with
@@ -952,7 +963,7 @@ private def insertionPoint? (commands : Array Syntax) (ns : Name) : Option Strin
 
 private def moveDeclaration (sourcePath declName targetPath : String) (apply : Bool)
     (omitBinders? : Option String := none) (targetNamespace? : Option String := none) : IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, _, sourceCommands, _) ← elaborateFile sourcePath
   let some ((start, stop), ns) ←
     okOr s!"{sourcePath}: " (declarationSite source sourceCommands declName) | return 1
@@ -1153,7 +1164,7 @@ private def dedupeEdits (edits : Array Edit) : Array Edit := Id.run do
     cost every rename pays, and `ScannedFile` is what makes one payment serve a whole batch. -/
 private def scanFile (path moduleName : String) : IO (Except UInt32 ScannedFile) := do
   claimElaboration path
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let source ← IO.FS.readFile path
   let (inputCtx, env, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
     | .ok result => pure result
@@ -1745,7 +1756,7 @@ private def moveDecls (pairs : Array (String × String)) (apply : Bool) : IO UIn
     | IO.eprintln s!"the declarations come from {sources.size} files {sources}; one run splits one source"
       return 2
   let some sourceModule ← okOr "" (moduleNameOfPath sourcePath) | return 2
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, fileMap, commands, env) ← elaborateFile sourcePath
   let some cuts ← okOr s!"{sourcePath}: " (cutsFor source commands (pairs.map (parseName ·.2))) | return 1
   -- A constant belongs to the destination of the cut whose name prefixes it, so projections,
@@ -2046,7 +2057,7 @@ private def modularize (path : String) (apply : Bool) : IO UInt32 := do
   unless apply do IO.println "preview only; pass --apply to write"; return 0
   let updated := applyEdits source selected
   IO.FS.writeFile path updated
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   unless ← fileElaboratesCleanly path updated do
     IO.FS.writeFile path source
     IO.eprintln s!"{path}: the modularised source does not elaborate; restored"
@@ -2453,7 +2464,7 @@ private partial def renameTokenAtoms (stx : Syntax) (oldToken newToken : String)
   return edits
 
 private def renameTokenFile (path oldToken newToken : String) (apply : Bool) : IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, fileMap, commands, _) ← elaborateFile path
   let mut edits := #[]
   for cmd in commands do
@@ -2530,7 +2541,7 @@ private partial def infixSites (stx : Syntax) (declName token source : String) :
 
 /-- Stage `path` with every application of `declName` written infix with `token`. -/
 private def infixStage (path declName token stagePath : String) : IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, fileMap, commands, _) ← elaborateFile path
   let mut edits := #[]
   for cmd in commands do
@@ -2678,7 +2689,7 @@ private def notateStage (path declName form stagePath : String) : IO UInt32 := d
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   let source ← IO.FS.readFile path
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (inputCtx, _, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
     | .ok result => pure result
     | .error e =>
@@ -2798,24 +2809,27 @@ private def patternRanges (infos : Array (Elab.ContextInfo × Elab.TermInfo)) : 
 /-- The type each explicit parameter of `c` takes where its result is expected at `ty?`: the
     parameters are opened as metavariables and the result unified with `ty?`, so `Except.ok`'s
     argument at `Except ε QValue` is a `QValue`, as the elaborator would have it. -/
-private def explicitArgTypes (c : Name) (ty? : Option Expr) : MetaM (Array Expr) := do
+private def explicitArgTypes (c : Name) (ty? : Option Expr) (all := false) : MetaM (Array Expr) := do
   let (xs, bis, r) ← Meta.forallMetaTelescopeReducing (← Meta.inferType (← Meta.mkConstWithFreshMVarLevels c))
   if let some ty := ty? then discard <| Meta.isDefEq r ty
   (xs.zip bis).filterMapM fun (x, bi) => do
-    if bi.isExplicit then return some (← instantiateMVars (← Meta.inferType x)) else return none
+    if all || bi.isExplicit then return some (← instantiateMVars (← Meta.inferType x)) else return none
 
 /-- Every application, identifier and `.c` written in pattern `p`, with the constant its head names
     (`none` where that cannot be told).  Read from the syntax, so it does not depend on the info tree
     it is a check on.  A `.c` resolves as the elaborator resolves it, in the namespace of the type
     expected there, `ty?`: a discriminant's, or a parameter's of the enclosing constructor or
-    `@[match_pattern]` application, or a field's of the enclosing `⟨…⟩`. -/
-private partial def patternHeads (ty? : Option Expr) (p : Syntax) :
+    `@[match_pattern]` application, or a field's of the enclosing `⟨…⟩`.  Where the syntax cannot
+    tell — no expected type is known here — `elaborated` answers the head the elaborator gave the
+    node at that position, if it recorded one.  `@c` lists every parameter, so its arguments are
+    typed by all of them. -/
+private partial def patternHeads (elaborated : Syntax → Option Name) (ty? : Option Expr) (p : Syntax) :
     MetaM (Array (Syntax × Option Name)) := do
   let k := p.getKind
   let tyHead? : MetaM (Option Name) := match ty? with
     | some ty => return (← Meta.whnfR ty).getAppFn.constName?
     | none => return none
-  let headOf (h : Syntax) : MetaM (Option Name) := do
+  let resolve (h : Syntax) : MetaM (Option Name) := do
     if h.isIdent then
       match (← resolveGlobalName h.getId).filter (·.2.isEmpty) with
       | [(n, _)] => return some n
@@ -2825,16 +2839,21 @@ private partial def patternHeads (ty? : Option Expr) (p : Syntax) :
       let n := t ++ h[1].getId
       return if (← getEnv).contains n then some n else none
     return none
+  let headOf (h : Syntax) : MetaM (Option Name) := do
+    let h := if h.isOfKind ``Lean.Parser.Term.explicit then h[1] else h
+    return (← resolve h) <|> elaborated h
   let inner (tys : Array Expr) (args : Array Syntax) acc :=
-    args.zipIdx.foldlM (init := acc) fun acc (a, i) => return acc ++ (← patternHeads tys[i]? a)
+    args.zipIdx.foldlM (init := acc) fun acc (a, i) => return acc ++ (← patternHeads elaborated tys[i]? a)
   if k == ``Lean.Parser.Term.paren || k == ``Lean.Parser.Term.typeAscription then
-    return ← patternHeads ty? p[1]
-  if k == ``Lean.Parser.Term.namedPattern then return ← patternHeads ty? p[p.getNumArgs - 1]
+    return ← patternHeads elaborated ty? p[1]
+  if k == ``Lean.Parser.Term.namedPattern then return ← patternHeads elaborated ty? p[p.getNumArgs - 1]
   if p.isIdent || k == ``Lean.Parser.Term.dotIdent then return #[(p, ← headOf p)]
   if k == ``Lean.Parser.Term.app then
     let c? ← headOf p[0]
-    let tys ← match c? with | some c => explicitArgTypes c ty? | none => pure #[]
-    return ← inner tys (p[1].getArgs.filter (!·.isOfKind ``Lean.Parser.Term.namedArgument)) #[(p, c?)]
+    let all := p[0].isOfKind ``Lean.Parser.Term.explicit
+    let tys ← match c? with | some c => explicitArgTypes c ty? all | none => pure #[]
+    return ← inner tys (p[1].getArgs.filter fun a => !a.isOfKind ``Lean.Parser.Term.namedArgument &&
+      !a.isOfKind ``Lean.Parser.Term.ellipsis) #[(p, c?)]
   if k == ``Lean.Parser.Term.anonymousCtor then
     let tys ← match ← tyHead? with
       | some t => match (← getEnv).find? t with
@@ -2844,13 +2863,14 @@ private partial def patternHeads (ty? : Option Expr) (p : Syntax) :
     return ← inner tys p[1].getSepArgs #[]
   return #[]
 
-/-- The explicit binders an application of `info` writes, name and domain: a constructor's are its
-    fields, past the inductive's parameters. -/
-private def explicitBinders (info : ConstantInfo) : Array (Name × Expr) := Id.run do
+/-- The explicit binders an application of `info` writes, name, domain and position among ALL the
+    binders, which is where `@c …` writes it: a constructor's are its fields, past the inductive's
+    parameters. -/
+private def explicitBinders (info : ConstantInfo) : Array (Name × Expr × Nat) := Id.run do
   let params := match info with | .ctorInfo c => c.numParams | _ => 0
   let mut (ty, k, acc) := (info.type, 0, #[])
   while ty.isForall do
-    if k ≥ params && ty.bindingInfo!.isExplicit then acc := acc.push (ty.bindingName!, ty.bindingDomain!)
+    if k ≥ params && ty.bindingInfo!.isExplicit then acc := acc.push (ty.bindingName!, ty.bindingDomain!, k)
     (ty, k) := (ty.bindingBody!, k + 1)
   return acc
 
@@ -2861,7 +2881,7 @@ private def explicitBinders (info : ConstantInfo) : Array (Name × Expr) := Id.r
 private def insertArgBinder (path declName : String) (n : Nat) : IO UInt32 := do
   claimElaboration path
   let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let decl := parseName declName
   let env ← match ← Elaborate.frontendOf path (← IO.FS.readFile path) (parseName moduleName)
       (stop? := some (·.contains decl)) with
@@ -2873,12 +2893,12 @@ private def insertArgBinder (path declName : String) (n : Nat) : IO UInt32 := do
   let some info := env.find? decl
     | IO.eprintln s!"{path}: does not declare `{declName}`, though the index places it here"; return 1
   let binders := explicitBinders info
-  let some (name, domain) := binders[n]?
+  let some (name, domain, full) := binders[n]?
     | IO.eprintln s!"{path}: `{declName}` has {binders.size} explicit parameter(s), so there is no \
         argument {n + 1}: add the new parameter to the declaration before running insert-arg"
       return 1
   IO.println (Json.mkObj [("name", toJson name), ("default", domain.isOptParam || domain.isAutoParam),
-    ("ctor", info.isCtor)]).compress
+    ("ctor", info.isCtor), ("full", full)]).compress
   return 0
 
 /-- How a use of a constructor is spelled, which decides its edit. -/
@@ -2900,12 +2920,12 @@ open Meta in
     left alone, unapplied uses included; a pattern still needs `_`, because there the default is a
     pattern too (`.f x _` with `(a := none)` matches only `none`), and one that stops short of `n`
     gets `(a := _)`, which leaves the defaults of the parameters it skips as they were. -/
-private def insertArgStage (path stagePath declName : String) (n : Nat) (term : String)
+private def insertArgStage (path stagePath declName : String) (n full : Nat) (term : String)
     (defaulted? : Option Name) : IO UInt32 := do
   claimElaboration path
   let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
   let source ← IO.FS.readFile path
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (inputCtx, _, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
     | .ok result => pure result
     | .error e =>
@@ -2951,27 +2971,54 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
         if s.isOfKind ``Lean.Parser.Term.app then
           if let some r := s.getRange? (canonicalOnly := true) then acc := acc.push (s, r)
     return acc
-  let headIs (ci : Elab.ContextInfo) (ti : Elab.TermInfo) : IO (Bool × Bool) := ci.runMetaM ti.lctx do
+  let headIs (ci : Elab.ContextInfo) (ti : Elab.TermInfo) : IO (Option Name × Bool) := ci.runMetaM ti.lctx do
     let head := (← instantiateMVars ti.expr).consumeMData.getAppFn.constName?
     let expected ← match ti.expectedType? with
       | some ty => pure (← whnfR (← instantiateMVars ty)).getAppFn.constName?
       | none => pure none
-    return (head == some decl, induct?.isSome && expected == induct?)
+    return (head, induct?.isSome && expected == induct?)
+  -- The info tree may hold a REWRITTEN copy of a pattern at its written head — `_` as `.(_)`, `#[k]`
+  -- as `List.toArray`, `..` as holes — whose arguments are not the text: the site is the written
+  -- application with that head, at that position.
+  let headId (h : Syntax) :=
+    if h.isOfKind ``Lean.Parser.Term.explicit || h.isOfKind ``Lean.Parser.Term.dotIdent then h[1].getId else h.getId
+  let writtenApp? (stx : Syntax) := writtenApps.find? fun (w, _) =>
+    w[0].getPos? == stx[0].getPos? && w[0].getKind == stx[0].getKind && headId w[0] == headId stx[0]
+  -- `cases … with | c x y` names a constructor and binds its fields; there is no argument list.
+  let altNames : Array Syntax.Range := Id.run do
+    let mut acc := #[]
+    for c in frontend.commands do
+      for s in c.topDown do
+        if s.isOfKind ``Lean.Parser.Tactic.inductionAltLHS then
+          for i in s[1].topDown do
+            if i.isIdent then if let some r := i.getRange? (canonicalOnly := true) then acc := acc.push r
+    return acc
   let mut uses : Array (CtorUse × Syntax × Syntax.Range) := #[]
   let mut fnRanges : Array Syntax.Range := #[]
   let mut refusals : Array String := #[]
   let mut foreignAnon : Array Syntax.Range := #[]
   let mut bare : Array Syntax.Range := #[]
+  -- The constant the elaborator gave each name it read, by position: what types a `.c` the syntax
+  -- alone cannot, because the type expected there is known only to the elaborator.
+  let mut elaborated : Array (String.Pos.Raw × Name) := #[]
   let lineOf (pos : String.Pos.Raw) := (fileMap.toPosition pos).line
   for (ci, ti) in infos do
     -- The name a declaration binds is no use of it.
     if ti.isBinder then continue
     let stx := ti.stx
-    let (isHead, expectsInduct) ← headIs ci ti
+    let (head?, expectsInduct) ← headIs ci ti
+    let isHead := head? == some decl
     let canonical? := stx.getRange? (canonicalOnly := true)
+    if stx.isIdent || stx.isOfKind ``Lean.Parser.Term.dotIdent then
+      if let (some h, some p) := (head?, canonical?) then elaborated := elaborated.push (p.start, h)
     if stx.isOfKind ``Lean.Parser.Term.anonymousCtor && !isHead && !expectsInduct then
       if let some r := canonical? then foreignAnon := foreignAnon.push r
     unless isHead || (expectsInduct && stx.isOfKind ``Lean.Parser.Term.anonymousCtor) do continue
+    if stx.isOfKind ``Lean.Parser.Term.app then
+      if let some (w, wr) := writtenApp? stx then
+        uses := uses.push (.app, w, wr)
+        if let some f := w[0].getRange? then fnRanges := fnRanges.push f
+        continue
     let some r := canonical? | do
       -- Generated text is no site, except where it stands for a `⟨…⟩` the author wrote: a pattern's
       -- `⟨…⟩` reaches the elaborator rewritten as a synthetic `C.mk …` positioned at its bracket, and
@@ -3004,18 +3051,25 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
     match counts.findIdx? (·.1 == key) with
     | some i => counts.modify i fun (k, c) => (k, c + 1)
     | none => counts.push (key, 1)
+  -- A head is the name, or `@` and the name, so the name's range ends where the head's does.
+  let mut unapplied : Array Syntax.Range := #[]
   for r in bare do
-    unless fnRanges.contains r || anonRanges.contains r do
-      if let some (app, appRange) := writtenApps.find? (·.1[0].getRange? == some r) then
-        unless uses.any (·.2.2 == appRange) do uses := uses.push (.app, app, appRange)
-      else if defaulted?.isSome && !inPattern r then counts := bump counts "unapplied-term-default"
-      else refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used unapplied; \
-        there is no argument list to insert into"
+    let heads (f : Syntax.Range) := f.start ≤ r.start && r.stop == f.stop
+    if fnRanges.any heads || anonRanges.contains r then continue
+    if altNames.contains r then counts := bump counts "cases-alternative"; continue
+    if let some (app, appRange) := writtenApps.find? (·.1[0].getRange?.any heads) then
+      unless uses.any (·.2.2 == appRange) do uses := uses.push (.app, app, appRange)
+    else if defaulted?.isSome && !inPattern r then counts := bump counts "unapplied-term-default"
+    else if inPattern r then refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used \
+      unapplied in a pattern; there is no argument list to insert into"
+    else unapplied := unapplied.push r
   -- The check on the info tree, from the syntax: every pattern is resolved by itself, typed from its
   -- match's discriminants down, and each that is the declaration must already be a site.  A node
   -- whose head could spell it (its last component is the declaration's) and does not resolve is
   -- refused, never taken for a term.
   let lastOf (n : Name) := n.componentsRev.head?
+  let elaboratedAt (h : Syntax) : Option Name :=
+    h.getPos? (canonicalOnly := true) >>= fun p => (elaborated.find? (·.1 == p)).map (·.2)
   let mut patternSites : Array Syntax.Range := #[]
   for (ci, ti) in infos do
     unless ti.stx.isOfKind ``Lean.Parser.Term.match do continue
@@ -3028,13 +3082,14 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
         unless alts.isOfKind ``Lean.Parser.Term.matchAlts do continue
         for alt in alts[0].getArgs do
           for pats in alt[1].getSepArgs do
-            for (pat, j) in pats.getSepArgs.zipIdx do acc := acc ++ (← patternHeads tys[j]? pat)
+            for (pat, j) in pats.getSepArgs.zipIdx do
+              acc := acc ++ (← patternHeads elaboratedAt tys[j]? pat)
       return acc
     for (stx, c?) in heads do
       let some r := stx.getRange? (canonicalOnly := true) | continue
       let app := stx.isOfKind ``Lean.Parser.Term.app
       let spelled := if app then stx[0] else stx
-      let id := if spelled.isOfKind ``Lean.Parser.Term.dotIdent then spelled[1].getId else spelled.getId
+      let id := headId spelled
       if c? == some decl then
         if app then
           patternSites := patternSites.push r
@@ -3056,6 +3111,26 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
     | .error _ => false
   if let .error message := parsed then IO.eprintln s!"`{term}` does not parse as a term: {message}"; return 2
   let mut edits : Array Edit := #[]
+  let spelledTerm := if atomic then term else s!"({term})"
+  -- A term that stops short of the new position is eta-expanded up to it: `f a` becomes
+  -- `(fun x2 => f a x2 t)`, which is `f a` with `t` given.  The binders avoid every name the term reads.
+  let etaBinders (stx : Syntax) (k : Nat) : String := Id.run do
+    let mut taken : Array Name := #[]
+    for s in stx.topDown do if s.isIdent then taken := taken.push s.getId
+    let mut xs : Array String := #[]
+    let mut i := 1
+    while xs.size < k do
+      unless taken.contains (Name.mkSimple s!"x{i}") do xs := xs.push s!"x{i}"
+      i := i + 1
+    return " ".intercalate xs.toList
+  for r in unapplied do
+    let xs := etaBinders .missing n
+    edits := edits.push { start := r.start, stop := r.stop, line := lineOf r.start,
+      replacement := if n == 0 then s!"({declName} {spelledTerm})" else s!"(fun {xs} => {declName} {xs} {spelledTerm})" }
+    counts := bump counts "unapplied-term-eta"
+  let explicitNames := (explicitBinders info).map (·.1)
+  -- An `@c …` or `c ..` pattern that already covers the new position needs no edit.
+  let mut covered : Array Syntax.Range := #[]
   for (kind, stx, r) in uses do
     let line := lineOf r.start
     let pattern := inPattern r || patternSites.contains r
@@ -3068,38 +3143,63 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
         counts := bump counts (if kind == .update then "with-update" else "instance")
     | .anon | .app =>
         let anon := kind == .anon
-        let args := if anon then stx[1].getSepArgs else stx[1].getArgs
-        if !anon && (args.any fun a => a.isOfKind ``Lean.Parser.Term.namedArgument ||
-            a.isOfKind ``Lean.Parser.Term.ellipsis) || !anon && !(stx[0].isIdent ||
-            stx[0].isOfKind ``Lean.Parser.Term.dotIdent) then
-          refusals := refusals.push s!"{path}:{line}: application of `{declName}` with named \
-            arguments, `..`, or a head that is not its name; edit it by hand"
+        let head := stx[0]
+        let explicitHead := !anon && head.isOfKind ``Lean.Parser.Term.explicit
+        let written := if anon then stx[1].getSepArgs else stx[1].getArgs
+        let ellipsis := !anon && written.any (·.isOfKind ``Lean.Parser.Term.ellipsis)
+        let args := written.filter fun a => !a.isOfKind ``Lean.Parser.Term.namedArgument &&
+          !a.isOfKind ``Lean.Parser.Term.ellipsis
+        -- `(x := …)` naming a parameter the positions skip leaves the positions as they are.
+        let namedExplicit := written.any fun a => a.isOfKind ``Lean.Parser.Term.namedArgument &&
+          (explicitHead || explicitNames.contains a[1].getId)
+        if !anon && (namedExplicit || !(head.isIdent || head.isOfKind ``Lean.Parser.Term.dotIdent ||
+            explicitHead && head[1].isIdent)) then
+          refusals := refusals.push s!"{path}:{line}: application of `{declName}` naming an explicit \
+            argument, or with a head that is not its name; edit it by hand"
           continue
+        -- `@c` writes every parameter, so the new one goes at its position among all of them.
+        let idx := if explicitHead then full else n
         let ranges := args.filterMap (·.getRange?)
         if anon && args.size > explicit && n + 1 ≥ explicit then
           refusals := refusals.push s!"{path}:{line}: `⟨…⟩` flattens {args.size - explicit + 1} \
             components into the last field; nest them as `⟨…⟩` by hand first"
           continue
-        if !anon && !pattern && defaulted?.isSome && ranges.size ≤ n then
+        if ellipsis && ranges.size < idx then
+          if pattern then
+            covered := covered.push r
+            counts := bump counts "ellipsis-pattern"
+          else refusals := refusals.push s!"{path}:{line}: `..` stands for argument {idx + 1} of \
+            `{declName}`, which it cannot elaborate; write the arguments before it out by hand"
+          continue
+        if !anon && !pattern && defaulted?.isSome && ranges.size ≤ idx then
           counts := bump counts "app-term-default"
           continue
         let spelled := if anon || atomic || pattern then text else s!"({text})"
         let named? := match defaulted? with
-          | some name => if !anon && pattern && n > ranges.size && ranges.size > 0 &&
+          | some name => if !anon && !explicitHead && pattern && idx > ranges.size && ranges.size > 0 &&
               !name.hasMacroScopes then some s!" ({name} := _)" else none
           | none => none
+        let afterHead := head.getRange?.map (·.stop)
         let edit? : Option Edit := if let some named := named? then
             some { start := ranges.back!.stop, stop := ranges.back!.stop, line, replacement := named }
-          else if h : n < ranges.size then
-            some { start := ranges[n].start, stop := ranges[n].start, line,
+          else if h : idx < ranges.size then
+            some { start := ranges[idx].start, stop := ranges[idx].start, line,
                    replacement := spelled ++ (if anon then ", " else " ") }
-          else if n == ranges.size && ranges.size > 0 then
-            some { start := ranges.back!.stop, stop := ranges.back!.stop, line,
-                   replacement := (if anon then ", " else " ") ++ spelled }
+          else if idx == ranges.size && (ranges.size > 0 || !anon) then
+            let p := if ranges.size > 0 then ranges.back!.stop else afterHead.getD r.stop
+            some { start := p, stop := p, line, replacement := (if anon then ", " else " ") ++ spelled }
           else none
         let some edit := edit? | do
-          refusals := refusals.push s!"{path}:{line}: `{declName}` applied to {ranges.size} \
-            argument(s); inserting before argument {n + 1} needs the {n} before it"
+          if anon || pattern then
+            refusals := refusals.push s!"{path}:{line}: `{declName}` applied to {ranges.size} \
+              argument(s); inserting before argument {idx + 1} needs the {idx} before it"
+            continue
+          let xs := etaBinders stx (idx - ranges.size)
+          let (stop, name) := if head.isOfKind ``Lean.Parser.Term.dotIdent then
+            (afterHead.getD r.start, s!"{declName}") else (r.start, "")
+          edits := edits.push { start := r.start, stop, line, replacement := s!"(fun {xs} => {name}" }
+          edits := edits.push { start := r.stop, stop := r.stop, line, replacement := s!" {xs} {spelledTerm})" }
+          counts := bump counts "app-term-eta"
           continue
         edits := edits.push edit
         counts := bump counts s!"{if anon then "anon" else "app"}-{if pattern then "pattern" else "term"}\
@@ -3115,8 +3215,10 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
   -- it, ends up spelling the new position — an edit lands in it, or it already names more than `n`.
   let unspelled := patternSites.filter fun r =>
     let stx? := uses.find? (·.2.2 == r) |>.map (·.2.1)
-    let given := stx?.map (·[1].getArgs.filter (!·.isOfKind ``Lean.Parser.Term.namedArgument) |>.size)
-    !(kept.any fun e => r.start ≤ e.start && e.start ≤ r.stop) && !(given.any (· > n))
+    let given := stx?.map fun s => (s[1].getArgs.filter fun a => !a.isOfKind ``Lean.Parser.Term.namedArgument &&
+      !a.isOfKind ``Lean.Parser.Term.ellipsis).size
+    let idx := if stx?.any (·[0].isOfKind ``Lean.Parser.Term.explicit) then full else n
+    !covered.contains r && !(kept.any fun e => r.start ≤ e.start && e.start ≤ r.stop) && !(given.any (· > idx))
   unless unspelled.isEmpty do
     for r in unspelled do
       IO.eprintln s!"refusing: {path}:{lineOf r.start}: a pattern of `{declName}` would not spell \
@@ -3204,7 +3306,7 @@ private def refactorSuggestedWarnings (selector : WarningSelector) (apply : Bool
   claimElaboration selector.path
   let some moduleName ← okOr "" (moduleNameOfPath selector.path) | return 2
   let source ← IO.FS.readFile selector.path
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (inputCtx, env, frontend) ←
     match ← Elaborate.frontendOf selector.path source (parseName moduleName) with
     | .ok result => pure result
@@ -3581,7 +3683,7 @@ private def objectClassOf (env : Environment) (class? : Option String) : Except 
     variable occurs — signature, statement and proof alike. -/
 private def renameBinder (path declName old new : String) (class? : Option String) (apply : Bool) :
     IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   let source ← IO.FS.readFile path
@@ -3631,7 +3733,7 @@ private def errorsIntroduced (importEnv : Environment) (path source : String)
 /-- The staging child of `rename-objects`: one file, whose renamed text goes to `stagePath`. -/
 private def renameObjectsStage (path stagePath : String) (class? letters? : Option String) :
     IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   let source ← IO.FS.readFile path
@@ -3759,7 +3861,7 @@ private def foldAbbrevEdits (d : Name) (inst? : Option String) (source : String)
 
 /-- The staging child of `fold-abbrev`: one file, with `d` written in at every match. -/
 private def foldAbbrevStage (path stagePath declName : String) (inst? : Option String) : IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   let source ← IO.FS.readFile path
@@ -3792,7 +3894,7 @@ private def foldAbbrevStage (path stagePath declName : String) (inst? : Option S
     unrelated `old` inside a longer identifier, are different things and are left alone. -/
 private def renameVarStage (path stagePath old new : String) (class? : Option String) :
     IO UInt32 := do
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   let source ← IO.FS.readFile path
@@ -3909,7 +4011,7 @@ private def inspectOneFile (declModule declName path : String) : IO UInt32 := do
   let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
   claimElaboration path
   let source ← IO.FS.readFile path
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (inputCtx, _, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
     | .ok result => pure result
     | .error e =>
@@ -3972,7 +4074,14 @@ def main (args : List String) : IO UInt32 := do
   let args := args.filter fun a =>
     !["--apply", "--uses-only", "--no-index", "--body", "--syntax", "--keep",
       "--same-statement", "--same-proof"].contains a
+  -- Once here, not once per file in every child: without it each import fails on its own.
+  if (← IO.getEnv "LEAN_PATH").isNone then
+    unless ← ((← IO.currentDir) / ".lake" / "build" / "lib" / "lean").isDir do
+      IO.eprintln s!"LEAN_PATH is unset and {← IO.currentDir}/.lake/build/lib/lean does not exist: run \
+        `lake build` in the repository being edited, then run lean-refactor from its root"
+      return 2
   let (args, defaulted?) := stripFlag "--defaulted" args
+  let (args, full?) := stripFlag "--full" args
   let (args, selector?) := stripFlag "--in" args
   let (args, token?) := stripFlag "--token" args
   let (args, into?) := stripFlag "--into" args
@@ -4080,7 +4189,8 @@ def main (args : List String) : IO UInt32 := do
   | ["insert-arg-binder", path, declName, index] =>
       return ← insertArgBinder path declName (index.toNat?.getD 1 - 1)
   | ["insert-arg-stage", path, stagePath, declName, index, term] =>
-      return ← insertArgStage path stagePath declName (index.toNat?.getD 1 - 1) term
+      let n := index.toNat?.getD 1 - 1
+      return ← insertArgStage path stagePath declName n ((full? >>= (·.toNat?)).getD n) term
         (defaulted?.map parseName)
   | ["insert-arg", declName, index, term] =>
       let some n := index.toNat? | IO.eprintln "argument index must be a positive integer"; return 2
@@ -4101,7 +4211,9 @@ def main (args : List String) : IO UInt32 := do
         {if hasDefault then "with a default: terms that omit it are left alone" else "with no default"}"
       let .ok ctor := json.getObjValAs? Bool "ctor"
         | IO.eprintln s!"insert-arg-binder: no `ctor` in {binder.stdout}"; return 1
-      let extra := if hasDefault then #["--defaulted", name.toString] else #[]
+      let .ok full := json.getObjValAs? Nat "full"
+        | IO.eprintln s!"insert-arg-binder: no `full` in {binder.stdout}"; return 1
+      let extra := #["--full", toString full] ++ if hasDefault then #["--defaulted", name.toString] else #[]
       -- Every use must take the argument or the build fails, so the default is the whole repository.
       -- A file that never spells the name holds no use, except a constructor's `⟨…⟩`.
       return ← stagedGlob (selector?.getD wholeRepository) s!"inserted `{term}` before argument {n} of `{declName}`"
@@ -4194,7 +4306,7 @@ def main (args : List String) : IO UInt32 := do
     | none => pure moduleName
   claimElaboration sourcePath
   let source ← IO.FS.readFile sourcePath
-  initSearchPath (← findSysroot)
+  initSearchPath (← findSysroot) (← targetSearchPath)
   let (inputCtx, env, frontend) ←
     match ← Elaborate.frontendOf sourcePath source (parseName moduleName) with
     | .ok result => pure result
