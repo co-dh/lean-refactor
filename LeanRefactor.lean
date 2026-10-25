@@ -2920,11 +2920,13 @@ open Meta in
     left alone, unapplied uses included; a pattern still needs `_`, because there the default is a
     pattern too (`.f x _` with `(a := none)` matches only `none`), and one that stops short of `n`
     gets `(a := _)`, which leaves the defaults of the parameters it skips as they were. -/
-private def insertArgStage (path stagePath declName : String) (n full : Nat) (term : String)
-    (defaulted? : Option Name) : IO UInt32 := do
+private partial def insertArgStage (path stagePath declName : String) (n full : Nat) (term : String)
+    (defaulted? : Option Name) (done? : Option (Array (Nat × Nat))) : IO UInt32 := do
   claimElaboration path
   let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
-  let source ← IO.FS.readFile path
+  -- A later pass over the declaring file reads the staged text; `done` is what earlier passes wrote.
+  let done := done?.getD #[]
+  let source ← IO.FS.readFile (if done?.isSome then stagePath else path)
   initSearchPath (← findSysroot) (← targetSearchPath)
   let (inputCtx, _, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
     | .ok result => pure result
@@ -3002,9 +3004,13 @@ private def insertArgStage (path stagePath declName : String) (n full : Nat) (te
   -- alone cannot, because the type expected there is known only to the elaborator.
   let mut elaborated : Array (String.Pos.Raw × Name) := #[]
   let lineOf (pos : String.Pos.Raw) := (fileMap.toPosition pos).line
+  -- Where the elaborator BOUND a name — a pattern variable spelled like the constructor — it is none.
+  let mut boundAt : Array String.Pos.Raw := #[]
   for (ci, ti) in infos do
     -- The name a declaration binds is no use of it.
-    if ti.isBinder then continue
+    if ti.isBinder then
+      if let some p := ti.stx.getPos? (canonicalOnly := true) then boundAt := boundAt.push p
+      continue
     let stx := ti.stx
     let (head?, expectsInduct) ← headIs ci ti
     let isHead := head? == some decl
@@ -3099,7 +3105,8 @@ private def insertArgStage (path stagePath declName : String) (n full : Nat) (te
         else unless anonRanges.contains r || fnRanges.contains r do
           refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used unapplied in \
             a pattern; there is no argument list to insert into"
-      else if c?.isNone && lastOf id == lastOf decl then
+      else if c?.isNone && lastOf id == lastOf decl &&
+          !(spelled.getPos? (canonicalOnly := true)).any boundAt.contains then
         refusals := refusals.push s!"{path}:{lineOf r.start}: pattern `{spelled}` may be \
           `{declName}` and its type is not known here; edit it by hand"
   uses := uses.foldl (init := #[]) fun acc u => if acc.any (·.2.2 == u.2.2) then acc else acc.push u
@@ -3123,15 +3130,20 @@ private def insertArgStage (path stagePath declName : String) (n full : Nat) (te
       unless taken.contains (Name.mkSimple s!"x{i}") do xs := xs.push s!"x{i}"
       i := i + 1
     return " ".intercalate xs.toList
+  let handled (r : Syntax.Range) := done.any fun (a, b) =>
+    (r.start.byteIdx ≤ a && b ≤ r.stop.byteIdx) || (a ≤ r.start.byteIdx && r.stop.byteIdx ≤ b)
   for r in unapplied do
+    if handled r then continue
     let xs := etaBinders .missing n
-    edits := edits.push { start := r.start, stop := r.stop, line := lineOf r.start,
-      replacement := if n == 0 then s!"({declName} {spelledTerm})" else s!"(fun {xs} => {declName} {xs} {spelledTerm})" }
+    let replacement := if n == 0 then s!"({declName} {spelledTerm})"
+      else s!"(fun {xs} => {declName} {xs} {spelledTerm})"
+    edits := edits.push { start := r.start, stop := r.stop, line := lineOf r.start, replacement }
     counts := bump counts "unapplied-term-eta"
   let explicitNames := (explicitBinders info).map (·.1)
   -- An `@c …` or `c ..` pattern that already covers the new position needs no edit.
   let mut covered : Array Syntax.Range := #[]
   for (kind, stx, r) in uses do
+    if handled r then continue
     let line := lineOf r.start
     let pattern := inPattern r || patternSites.contains r
     let text := if pattern then "_" else term
@@ -3228,9 +3240,21 @@ private def insertArgStage (path stagePath declName : String) (n full : Nat) (te
     IO.println s!"{path}:{edit.line}: insert {repr edit.replacement}"
   if !counts.isEmpty then
     IO.println s!"{path}: {String.intercalate ", " (counts.toList.map fun (k, c) => s!"{k} {c}")}"
-  if kept.isEmpty then return 3
+  if kept.isEmpty then return if done?.isSome then 0 else 3
   IO.FS.writeFile stagePath (applyEdits source kept)
-  return 0
+  -- In the declaring file a pattern written for the old arity fails, and the elaborator never reaches
+  -- its right-hand side: elaborate the edited text again until a pass finds no new site.
+  if (env.getModuleIdxFor? decl).isSome then return 0
+  let shift (p : Nat) : Nat := (kept.foldl (init := (p : Int)) fun q e => if e.start.byteIdx < p then
+    q + (e.replacement.utf8ByteSize : Int) + (e.start.byteIdx : Int) - (e.stop.byteIdx : Int) else q).toNat
+  let spans := done.map (fun (a, b) => (shift a, shift b)) ++
+    kept.map fun e => let s := shift e.start.byteIdx; (s, s + e.replacement.utf8ByteSize)
+  let out ← spawnSelf (#["insert-arg-stage", path, stagePath, declName, toString (n + 1), term,
+    "--full", toString full, "--done", ",".intercalate (spans.toList.map fun (a, b) => s!"{a}-{b}")] ++
+    (defaulted?.map (#["--defaulted", toString ·])).getD #[])
+  IO.print out.stdout
+  IO.eprint out.stderr
+  return out.exitCode
 
 private def notateGlob (pattern declName form : String) (apply : Bool) : IO UInt32 := do
   if let .error message := parseForm form then IO.eprintln s!"form `{form}`: {message}"; return 2
@@ -4082,6 +4106,7 @@ def main (args : List String) : IO UInt32 := do
       return 2
   let (args, defaulted?) := stripFlag "--defaulted" args
   let (args, full?) := stripFlag "--full" args
+  let (args, done?) := stripFlag "--done" args
   let (args, selector?) := stripFlag "--in" args
   let (args, token?) := stripFlag "--token" args
   let (args, into?) := stripFlag "--into" args
@@ -4190,8 +4215,10 @@ def main (args : List String) : IO UInt32 := do
       return ← insertArgBinder path declName (index.toNat?.getD 1 - 1)
   | ["insert-arg-stage", path, stagePath, declName, index, term] =>
       let n := index.toNat?.getD 1 - 1
+      let done? := done?.map fun s => ((s.splitOn ",").filter (· ≠ "")).toArray.filterMap fun ab =>
+        match ab.splitOn "-" with | [a, b] => (·, ·) <$> a.toNat? <*> b.toNat? | _ => none
       return ← insertArgStage path stagePath declName n ((full? >>= (·.toNat?)).getD n) term
-        (defaulted?.map parseName)
+        (defaulted?.map parseName) done?
   | ["insert-arg", declName, index, term] =>
       let some n := index.toNat? | IO.eprintln "argument index must be a positive integer"; return 2
       if n == 0 then IO.eprintln "argument index is 1-based"; return 2
