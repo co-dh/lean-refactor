@@ -2795,6 +2795,51 @@ private def patternRanges (infos : Array (Elab.ContextInfo × Elab.TermInfo)) : 
             if let some r := pat.getRange? (canonicalOnly := true) then ranges := ranges.push r
   return ranges
 
+/-- The head constant of the type each explicit parameter of `c` takes, `none` where it has none. -/
+private def explicitArgHeads (c : Name) : MetaM (Array (Option Name)) := do
+  Meta.forallTelescopeReducing (← getConstInfo c).type fun xs _ => do
+    let xs ← xs.filterM fun x => return (← x.fvarId!.getBinderInfo).isExplicit
+    xs.mapM fun x => return (← Meta.whnfR (← Meta.inferType x)).getAppFn.constName?
+
+/-- Every application, identifier and `.c` written in pattern `p`, with the constant its head names
+    (`none` where that cannot be told).  Read from the syntax, because the info tree keeps a pattern's
+    elaboration only where its reference survives the unfolding of a `@[match_pattern]` definition:
+    `.marked _ (.general _ _)` leaves no info at all.  A `.c` resolves as the elaborator resolves it,
+    in the namespace of the type expected there, `ty?`: a discriminant's, or a parameter's of the
+    enclosing constructor or `@[match_pattern]` application, or a field's of the enclosing `⟨…⟩`. -/
+private partial def patternHeads (ty? : Option Name) (p : Syntax) :
+    MetaM (Array (Syntax × Option Name)) := do
+  let k := p.getKind
+  let headOf (h : Syntax) : MetaM (Option Name) := do
+    if h.isIdent then
+      match (← resolveGlobalName h.getId).filter (·.2.isEmpty) with
+      | [(n, _)] => return some n
+      | _ => return none
+    if h.isOfKind ``Lean.Parser.Term.dotIdent then
+      let some t := ty? | return none
+      let n := t ++ h[1].getId
+      return if (← getEnv).contains n then some n else none
+    return none
+  if k == ``Lean.Parser.Term.paren || k == ``Lean.Parser.Term.typeAscription then
+    return ← patternHeads ty? p[1]
+  if k == ``Lean.Parser.Term.namedPattern then return ← patternHeads ty? p[p.getNumArgs - 1]
+  if p.isIdent || k == ``Lean.Parser.Term.dotIdent then return #[(p, ← headOf p)]
+  if k == ``Lean.Parser.Term.app then
+    let c? ← headOf p[0]
+    let tys ← match c? with | some c => explicitArgHeads c | none => pure #[]
+    let args := p[1].getArgs.filter (!·.isOfKind ``Lean.Parser.Term.namedArgument)
+    return ← args.zipIdx.foldlM (init := #[(p, c?)]) fun acc (a, i) =>
+      return acc ++ (← patternHeads tys[i]?.join a)
+  if k == ``Lean.Parser.Term.anonymousCtor then
+    let tys ← match ty? with
+      | some t => match (← getEnv).find? t with
+        | some (.inductInfo { ctors := [c], .. }) => explicitArgHeads c
+        | _ => pure #[]
+      | none => pure #[]
+    return ← p[1].getSepArgs.zipIdx.foldlM (init := #[]) fun acc (a, i) =>
+      return acc ++ (← patternHeads tys[i]?.join a)
+  return #[]
+
 /-- The explicit binders an application of `info` writes, name and domain: a constructor's are its
     fields, past the inductive's parameters. -/
 private def explicitBinders (info : ConstantInfo) : Array (Name × Expr) := Id.run do
@@ -2950,6 +2995,41 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
       else if defaulted?.isSome && !inPattern r then counts := bump counts "unapplied-term-default"
       else refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used unapplied; \
         there is no argument list to insert into"
+  -- Every pattern is read from its syntax, typed from its match's discriminants down: the info tree
+  -- misses patterns nested under a `@[match_pattern]` unfolding.  Each node whose head could spell
+  -- the declaration (its last component is the declaration's) must resolve, to it or to another
+  -- constant; one that does not is refused, never taken for a term.
+  let lastOf (n : Name) := n.componentsRev.head?
+  let mut patternSites : Array Syntax.Range := #[]
+  for (ci, ti) in infos do
+    unless ti.stx.isOfKind ``Lean.Parser.Term.match do continue
+    let heads ← ci.runMetaM ti.lctx do
+      let discrs := match ← Meta.matchMatcherApp? (← instantiateMVars ti.expr).consumeMData with
+        | some m => m.discrs | none => #[]
+      let tys ← discrs.mapM fun d => return (← Meta.whnfR (← Meta.inferType d)).getAppFn.constName?
+      let mut acc := #[]
+      for alts in ti.stx.getArgs do
+        unless alts.isOfKind ``Lean.Parser.Term.matchAlts do continue
+        for alt in alts[0].getArgs do
+          for pats in alt[1].getSepArgs do
+            for (pat, j) in pats.getSepArgs.zipIdx do acc := acc ++ (← patternHeads tys[j]?.join pat)
+      return acc
+    for (stx, c?) in heads do
+      let some r := stx.getRange? (canonicalOnly := true) | continue
+      let app := stx.isOfKind ``Lean.Parser.Term.app
+      let spelled := if app then stx[0] else stx
+      let id := if spelled.isOfKind ``Lean.Parser.Term.dotIdent then spelled[1].getId else spelled.getId
+      if c? == some decl then
+        if app then
+          patternSites := patternSites.push r
+          unless uses.any (·.2.2 == r) do uses := uses.push (.app, stx, r)
+        else unless anonRanges.contains r || fnRanges.contains r do
+          refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used unapplied in \
+            a pattern; there is no argument list to insert into"
+      else if c?.isNone && lastOf id == lastOf decl then
+        refusals := refusals.push s!"{path}:{lineOf r.start}: pattern `{spelled}` may be \
+          `{declName}` and its type is not known here; edit it by hand"
+  uses := uses.foldl (init := #[]) fun acc u => if acc.any (·.2.2 == u.2.2) then acc else acc.push u
   let parsed := Parser.runParserCategory env `term term
   let atomic := match parsed with
     | .ok t => t.isIdent || t.isAtom || [``Lean.Parser.Term.paren, ``Lean.Parser.Term.anonymousCtor,
@@ -2960,7 +3040,7 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
   let mut edits : Array Edit := #[]
   for (kind, stx, r) in uses do
     let line := lineOf r.start
-    let pattern := inPattern r
+    let pattern := inPattern r || patternSites.contains r
     let text := if pattern then "_" else term
     match kind with
     | .inst | .update =>
@@ -3012,6 +3092,17 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
   let (kept, overlapping) := independentEdits edits
   if overlapping > 0 then
     IO.eprintln s!"refusing: {path}: {overlapping} edit(s) overlap another; edit those by hand first"
+    return 1
+  -- The check this command exists to pass: every pattern of the declaration, as the syntax resolves
+  -- it, ends up spelling the new position — an edit lands in it, or it already names more than `n`.
+  let unspelled := patternSites.filter fun r =>
+    let stx? := uses.find? (·.2.2 == r) |>.map (·.2.1)
+    let given := stx?.map (·[1].getArgs.filter (!·.isOfKind ``Lean.Parser.Term.namedArgument) |>.size)
+    !(kept.any fun e => r.start ≤ e.start && e.start ≤ r.stop) && !(given.any (· > n))
+  unless unspelled.isEmpty do
+    for r in unspelled do
+      IO.eprintln s!"refusing: {path}:{lineOf r.start}: a pattern of `{declName}` would not spell \
+        argument {n + 1}, so it would match only the default"
     return 1
   for edit in kept.qsort (·.start.byteIdx < ·.start.byteIdx) do
     IO.println s!"{path}:{edit.line}: insert {repr edit.replacement}"

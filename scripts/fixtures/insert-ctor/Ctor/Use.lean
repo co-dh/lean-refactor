@@ -39,6 +39,56 @@ def genShort : V → Nat
   | .gen k => k
   | _ => 0
 
+-- Every place a pattern can stand, each spelling `.gen` with both explicit arguments.
+def genNested : V → Nat
+  | .wrap _ (.gen k n) => k + n
+  | _ => 0
+
+def genAs : V → Nat
+  | .wrap _ (v@(.gen _ _)) => genBoth v
+  | _ => 0
+
+def genAlts : Nat → V → Nat
+  | _, .atom k | _, .wrap _ (.gen k _) => k
+  | _, _ => 0
+
+def genDoBind (v : V) : Id Nat := do
+  match v, ← pure 1 with
+  | .gen k n, _ => return k + n
+  | _, m => return m
+
+def genInnerMatch : Nat → V → Nat
+  | 0, _ => 0
+  | f + 1, v =>
+    let t := f
+    match v with
+    | .gen k n => k + n + t
+    | .wrap _ w => match w with
+      | .gen k _ => k
+      | _ => 1
+    | _ => 0
+
+def genFunAlts : V → Nat := fun
+  | .gen k n => k + n
+  | _ => 0
+
+def genMatchH (v : V) : Nat :=
+  match h : v with
+  | .gen k n => k + n
+  | _ => 0
+
+def genIfLet (v : V) : Nat := if let .gen k _ := v then k else 0
+
+def genDoMatch (v : V) : Id Nat := do
+  let x := 1
+  match v with
+  | .gen k n => return k + n + x
+  | .wrap _ (.gen k _) => do
+    match v with
+    | .wrap _ (.gen j _) => return j + k
+    | _ => return 0
+  | _ => return 0
+
 def genTerm1 : V := .gen 1
 def genTerm2 : V := V.gen 1 2
 def genMap : List V := [1, 2].map V.gen
