@@ -41,7 +41,7 @@ usage: lean-refactor command [args] [--in g] [--apply]
           'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'
           Default: the file the index says declares d; every file the index recorded a use of
           d in for inspect; the whole repository for the sweeps (rename, infix, unused,
-          unused-simp, modularize).
+          unused-simp, modularize, insert-arg).
 
   d  declaration, full name      r  replacement      n  index, counting from 1
   tok  a notation token: the symbol a `notation`/`infixl` command introduces, as the source
@@ -87,7 +87,8 @@ arguments
   remove-arg d n                          remove argument n at every call of d
     --syntax                              read calls off this file's elaboration, not the built .ilean
     --token tok                           also match calls written as the notation tok
-  insert-arg d n term                     insert term before argument n
+  insert-arg d n term                     insert term before argument n of every application of d, ⟨…⟩ included;
+                                            a pattern gets _
   remove-param d binder n                 remove a parameter Lean reports unused
 
 cleanup

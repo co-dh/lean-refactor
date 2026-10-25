@@ -2233,7 +2233,9 @@ private def stagedGlob (pattern description : String)
     unless output.stdout.isEmpty do IO.print output.stdout
     unless output.stderr.isEmpty do IO.eprint output.stderr
     if output.exitCode == 0 then staged := staged.push path
-    else if output.exitCode != 3 then failed := true
+    else if output.exitCode != 3 then
+      IO.eprintln s!"{path}: staging child exited {output.exitCode}"
+      failed := true
   let stagedFiles := staged
   if failed then
     dropStagedFiles stagedFiles
@@ -3656,7 +3658,7 @@ private def usage : String := String.intercalate "\n" [
   "          'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'",
   "          Default: the file the index says declares d; every file the index recorded a use of",
   "          d in for inspect; the whole repository for the sweeps (rename, infix, unused,",
-  "          unused-simp, modularize).",
+  "          unused-simp, modularize, insert-arg).",
   "",
   "  d  declaration, full name      r  replacement      n  index, counting from 1",
   "  tok  a notation token: the symbol a `notation`/`infixl` command introduces, as the source",
@@ -3702,8 +3704,8 @@ private def usage : String := String.intercalate "\n" [
   row "remove-arg d n" "remove argument n at every call of d",
   row "  --syntax" "read calls off this file's elaboration, not the built .ilean",
   row "  --token tok" "also match calls written as the notation tok",
-  row "insert-arg d n term" "insert term before argument n of every application of d, and for a constructor every ⟨…⟩;",
-  row "" "  a pattern gets _ (default: the whole repository)",
+  row "insert-arg d n term" "insert term before argument n of every application of d, ⟨…⟩ included;",
+  row "" "  a pattern gets _",
   row "remove-param d binder n" "remove a parameter Lean reports unused",
   "",
   "cleanup",
