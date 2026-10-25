@@ -89,7 +89,8 @@ arguments
     --syntax                              read calls off this file's elaboration, not the built .ilean
     --token tok                           also match calls written as the notation tok
   insert-arg d n term                     insert term before argument n of every application of d, ⟨…⟩ included;
-                                            a pattern gets _; a parameter with a default leaves the terms that omit it alone
+                                            a pattern gets _; a parameter with a default leaves the terms that omit it alone;
+                                            refuses a file that does not elaborate, or a pattern the edit would not reach
   remove-param d binder n                 remove a parameter Lean reports unused
 
 cleanup

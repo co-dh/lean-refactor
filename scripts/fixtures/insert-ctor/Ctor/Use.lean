@@ -89,6 +89,14 @@ def genDoMatch (v : V) : Id Nat := do
     | _ => return 0
   | _ => return 0
 
+def genMark : V → Nat
+  | .mark _ (.gen k _) => k
+  | _ => 0
+
+def genPair : V → Nat
+  | .pair (.vec (c@⟨_, _, _⟩)) (.gen k _) => k + c.n
+  | _ => 0
+
 def genTerm1 : V := .gen 1
 def genTerm2 : V := V.gen 1 2
 def genMap : List V := [1, 2].map V.gen

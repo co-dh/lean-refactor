@@ -44,11 +44,39 @@ check "$use" '(⟨1, 2, .raw 0, 9⟩ : Col).n'
 
 # A parameter WITH a default: terms that omit it keep the default and are not edited; a pattern
 # takes `_` (there the default would be a pattern too), and one short of it names the parameter.
-sed -i 's/^@\[match_pattern\] abbrev V.gen (k : Nat) (n : Nat := 0) : V := .vec k n none$/@[match_pattern] abbrev V.gen (k : Nat) (n : Nat := 0) (a : Option Nat := none) : V := .vec k n a/' Ctor/Base.lean
+sed -i 's/^@\[match_pattern\] abbrev V.gen (k : Nat) (n : Nat := 0) : V := .vec ⟨n, .pay k, none⟩$/@[match_pattern] abbrev V.gen (k : Nat) (n : Nat := 0) (a : Option Nat := none) : V := .vec ⟨n, .pay k, a⟩/' Ctor/Base.lean
+# A source ahead of its build (`VC` has three fields there) fails to elaborate, and its patterns
+# record nothing: refused, where it used to leave both `.gen` patterns out without a word.
+cp Ctor/Use.lean Ctor/Use.lean.orig
+printf 'def genStale : V → Nat\n  | .pair (.vec ⟨_, _, _, _⟩) (.gen k _) => k\n  | .wrap _ (.gen k _) => k\n  | _ => 0\n' >> Ctor/Use.lean
+if out=$("$root/scripts/lean-refactor" insert-arg Ctor.V.gen 3 none --in 'Ctor/*.lean' 2>&1); then
+  echo "test-insert-ctor: a file that does not elaborate against its build was not refused"; fail=1
+fi
+check "$out" 'does not elaborate against the built imports'
+mv Ctor/Use.lean.orig Ctor/Use.lean
 "$root/scripts/lean-refactor" insert-arg Ctor.V.gen 3 none --in 'Ctor/*.lean' --apply
 use=$(cat Ctor/Use.lean)
 check "$use" '| .gen k n _ => k + n'
 check "$use" '| .gen k (a := _) => k'
+# Every pattern position, including those nested under another constructor, where the info tree
+# keeps nothing once `.gen` is unfolded: each must name the new parameter.
+check "$use" '| .wrap _ (.gen k n _) => k + n'
+check "$use" '| .wrap _ (v@(.gen _ _ _)) => genBoth v'
+check "$use" '| _, .atom k | _, .wrap _ (.gen k _ _) => k'
+check "$use" '| .gen k n _, _ => return k + n'
+check "$use" '| .gen k n _ => k + n + t'
+check "$use" '| .gen k _ _ => k
+'
+check "$use" 'fun
+  | .gen k n _ => k + n'
+check "$use" 'match h : v with
+  | .gen k n _ => k + n'
+check "$use" 'if let .gen k _ _ := v then k'
+check "$use" '| .gen k n _ => return k + n + x'
+check "$use" '| .wrap _ (.gen k _ _) => do'
+check "$use" '| .wrap _ (.gen j _ _) => return j + k'
+check "$use" '| .mark _ (.gen k _ _) => k'
+check "$use" '| .pair (.vec (c@⟨_, _, _⟩)) (.gen k _ _) => k + c.n'
 check "$use" 'def genTerm1 : V := .gen 1
 '
 check "$use" 'def genTerm2 : V := V.gen 1 2
