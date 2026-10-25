@@ -26,6 +26,42 @@ public def setupOf (path : String) (mainModule : Name) : IO ModuleSetup := do
       the dynamic libraries its imports need are unknown; run `lake build {mainModule}` first"
   ModuleSetup.load file
 
+/-- Every `[name, hash]` pair anywhere in a lake trace: how a trace lists each input it hashed. -/
+private partial def hashPairs : Json → Array (String × String)
+  | .arr #[.str p, .str h] => #[(p, h)]
+  | .arr xs => xs.flatMap hashPairs
+  | .obj kvs => kvs.foldl (fun acc _ v => acc ++ hashPairs v) #[]
+  | _ => #[]
+
+/-- Refuse a `.lake` that mixes two builds: a library `mainModule`'s trace recorded at its last build
+    whose `.hash` now says it was rebuilt since.  A failed or interrupted build leaves exactly that, and
+    loading such a set runs native code compiled against another layout of the same structures — a
+    segfault in `initialize`, not an error.  A loaded library the trace does not list (an
+    `extern_lib`, which lake leaves out of a module's trace) has nothing to compare against. -/
+public def checkLibraries (path : String) (mainModule : Name) (setup : ModuleSetup) : IO Unit := do
+  let loaded := setup.dynlibs ++ setup.plugins
+  if loaded.isEmpty then return
+  let trace := mainModule.components.foldl (fun p c => p / c.toString) (System.FilePath.mk Db.buildDir)
+    |>.addExtension "trace"
+  let fix := s!"run `lake build {mainModule}` (with any declaration edited ahead of a refactor stashed: \
+    `git stash; lake build {mainModule}; git stash pop`)"
+  unless ← trace.pathExists do
+    throw <| IO.userError s!"{path}: {trace} does not exist, so which libraries `{mainModule}` was \
+      built against is unknown; {fix}"
+  let json ← IO.ofExcept <| (Json.parse (← IO.FS.readFile trace)).mapError (s!"{trace}: " ++ ·)
+  let recorded := hashPairs (json.getObjValD "inputs")
+  for lib in loaded do
+    let some (_, built) := recorded.find? (·.1 == lib.toString) | continue
+    let hashFile := lib.toString ++ ".hash"
+    unless ← System.FilePath.pathExists hashFile do
+      throw <| IO.userError s!"{path}: {hashFile} does not exist, so whether {lib} is the build \
+        `{mainModule}` was compiled against is unknown; {fix}"
+    let now := (← IO.FS.readFile hashFile).trimAscii.toString
+    unless now == built do
+      throw <| IO.userError s!"{path}: `{mainModule}` was built against {lib} at hash {built}, but \
+        that library has been rebuilt since (now {now}): .lake mixes two builds, and loading it would \
+        run native code compiled against the other one.  {fix}"
+
 /-- Build the environment `header` imports, set up as `lean` sets it up under lake: the module's
     `dynlibs` loaded and its `plugins` handed to the import, so an imported `initialize` that calls
     an `@[extern]` finds the native symbol (without them: "Could not find native implementation of
@@ -33,6 +69,7 @@ public def setupOf (path : String) (mainModule : Name) : IO ModuleSetup := do
 public def headerEnv (path : String) (header : Elab.HeaderSyntax) (messages : MessageLog)
     (inputCtx : Parser.InputContext) (mainModule : Name) : IO (Environment × MessageLog × Options) := do
   let setup ← setupOf path mainModule
+  checkLibraries path mainModule setup
   setup.dynlibs.forM Lean.loadDynlib
   let opts := setup.options.toOptions
   let (env, messages) ← Elab.processHeader header opts messages inputCtx
@@ -52,5 +89,22 @@ public def frontendOf (path source : String) (mainModule : Name) :
   if headerMessages.hasErrors then return .error { parsed := true, messages := headerMessages }
   let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} opts)
   return .ok (inputCtx, env, frontend)
+
+/-- `frontendOf`, but stopping after the first command that leaves `stop` true of the environment:
+    reading one declaration's elaborated form costs the commands up to it, not the whole file. -/
+public def envThrough (path source : String) (mainModule : Name) (stop : Environment → Bool) :
+    IO (Except HeaderError Environment) := do
+  let inputCtx := Parser.mkInputContext source path
+  let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
+  if headerMessages.hasErrors then return .error { parsed := false, messages := headerMessages }
+  let (env, headerMessages, opts) ← headerEnv path header headerMessages inputCtx mainModule
+  if headerMessages.hasErrors then return .error { parsed := true, messages := headerMessages }
+  let mut st : Elab.Frontend.State :=
+    { commandState := Elab.Command.mkState env {} opts, parserState, cmdPos := parserState.pos }
+  repeat
+    let (done, st') ← (Elab.Frontend.processCommand.run { inputCtx }).run st
+    st := st'
+    if done || stop st.commandState.env then break
+  return .ok st.commandState.env
 
 end LeanRefactor.Elaborate

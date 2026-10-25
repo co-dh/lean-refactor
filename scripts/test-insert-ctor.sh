@@ -41,4 +41,18 @@ check "$use" 'if let ⟨t, _, .raw _, _⟩ := c'
 check "$use" 'for ⟨t, _, _, _⟩ in cs'
 check "$use" 'obtain ⟨t, n, e⟩ := c'
 check "$use" '(⟨1, 2, .raw 0, 9⟩ : Col).n'
+
+# A parameter WITH a default: terms that omit it keep the default and are not edited; a pattern
+# takes `_` (there the default would be a pattern too), and one short of it names the parameter.
+sed -i 's/^@\[match_pattern\] abbrev V.gen (k : Nat) (n : Nat := 0) : V := .vec k n none$/@[match_pattern] abbrev V.gen (k : Nat) (n : Nat := 0) (a : Option Nat := none) : V := .vec k n a/' Ctor/Base.lean
+"$root/scripts/lean-refactor" insert-arg Ctor.V.gen 3 none --in 'Ctor/*.lean' --apply
+use=$(cat Ctor/Use.lean)
+check "$use" '| .gen k n _ => k + n'
+check "$use" '| .gen k (a := _) => k'
+check "$use" 'def genTerm1 : V := .gen 1
+'
+check "$use" 'def genTerm2 : V := V.gen 1 2
+'
+check "$use" 'def genMap : List V := [1, 2].map V.gen
+'
 exit $fail

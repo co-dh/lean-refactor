@@ -2190,6 +2190,11 @@ transactional at repository scale — the same contract as `rename-module`. -/
 
 private def stagePathFor (path : String) : String := path ++ ".rename-stage"
 
+/-- `--keep`: a staged edit whose verifying build fails stays written instead of being restored.  A
+    large mechanical edit can be right while the build fails on proofs that need a human, and then
+    the edit is the work; a global because every staged command takes it the same way. -/
+builtin_initialize keepFailedEdit : IO.Ref Bool ← IO.mkRef false
+
 private def dropStagedFiles (staged : Array String) : IO Unit := do
   for path in staged do
     let stage := stagePathFor path
@@ -2259,6 +2264,12 @@ private def stagedGlob (pattern description : String)
   IO.println s!"repository build in {(← IO.monoMsNow) - buildStarted} ms"
   unless build.stdout.isEmpty do IO.eprint build.stdout
   unless build.stderr.isEmpty do IO.eprint build.stderr
+  if build.exitCode != 0 && (← keepFailedEdit.get) then
+    IO.eprintln s!"whole-repository build failed ({description}); the edit is KEPT in \
+      {stagedFiles.size} file(s), the failing modules are in the build output above.  `.lake` now \
+      mixes two builds until the repository builds again; `git checkout -- <files>` undoes the edit:"
+    for path in stagedFiles do IO.eprintln s!"  {path}"
+    return build.exitCode
   if build.exitCode != 0 then
     for (path, source) in restore do IO.FS.writeFile path source
     dropBuildArtefacts stagedFiles
@@ -2784,6 +2795,42 @@ private def patternRanges (infos : Array (Elab.ContextInfo × Elab.TermInfo)) : 
             if let some r := pat.getRange? (canonicalOnly := true) then ranges := ranges.push r
   return ranges
 
+/-- The explicit binders an application of `info` writes, name and domain: a constructor's are its
+    fields, past the inductive's parameters. -/
+private def explicitBinders (info : ConstantInfo) : Array (Name × Expr) := Id.run do
+  let params := match info with | .ctorInfo c => c.numParams | _ => 0
+  let mut (ty, k, acc) := (info.type, 0, #[])
+  while ty.isForall do
+    if k ≥ params && ty.bindingInfo!.isExplicit then acc := acc.push (ty.bindingName!, ty.bindingDomain!)
+    (ty, k) := (ty.bindingBody!, k + 1)
+  return acc
+
+/-- The child that reads the NEW parameter off the declaration's NEW signature: `path` is the file
+    that declares it, already edited, elaborated up to that declaration.  Every other file is read
+    against the built (old) declaration, so this is the one place the new binder exists.  Prints
+    `{"name": n, "default": b}`, `b` when the binder is an `optParam` or `autoParam`. -/
+private def insertArgBinder (path declName : String) (n : Nat) : IO UInt32 := do
+  claimElaboration path
+  let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
+  initSearchPath (← findSysroot)
+  let decl := parseName declName
+  let env ← match ← Elaborate.envThrough path (← IO.FS.readFile path) (parseName moduleName)
+      (·.contains decl) with
+    | .ok env => pure env
+    | .error e =>
+        for msg in e.messages.toList do IO.eprintln (← msg.toString)
+        IO.eprintln s!"{path}: imports failed to elaborate"
+        return 1
+  let some info := env.find? decl
+    | IO.eprintln s!"{path}: does not declare `{declName}`, though the index places it here"; return 1
+  let binders := explicitBinders info
+  let some (name, domain) := binders[n]?
+    | IO.eprintln s!"{path}: `{declName}` has {binders.size} explicit parameter(s), so there is no \
+        argument {n + 1}: add the new parameter to the declaration before running insert-arg"
+      return 1
+  IO.println (Json.mkObj [("name", toJson name), ("default", domain.isOptParam || domain.isAutoParam)]).compress
+  return 0
+
 /-- How a use of a constructor is spelled, which decides its edit. -/
 private inductive CtorUse | anon | app | inst | update
   deriving BEq
@@ -2796,8 +2843,15 @@ open Meta in
     inductive (so a file that already declares the new field, where `⟨a, b⟩` fails to elaborate,
     still names its sites).  A use inside a `match` pattern gets `_`.  Named-field instances
     `{ f := … }` are reported, not edited: the insertion is positional and they name their fields,
-    so the new field needs a default there or a hand edit; a `{ c with … }` copies it. -/
-private def insertArgStage (path stagePath declName : String) (n : Nat) (term : String) : IO UInt32 := do
+    so the new field needs a default there or a hand edit; a `{ c with … }` copies it.
+
+    `defaulted?` names the new parameter when the declaration's NEW signature gives it a default
+    (`insertArgBinder`).  Then a term that writes no argument from `n` on takes the default and is
+    left alone, unapplied uses included; a pattern still needs `_`, because there the default is a
+    pattern too (`.f x _` with `(a := none)` matches only `none`), and one that stops short of `n`
+    gets `(a := _)`, which leaves the defaults of the parameters it skips as they were. -/
+private def insertArgStage (path stagePath declName : String) (n : Nat) (term : String)
+    (defaulted? : Option Name) : IO UInt32 := do
   claimElaboration path
   let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
   let source ← IO.FS.readFile path
@@ -2815,13 +2869,7 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
     | IO.println s!"{path}: `{declName}` is not in scope"; return 3
   let induct? := match info with | .ctorInfo c => some c.induct | _ => none
   -- Explicit fields of a constructor are what `⟨…⟩` lists; flattening hands the surplus to the last.
-  let explicit := Id.run do
-    let mut (ty, k, count) := (info.type, 0, 0)
-    while ty.isForall do
-      if k ≥ (match info with | .ctorInfo c => c.numParams | _ => 0) && ty.bindingInfo!.isExplicit then
-        count := count + 1
-      (ty, k) := (ty.bindingBody!, k + 1)
-    return count
+  let explicit := (explicitBinders info).size
   let infos := termInfos frontend.commandState.infoState.trees.toArray
   let patterns := patternRanges infos
   let inPattern (r : Syntax.Range) := patterns.any fun p => p.start ≤ r.start && r.stop ≤ p.stop
@@ -2878,9 +2926,15 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
   let anonRanges := uses.filterMap fun (k, _, r) => if k == .anon then some r else none
   uses := uses.filter fun (k, stx, _) => k != .app || !(stx[0].getRange?.any anonRanges.contains)
   -- The head of an application is recorded too; only one that heads no application is unapplied.
+  let mut counts : Array (String × Nat) := #[]
+  let bump (counts : Array (String × Nat)) (key : String) :=
+    match counts.findIdx? (·.1 == key) with
+    | some i => counts.modify i fun (k, c) => (k, c + 1)
+    | none => counts.push (key, 1)
   for r in bare do
     unless fnRanges.contains r || anonRanges.contains r do
-      refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used unapplied; \
+      if defaulted?.isSome && !inPattern r then counts := bump counts "unapplied-term-default"
+      else refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used unapplied; \
         there is no argument list to insert into"
   let parsed := Parser.runParserCategory env `term term
   let atomic := match parsed with
@@ -2890,11 +2944,6 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
     | .error _ => false
   if let .error message := parsed then IO.eprintln s!"`{term}` does not parse as a term: {message}"; return 2
   let mut edits : Array Edit := #[]
-  let mut counts : Array (String × Nat) := #[]
-  let bump (counts : Array (String × Nat)) (key : String) :=
-    match counts.findIdx? (·.1 == key) with
-    | some i => counts.modify i fun (k, c) => (k, c + 1)
-    | none => counts.push (key, 1)
   for (kind, stx, r) in uses do
     let line := lineOf r.start
     let pattern := inPattern r
@@ -2919,8 +2968,17 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
           refusals := refusals.push s!"{path}:{line}: `⟨…⟩` flattens {args.size - explicit + 1} \
             components into the last field; nest them as `⟨…⟩` by hand first"
           continue
+        if !anon && !pattern && defaulted?.isSome && ranges.size ≤ n then
+          counts := bump counts "app-term-default"
+          continue
         let spelled := if anon || atomic || pattern then text else s!"({text})"
-        let edit? : Option Edit := if h : n < ranges.size then
+        let named? := match defaulted? with
+          | some name => if !anon && pattern && n > ranges.size && ranges.size > 0 &&
+              !name.hasMacroScopes then some s!" ({name} := _)" else none
+          | none => none
+        let edit? : Option Edit := if let some named := named? then
+            some { start := ranges.back!.stop, stop := ranges.back!.stop, line, replacement := named }
+          else if h : n < ranges.size then
             some { start := ranges[n].start, stop := ranges[n].start, line,
                    replacement := spelled ++ (if anon then ", " else " ") }
           else if n == ranges.size && ranges.size > 0 then
@@ -2932,7 +2990,8 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
             argument(s); inserting before argument {n + 1} needs the {n} before it"
           continue
         edits := edits.push edit
-        counts := bump counts s!"{if anon then "anon" else "app"}-{if pattern then "pattern" else "term"}"
+        counts := bump counts s!"{if anon then "anon" else "app"}-{if pattern then "pattern" else "term"}\
+          {if named?.isSome then "-named" else ""}"
   unless refusals.isEmpty do
     for r in refusals do IO.eprintln s!"refusing: {r}"
     return 1
@@ -3653,6 +3712,7 @@ private def usage : String := String.intercalate "\n" [
   "",
   "  --apply writes the edit; without it a command only previews.  A repository-wide edit is",
   "  verified by a build and restored if that build fails.",
+  "  --keep  ... leaves it written when that build fails, for the failures a human has to fix.",
   "",
   "  --in g  which files to work on: one path, a glob, or a comma-list where a leading ! subtracts",
   "          'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'",
@@ -3784,9 +3844,11 @@ def main (args : List String) : IO UInt32 := do
   let noIndex := args.contains "--no-index"
   let body := args.contains "--body"
   let syntaxMatch := args.contains "--syntax"
+  keepFailedEdit.set (args.contains "--keep")
   let args := args.filter fun a =>
-    !["--apply", "--uses-only", "--no-index", "--body", "--syntax",
+    !["--apply", "--uses-only", "--no-index", "--body", "--syntax", "--keep",
       "--same-statement", "--same-proof"].contains a
+  let (args, defaulted?) := stripFlag "--defaulted" args
   let (args, selector?) := stripFlag "--in" args
   let (args, token?) := stripFlag "--token" args
   let (args, into?) := stripFlag "--into" args
@@ -3891,14 +3953,33 @@ def main (args : List String) : IO UInt32 := do
       return ← refactorSuggestedWarnings { path } apply (includeVariables := false)
   | ["infix", declName, token] =>
       return ← infixGlob (selector?.getD wholeRepository) declName token apply
+  | ["insert-arg-binder", path, declName, index] =>
+      return ← insertArgBinder path declName (index.toNat?.getD 1 - 1)
   | ["insert-arg-stage", path, stagePath, declName, index, term] =>
       return ← insertArgStage path stagePath declName (index.toNat?.getD 1 - 1) term
+        (defaulted?.map parseName)
   | ["insert-arg", declName, index, term] =>
       let some n := index.toNat? | IO.eprintln "argument index must be a positive integer"; return 2
       if n == 0 then IO.eprintln "argument index is 1-based"; return 2
+      -- Whether the new parameter has a default is in the edited declaration, which no built
+      -- artefact holds yet: read it there once, in a child, rather than asking the caller.
+      let .ok declPath ← fileOf none declName | return 2
+      let binder ← spawnSelf #["insert-arg-binder", declPath, declName, index]
+      IO.eprint binder.stderr
+      if binder.exitCode != 0 then return binder.exitCode
+      let .ok json := Json.parse binder.stdout
+        | IO.eprintln s!"insert-arg-binder printed no JSON: {binder.stdout}"; return 1
+      let .ok name := json.getObjValAs? Name "name"
+        | IO.eprintln s!"insert-arg-binder: no `name` in {binder.stdout}"; return 1
+      let .ok hasDefault := json.getObjValAs? Bool "default"
+        | IO.eprintln s!"insert-arg-binder: no `default` in {binder.stdout}"; return 1
+      IO.println s!"argument {n} of `{declName}` is `{name}`, \
+        {if hasDefault then "with a default: terms that omit it are left alone" else "with no default"}"
+      let extra := if hasDefault then #["--defaulted", name.toString] else #[]
       -- Every use must take the argument or the build fails, so the default is the whole repository.
       return ← stagedGlob (selector?.getD wholeRepository) s!"inserted `{term}` before argument {n} of `{declName}`"
-        (fun path stage => spawnSelf #["insert-arg-stage", path, stage, declName, index, term]) apply
+        (fun path stage => spawnSelf (#["insert-arg-stage", path, stage, declName, index, term] ++ extra))
+        apply
   | ["notate-stage", path, declName, form, stagePath] =>
       return ← notateStage path declName form stagePath
   | ["notate", declName] =>

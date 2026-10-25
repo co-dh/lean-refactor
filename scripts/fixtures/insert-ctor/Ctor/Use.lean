@@ -31,4 +31,16 @@ theorem obtained (c : Col) : c.ty = c.ty := by
 
 theorem anonInStatement : (⟨1, 2, .raw 0⟩ : Col).n = 2 := rfl
 
+def genBoth : V → Nat
+  | .gen k n => k + n
+  | _ => 0
+
+def genShort : V → Nat
+  | .gen k => k
+  | _ => 0
+
+def genTerm1 : V := .gen 1
+def genTerm2 : V := V.gen 1 2
+def genMap : List V := [1, 2].map V.gen
+
 end Ctor
