@@ -83,4 +83,23 @@ check "$use" 'def genTerm2 : V := V.gen 1 2
 '
 check "$use" 'def genMap : List V := [1, 2].map V.gen
 '
+
+# A constructor with no default: ellipsis, `@C`, partial application and eta, `cases` alternatives
+# and binder-named patterns.  Kv is declared with the new parameter first, as a refactor would.
+sed -i 's/^  | pair : Kv → Kv → Kv$/  | pair : Kv → Kv → (s : Bool) → Kv/' Ctor/Kv.lean
+"$root/scripts/lean-refactor" insert-arg Ctor.Kv.pair 3 false --in 'Ctor/*.lean' --apply
+sed -i 's/^  | tagged : Nat → Nat → {ix : Nat} → Kv$/  | tagged : Nat → Nat → (s : Bool) → {ix : Nat} → Kv/' Ctor/Kv.lean
+"$root/scripts/lean-refactor" insert-arg Ctor.Kv.tagged 3 false --in 'Ctor/*.lean' --apply
+kv=$(cat Ctor/Kv.lean); kvuse=$(cat Ctor/KvUse.lean)
+check "$kv" '.pair k v false'
+check "$kv" '| .pair k v _ => .pair v k false'
+check "$kvuse" '| @Kv.tagged a b _ _'
+check "$kvuse" '| .pair .. => true'
+check "$kvuse" '| #[.pair _ (.leaf n) _] => n'
+check "$kvuse" 'vs.map ((fun x1 => Kv.pair k x1 false))'
+check "$kvuse" ':= (fun x1 => Ctor.Kv.pair k x1 false)'
+check "$kvuse" 'List.zipWith (fun x1 x2 => Ctor.Kv.pair x1 x2 false) ks vs'
+check "$kvuse" '| .tagged pair _ _ => pair'
+check "$kvuse" '(h : ∀ k v, x ≠ .pair k v false)'
+check "$kvuse" '| pair k v => trivial'
 exit $fail
