@@ -36,6 +36,7 @@ usage: lean-refactor command [args] [--in g] [--apply]
 
   --apply writes the edit; without it a command only previews.  A repository-wide edit is
   verified by a build and restored if that build fails.
+  --keep  ... leaves it written when that build fails, for the failures a human has to fix.
 
   --in g  which files to work on: one path, a glob, or a comma-list where a leading ! subtracts
           'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'
@@ -88,7 +89,7 @@ arguments
     --syntax                              read calls off this file's elaboration, not the built .ilean
     --token tok                           also match calls written as the notation tok
   insert-arg d n term                     insert term before argument n of every application of d, ⟨…⟩ included;
-                                            a pattern gets _
+                                            a pattern gets _; a parameter with a default leaves the terms that omit it alone
   remove-param d binder n                 remove a parameter Lean reports unused
 
 cleanup

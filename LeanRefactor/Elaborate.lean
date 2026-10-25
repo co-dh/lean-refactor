@@ -52,15 +52,24 @@ public def checkLibraries (path : String) (mainModule : Name) (setup : ModuleSet
   let recorded := hashPairs (json.getObjValD "inputs")
   for lib in loaded do
     let some (_, built) := recorded.find? (·.1 == lib.toString) | continue
-    let hashFile := lib.toString ++ ".hash"
-    unless ← System.FilePath.pathExists hashFile do
-      throw <| IO.userError s!"{path}: {hashFile} does not exist, so whether {lib} is the build \
-        `{mainModule}` was compiled against is unknown; {fix}"
-    let now := (← IO.FS.readFile hashFile).trimAscii.toString
-    unless now == built do
-      throw <| IO.userError s!"{path}: `{mainModule}` was built against {lib} at hash {built}, but \
-        that library has been rebuilt since (now {now}): .lake mixes two builds, and loading it would \
-        run native code compiled against the other one.  {fix}"
+    -- A `.lake` copied from another tree keeps that tree's library paths in its setups while the
+    -- imports read THIS tree's `.olean`s, so this tree's copy of the library must match as well.
+    let parts := lib.components
+    let local? := parts.findIdx? (· == ".lake") |>.map fun i =>
+      System.mkFilePath (parts.drop i)
+    let copies := match local? with
+      | some l => if l.toString != lib.toString then #[lib, l] else #[lib]
+      | none => #[lib]
+    for copy in copies do
+      let hashFile := copy.toString ++ ".hash"
+      unless ← System.FilePath.pathExists hashFile do
+        throw <| IO.userError s!"{path}: {hashFile} does not exist, so whether {copy} is the build \
+          `{mainModule}` was compiled against is unknown; {fix}"
+      let now := (← IO.FS.readFile hashFile).trimAscii.toString
+      unless now == built do
+        throw <| IO.userError s!"{path}: `{mainModule}` was built against {lib} at hash {built}, but \
+          {copy} is at {now}: .lake mixes two builds, and loading the library would run native code \
+          compiled against another form of the `.olean`s it is imported with.  {fix}"
 
 /-- Build the environment `header` imports, set up as `lean` sets it up under lake: the module's
     `dynlibs` loaded and its `plugins` handed to the import, so an imported `initialize` that calls
@@ -79,32 +88,25 @@ public def headerEnv (path : String) (header : Elab.HeaderSyntax) (messages : Me
 /-- Parse `source`'s import header, build the environment its imports define, and run the frontend
     over the rest.  Stops there: what a COMMAND error means is the caller's decision, not this one's.
     The environment handed back is the one the IMPORTS built, which is what re-elaborating an edit
-    of the same file needs; `frontend.commandState.env` is the one the commands left behind. -/
-public def frontendOf (path source : String) (mainModule : Name) :
+    of the same file needs; `frontend.commandState.env` is the one the commands left behind.
+    With `stop?`, the commands end after the first that leaves it true of the environment: reading
+    one declaration's elaborated form costs the commands up to it, not the whole file. -/
+public def frontendOf (path source : String) (mainModule : Name)
+    (stop? : Option (Environment → Bool) := none) :
     IO (Except HeaderError (Parser.InputContext × Environment × Elab.Frontend.State)) := do
   let inputCtx := Parser.mkInputContext source path
   let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
   if headerMessages.hasErrors then return .error { parsed := false, messages := headerMessages }
   let (env, headerMessages, opts) ← headerEnv path header headerMessages inputCtx mainModule
   if headerMessages.hasErrors then return .error { parsed := true, messages := headerMessages }
-  let frontend ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} opts)
-  return .ok (inputCtx, env, frontend)
-
-/-- `frontendOf`, but stopping after the first command that leaves `stop` true of the environment:
-    reading one declaration's elaborated form costs the commands up to it, not the whole file. -/
-public def envThrough (path source : String) (mainModule : Name) (stop : Environment → Bool) :
-    IO (Except HeaderError Environment) := do
-  let inputCtx := Parser.mkInputContext source path
-  let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
-  if headerMessages.hasErrors then return .error { parsed := false, messages := headerMessages }
-  let (env, headerMessages, opts) ← headerEnv path header headerMessages inputCtx mainModule
-  if headerMessages.hasErrors then return .error { parsed := true, messages := headerMessages }
-  let mut st : Elab.Frontend.State :=
-    { commandState := Elab.Command.mkState env {} opts, parserState, cmdPos := parserState.pos }
+  let commandState := Elab.Command.mkState env {} opts
+  let some stop := stop?
+    | return .ok (inputCtx, env, ← Elab.IO.processCommands inputCtx parserState commandState)
+  let mut st : Elab.Frontend.State := { commandState, parserState, cmdPos := parserState.pos }
   repeat
     let (done, st') ← (Elab.Frontend.processCommand.run { inputCtx }).run st
     st := st'
     if done || stop st.commandState.env then break
-  return .ok st.commandState.env
+  return .ok (inputCtx, env, st)
 
 end LeanRefactor.Elaborate

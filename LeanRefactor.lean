@@ -2814,9 +2814,9 @@ private def insertArgBinder (path declName : String) (n : Nat) : IO UInt32 := do
   let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
   initSearchPath (← findSysroot)
   let decl := parseName declName
-  let env ← match ← Elaborate.envThrough path (← IO.FS.readFile path) (parseName moduleName)
-      (·.contains decl) with
-    | .ok env => pure env
+  let env ← match ← Elaborate.frontendOf path (← IO.FS.readFile path) (parseName moduleName)
+      (stop? := some (·.contains decl)) with
+    | .ok (_, _, frontend) => pure frontend.commandState.env
     | .error e =>
         for msg in e.messages.toList do IO.eprintln (← msg.toString)
         IO.eprintln s!"{path}: imports failed to elaborate"
@@ -2828,7 +2828,8 @@ private def insertArgBinder (path declName : String) (n : Nat) : IO UInt32 := do
     | IO.eprintln s!"{path}: `{declName}` has {binders.size} explicit parameter(s), so there is no \
         argument {n + 1}: add the new parameter to the declaration before running insert-arg"
       return 1
-  IO.println (Json.mkObj [("name", toJson name), ("default", domain.isOptParam || domain.isAutoParam)]).compress
+  IO.println (Json.mkObj [("name", toJson name), ("default", domain.isOptParam || domain.isAutoParam),
+    ("ctor", info.isCtor)]).compress
   return 0
 
 /-- How a use of a constructor is spelled, which decides its edit. -/
@@ -2880,6 +2881,15 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
         if s.isOfKind ``Lean.Parser.Term.anonymousCtor then
           if let some r := s.getRange? (canonicalOnly := true) then acc := acc.push (s, r)
     return acc
+  -- An application whose ELABORATED head is another constant — a `@[match_pattern]` definition in a
+  -- pattern is unfolded first — leaves only its head's info naming `declName`; this finds the rest.
+  let writtenApps : Array (Syntax × Syntax.Range) := Id.run do
+    let mut acc := #[]
+    for c in frontend.commands do
+      for s in c.topDown do
+        if s.isOfKind ``Lean.Parser.Term.app then
+          if let some r := s.getRange? (canonicalOnly := true) then acc := acc.push (s, r)
+    return acc
   let headIs (ci : Elab.ContextInfo) (ti : Elab.TermInfo) : IO (Bool × Bool) := ci.runMetaM ti.lctx do
     let head := (← instantiateMVars ti.expr).consumeMData.getAppFn.constName?
     let expected ← match ti.expectedType? with
@@ -2893,6 +2903,8 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
   let mut bare : Array Syntax.Range := #[]
   let lineOf (pos : String.Pos.Raw) := (fileMap.toPosition pos).line
   for (ci, ti) in infos do
+    -- The name a declaration binds is no use of it.
+    if ti.isBinder then continue
     let stx := ti.stx
     let (isHead, expectsInduct) ← headIs ci ti
     let canonical? := stx.getRange? (canonicalOnly := true)
@@ -2933,7 +2945,9 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
     | none => counts.push (key, 1)
   for r in bare do
     unless fnRanges.contains r || anonRanges.contains r do
-      if defaulted?.isSome && !inPattern r then counts := bump counts "unapplied-term-default"
+      if let some (app, appRange) := writtenApps.find? (·.1[0].getRange? == some r) then
+        unless uses.any (·.2.2 == appRange) do uses := uses.push (.app, app, appRange)
+      else if defaulted?.isSome && !inPattern r then counts := bump counts "unapplied-term-default"
       else refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used unapplied; \
         there is no argument list to insert into"
   let parsed := Parser.runParserCategory env `term term
@@ -3765,7 +3779,7 @@ private def usage : String := String.intercalate "\n" [
   row "  --syntax" "read calls off this file's elaboration, not the built .ilean",
   row "  --token tok" "also match calls written as the notation tok",
   row "insert-arg d n term" "insert term before argument n of every application of d, ⟨…⟩ included;",
-  row "" "  a pattern gets _",
+  row "" "  a pattern gets _; a parameter with a default leaves the terms that omit it alone",
   row "remove-param d binder n" "remove a parameter Lean reports unused",
   "",
   "cleanup",
@@ -3975,11 +3989,14 @@ def main (args : List String) : IO UInt32 := do
         | IO.eprintln s!"insert-arg-binder: no `default` in {binder.stdout}"; return 1
       IO.println s!"argument {n} of `{declName}` is `{name}`, \
         {if hasDefault then "with a default: terms that omit it are left alone" else "with no default"}"
+      let .ok ctor := json.getObjValAs? Bool "ctor"
+        | IO.eprintln s!"insert-arg-binder: no `ctor` in {binder.stdout}"; return 1
       let extra := if hasDefault then #["--defaulted", name.toString] else #[]
       -- Every use must take the argument or the build fails, so the default is the whole repository.
+      -- A file that never spells the name holds no use, except a constructor's `⟨…⟩`.
       return ← stagedGlob (selector?.getD wholeRepository) s!"inserted `{term}` before argument {n} of `{declName}`"
         (fun path stage => spawnSelf (#["insert-arg-stage", path, stage, declName, index, term] ++ extra))
-        apply
+        apply (mentioning := if ctor then #[] else #[shortName declName])
   | ["notate-stage", path, declName, form, stagePath] =>
       return ← notateStage path declName form stagePath
   | ["notate", declName] =>
