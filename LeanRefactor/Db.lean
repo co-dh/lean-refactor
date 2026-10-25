@@ -14,6 +14,8 @@ public def recordSep : String := "\x1e"
 /-- Where `lake` puts the compiled artefacts of the repository being edited, and the index this
     tool derives from them; both relative, because every operation runs in the target's root. -/
 public def buildDir : String := ".lake/build/lib/lean"
+/-- Where lake keeps each module's IR and the `<M>.setup.json` it handed `lean`. -/
+public def irDir : String := ".lake/build/ir"
 public def indexPath : String := ".lake/build/refactor-index.db"
 
 /-- 0x1D between the two record groups a `syntax-rows` child prints — its syntax nodes, then its
