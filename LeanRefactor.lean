@@ -2823,6 +2823,13 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
   let infos := termInfos frontend.commandState.infoState.trees.toArray
   let patterns := patternRanges infos
   let inPattern (r : Syntax.Range) := patterns.any fun p => p.start ≤ r.start && r.stop ≤ p.stop
+  let written : Array (Syntax × Syntax.Range) := Id.run do
+    let mut acc := #[]
+    for c in frontend.commands do
+      for s in c.topDown do
+        if s.isOfKind ``Lean.Parser.Term.anonymousCtor then
+          if let some r := s.getRange? (canonicalOnly := true) then acc := acc.push (s, r)
+    return acc
   let headIs (ci : Elab.ContextInfo) (ti : Elab.TermInfo) : IO (Bool × Bool) := ci.runMetaM ti.lctx do
     let head := (← instantiateMVars ti.expr).consumeMData.getAppFn.constName?
     let expected ← match ti.expectedType? with
@@ -2843,13 +2850,15 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
       if let some r := canonical? then foreignAnon := foreignAnon.push r
     unless isHead || (expectsInduct && stx.isOfKind ``Lean.Parser.Term.anonymousCtor) do continue
     let some r := canonical? | do
-      -- Generated text is no site, except the inner `⟨…⟩` Lean builds when it flattens another
-      -- structure's `⟨a, b, c⟩` into its last field: that one is this constructor, written by hand.
-      if stx.isOfKind ``Lean.Parser.Term.anonymousCtor then
-        if let some pos := stx.getPos? then
-          if foreignAnon.any (fun o => o.start ≤ pos && pos < o.stop) then
-            refusals := refusals.push s!"{path}:{lineOf pos}: `⟨…⟩` of another structure flattens \
-              into a `{declName}`; write the inner `⟨…⟩` out by hand first"
+      -- Generated text is no site, except where it stands for a `⟨…⟩` the author wrote: a pattern's
+      -- `⟨…⟩` reaches the elaborator rewritten as a synthetic `C.mk …` positioned at its bracket, and
+      -- so does the inner `⟨…⟩` Lean builds when it flattens ANOTHER structure's `⟨a, b, c⟩`.
+      let some pos := stx.getPos? | continue
+      let some (orig, o) := written.find? (·.2.start == pos) | continue
+      if foreignAnon.contains o then
+        refusals := refusals.push s!"{path}:{lineOf pos}: `⟨…⟩` of another structure flattens \
+          into a `{declName}`; write the inner `⟨…⟩` out by hand first"
+      else uses := uses.push (.anon, orig, o)
       continue
     if stx.isOfKind ``Lean.Parser.Term.anonymousCtor then uses := uses.push (.anon, stx, r)
     else if stx.isOfKind ``Lean.Parser.Term.app then
@@ -2860,9 +2869,15 @@ private def insertArgStage (path stagePath declName : String) (n : Nat) (term : 
     else if stx.isIdent || stx.isOfKind ``Lean.Parser.Term.dotIdent ||
         stx.isOfKind ``Lean.Parser.Term.explicit then
       bare := bare.push r
+  -- `⟨…⟩` elaborates as `C.mk a b` with a CANONICAL head spanning the brackets (for hover), so that
+  -- application and its head are the anonymous constructor again, not a second use.
+  -- One site per range: a pattern is elaborated more than once.
+  uses := uses.foldl (init := #[]) fun acc u => if acc.any (·.2.2 == u.2.2) then acc else acc.push u
+  let anonRanges := uses.filterMap fun (k, _, r) => if k == .anon then some r else none
+  uses := uses.filter fun (k, stx, _) => k != .app || !(stx[0].getRange?.any anonRanges.contains)
   -- The head of an application is recorded too; only one that heads no application is unapplied.
   for r in bare do
-    unless fnRanges.contains r do
+    unless fnRanges.contains r || anonRanges.contains r do
       refusals := refusals.push s!"{path}:{lineOf r.start}: `{declName}` is used unapplied; \
         there is no argument list to insert into"
   let parsed := Parser.runParserCategory env `term term

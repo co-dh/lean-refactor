@@ -1,0 +1,6 @@
+name = "ctor"
+defaultTargets = ["Ctor"]
+
+[[lean_lib]]
+name = "Ctor"
+globs = ["Ctor.+"]
