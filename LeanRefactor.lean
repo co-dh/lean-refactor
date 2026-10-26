@@ -2386,7 +2386,9 @@ private def nodesOfChild (path : String) : IO (Array SyntaxRows.Node) := do
   let child ← spawnSelf #["syntax-rows", path]
   if child.exitCode != 0 then
     throw <| IO.userError s!"{path}: the `syntax-rows` child failed: {child.stderr}"
-  pure (SyntaxQuery.nodesOfRows (Db.childGroups child.stdout)[0]!)
+  match Db.childGroups child.stdout with
+  | .ok groups => pure (SyntaxQuery.nodesOfRows groups[0]!)
+  | .error e => throw <| IO.userError s!"{path}: {e}"
 
 /-- `lean-refactor modularize --glob`: put every file matching the pattern on the module system
     together, staging per file and swapping all in at once — the shape `rename-decl` uses for

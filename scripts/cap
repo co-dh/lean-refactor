@@ -26,6 +26,8 @@
 # rlimits are inherited, so wrapping the outermost command covers its whole process tree.
 [ $# -gt 0 ] || { echo "usage: cap <command> [args...]   (CAP_MEM_MB, default 12288)" >&2; exit 2; }
 mb=${CAP_MEM_MB:-12288}
-ulimit -v $((mb * 1024)) 2>/dev/null ||
-  echo "cap: could not set a ${mb} MB address-space limit (hard limit lower?); running uncapped" >&2
+# CAP_MEM_MB is exported only once the limit is set, so a process under it can name the cap it hit.
+if ulimit -v $((mb * 1024)) 2>/dev/null; then export CAP_MEM_MB=$mb
+else unset CAP_MEM_MB; echo "cap: could not set a ${mb} MB address-space limit (hard limit lower?); running uncapped" >&2
+fi
 exec "$@"

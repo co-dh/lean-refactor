@@ -27,12 +27,18 @@ public def groupSep : String := "\x1d"
 public def childGroupCount : Nat := 4
 
 /-- The records of each group a `syntax-rows` child printed.  A child that failed prints nothing,
-    and every group then comes back empty rather than as one malformed group. -/
-public def childGroups (stdout : String) : Array (Array String) :=
+    and that is an error, never `childGroupCount` empty groups: those read as a module with no rows. -/
+public def childGroups (stdout : String) : Except String (Array (Array String)) :=
   let records (s : String) : Array String := ((s.splitOn recordSep).filter (· != "")).toArray
   let groups := stdout.splitOn groupSep
-  if groups.length == childGroupCount then (groups.map records).toArray
-  else Array.replicate childGroupCount #[]
+  if groups.length == childGroupCount then .ok (groups.map records).toArray
+  else .error s!"the `syntax-rows` child printed {groups.length} record group(s), not {childGroupCount}"
+
+/-- Remove `path` if it exists.  Only a missing file is ignored; any other failure propagates. -/
+public def removeIfPresent (path : String) : IO Unit :=
+  try IO.FS.removeFile path catch
+    | .noFileOrDirectory .. => pure ()
+    | e => throw e
 
 /-- One row: the cell values joined by `fieldSep`. -/
 public def row (cells : Array String) : String :=
@@ -218,10 +224,13 @@ public def queryRows {α : Type} (dbPath sql : String) (row : Json → Option α
   | _ => pure #[]
 
 /-- The first row's `column` as a `Nat`, `0` when the query returns no row — the shape every scalar
-    `select` has. -/
+    `select` has.  A row whose `column` does not decode is an error, never `0`. -/
 public def queryNat (dbPath sql column : String) : IO Nat := do
-  let values ← queryRows dbPath sql (·.getObjValAs? Nat column |>.toOption)
-  pure (values[0]?.getD 0)
+  let .arr rows ← query dbPath sql | throw <| IO.userError s!"{dbPath}: `{sql}` did not return an array"
+  let some row := rows[0]? | return 0
+  match row.getObjValAs? Nat column with
+  | .ok n => pure n
+  | .error e => throw <| IO.userError s!"{dbPath}: `{sql}`: column {column} of {row.compress}: {e}"
 
 /-- The graph both clients draw, as views, so the Lean page and `scripts/graphdb.py` cannot drift.
     Re-applied on EVERY `ensureSchema`, not guarded by `schemaVersion`: a view stores nothing, so
@@ -303,7 +312,7 @@ private def schemaCurrent (dbPath : String) : IO Bool := do
     Recreating means: delete the database file and start over — this is a derived cache, never a source of truth. -/
 public def ensureSchema (dbPath : String) : IO Bool := do
   let fresh ← if ← schemaCurrent dbPath then pure false else do
-    try IO.FS.removeFile dbPath catch _ => pure ()
+    removeIfPresent dbPath
     exec dbPath schemaSql
     exec dbPath "pragma journal_mode = wal;"
     exec dbPath s!"insert into meta (key, value) values ('schema_version', '{schemaVersion}');"

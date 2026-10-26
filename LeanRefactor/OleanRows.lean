@@ -207,7 +207,8 @@ public def ofModules (modules : Array Name) (buildDir : String := Db.buildDir) :
   let mut imports := #[]
   for mod in modules do
     let parts ← (oleanParts buildDir mod).filterM fun p => do System.FilePath.pathExists p
-    if parts.isEmpty then continue
+    if parts.isEmpty then
+      throw <| IO.userError s!"{mod}: no olean under {buildDir}, though its .ilean was scanned; run `lake build`"
     -- A split module's parts share compacted data, so they must be read together; if that fails, the
     -- main part alone still holds every constant.
     let datas ←

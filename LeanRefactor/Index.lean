@@ -22,9 +22,10 @@ private structure Module where
   oleanHash : String
   relPath   : String
 
-/-- Read `p`, trimmed; a missing file reads as `""`. -/
+/-- Read `p`, trimmed.  A missing hash file is an error, never `""`: an empty hash stored and an
+    empty hash scanned compare equal, so the module would count as up to date forever. -/
 private def readTrimmed (p : System.FilePath) : IO String := do
-  try return (← IO.FS.readFile p).trimAscii.toString catch _ => return ""
+  return (← IO.FS.readFile p).trimAscii.toString
 
 /-- The trimmed contents of every existing `X.olean*.hash` file in `dir`, in sorted filename order,
     joined by `,`. Lean 4.28 splits a module into `X.olean`, `X.olean.private` and `X.olean.server`,
@@ -64,15 +65,14 @@ private partial def scanDir (buildDir relDir : String) : IO (Array Module) := do
 
 /-- The `module` table as a map from name to the stored hash pair. -/
 private def storedModules (dbPath : String) : IO (Std.HashMap String (String × String)) := do
-  let j ← Db.query dbPath "select name, ilean_hash, olean_hash from module;"
+  let sql := "select name, ilean_hash, olean_hash from module;"
+  let .arr rows ← Db.query dbPath sql | throw <| IO.userError s!"{dbPath}: `{sql}` did not return an array"
   let mut map : Std.HashMap String (String × String) := {}
-  match j with
-  | .arr rows =>
-      for row in rows do
-        map := map.insert (row.getObjValAs? String "name" |>.toOption |>.getD "")
-          ((row.getObjValAs? String "ilean_hash" |>.toOption |>.getD ""),
-           (row.getObjValAs? String "olean_hash" |>.toOption |>.getD ""))
-  | _ => pure ()
+  for row in rows do
+    let field (k : String) : IO String := match row.getObjValAs? String k with
+      | .ok v => pure v
+      | .error e => throw <| IO.userError s!"{dbPath}: module row {row.compress}: column {k}: {e}"
+    map := map.insert (← field "name") (← field "ilean_hash", ← field "olean_hash")
   return map
 
 /-- The scanned modules whose hash pair differs from the stored pair, plus scanned modules not
@@ -133,6 +133,30 @@ update decl_info set stmt = s.stmt
 delete from decl_stmt_in;
 commit;"
 
+/-- Write the hash pair of each of `modules`, in one transaction: the last write of a refresh, so a
+    module counts as up to date only once every row of it is in. -/
+private def recordHashes (dbPath : String) (modules : Array Module) : IO Unit := do
+  unless modules.isEmpty do
+    Db.exec dbPath <| modules.foldl (init := "begin;\n") (fun sql m =>
+      sql ++ s!"update module set ilean_hash = '{Db.escaped m.ileanHash}', olean_hash = \
+        '{Db.escaped m.oleanHash}' where name = '{Db.escaped m.name}';\n") ++ "commit;"
+
+/-- The runtime's fixed line when an allocation fails (`lean_internal_panic_out_of_memory`).  The
+    exit code is a plain 1, so this line is the only thing that tells an OOM from any other failure. -/
+private def oomPanic : String := "INTERNAL PANIC: out of memory"
+
+/-- Why a `syntax-rows` child that exited nonzero produced no rows, naming the memory cap when the
+    runtime ran out of memory under it.  `scripts/cap` exports `CAP_MEM_MB`, the limit it set. -/
+private def childCause (o : IO.Process.Output) : IO String := do
+  let code := if o.exitCode > 128 then s!"was killed by signal {o.exitCode - 128}" else s!"exited {o.exitCode}"
+  unless (o.stderr.splitOn "\n").any (·.trimAscii.toString == oomPanic) do
+    return s!"the `syntax-rows` child {code}; its stderr is above"
+  match ← IO.getEnv "CAP_MEM_MB" with
+  | some mb => return s!"the `syntax-rows` child ran out of memory under scripts/cap's address-space \
+      limit of {mb} MB (`ulimit -v`); raise it: `CAP_MEM_MB=<more than {mb}> lean-refactor index`"
+  | none => return s!"the `syntax-rows` child ran out of memory with no scripts/cap limit in effect \
+      (CAP_MEM_MB unset): the machine's memory or an outer `ulimit -v` was exhausted"
+
 /-- A build directory outlives the sources that produced it: renaming `Fredy` to `Freyd` left 583
     `Fredy/*.ilean` behind in this repository's `.lake`, one of which still imports a package that is
     no longer required, so importing the scan as a whole failed outright.  An artefact whose source
@@ -153,8 +177,7 @@ private def withSources (scanned : Array Module) : IO (Array Module × Nat) := d
 public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × Nat) := do
   if full then
     -- Drop the WAL and SHM too, so a stale write-ahead log cannot be replayed into the fresh file.
-    for f in #[dbPath, dbPath ++ "-wal", dbPath ++ "-shm"] do
-      try IO.FS.removeFile f catch _ => pure ()
+    for f in #[dbPath, dbPath ++ "-wal", dbPath ++ "-shm"] do Db.removeIfPresent f
   _ ← Db.ensureSchema dbPath
   let (scanned, orphaned) ← withSources (← scanDir buildDir "")
   let stored ← storedModules dbPath
@@ -179,17 +202,21 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   -- Each module's syntax tree is one full elaboration, so one process must not hold the
   -- environments of many files — measured at 18.3 GB on this repository — and every tree is built
   -- in a CHILD process that prints the flattened rows and exits.  The child is THIS binary, not
-  -- `lake exe`: the parent is by construction the up-to-date build.  A failed child prints its
-  -- stderr and the module still gets its rows — the semantic rows are the freshness authority, and
-  -- a module that `ofModules` just imported cleanly elaborates fine here, so a failure is a broken
-  -- build, not a reason to keep the module stale and retry every refresh.
+  -- `lake exe`: the parent is by construction the up-to-date build.  A child that dies leaves its
+  -- module without hashes, so the next refresh retries it, and the refresh throws naming it.
   let self := (← IO.appPath).toString
   let outputs ← mapFilesParallel (← scanJobs) (stale.map (·.source)) fun path =>
-    IO.Process.output { cmd := self, args := #["syntax-rows", path] }
+    tryCatch (IO.Process.output { cmd := self, args := #["syntax-rows", path] }) fun e =>
+      throw <| IO.userError s!"{path}: cannot spawn the `syntax-rows` child: {e}"
   let mut groups : Array (Array String) := Array.replicate Db.childGroupCount #[]
-  for output in outputs do
-    groups := (groups.zip (Db.childGroups output.stdout)).map fun (a, b) => a ++ b
+  let mut failed : Array (String × String) := #[]
+  for (m, output) in stale.zip outputs do
     unless output.stderr.isEmpty do IO.eprint output.stderr
+    let parsed ← if output.exitCode == 0 then pure (Db.childGroups output.stdout)
+      else Except.error <$> childCause output
+    match parsed with
+    | .ok gs => groups := (groups.zip gs).map fun (a, b) => a ++ b
+    | .error cause => failed := failed.push (m.name, cause)
   let syntaxRows := groups[0]!
   let stmtRows := groups[1]!
   Db.importRows dbPath "decl_range" declRanges
@@ -197,12 +224,13 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   Db.importRows dbPath "decl_info" oleanRows.declInfos
   Db.importRows dbPath "dep" oleanRows.deps
   Db.importRows dbPath "import_edge" oleanRows.imports
-  -- The `module` rows go in BEFORE the syntax nodes that intern their names against them.
+  -- The `module` rows go in BEFORE the syntax nodes that intern their names against them, but with
+  -- EMPTY hashes: the hashes are what marks a module up to date, so `recordHashes` writes them last,
+  -- and a write that fails anywhere before it leaves every module stale.
   -- Numbering from the largest id ever handed out, not from the row count: a module deleted and
   -- re-inserted must get a fresh id, or the untouched modules' syntax nodes point at the wrong one.
   let firstId ← (· + 1) <$> Db.queryNat dbPath "select coalesce(max(id), 0) as m from module;" "m"
-  Db.importRows dbPath "module" (stale.mapIdx fun i m =>
-    Db.row #[toString (firstId + i), m.name, m.source, m.ileanHash, m.oleanHash])
+  Db.importRows dbPath "module" (stale.mapIdx fun i m => Db.row #[toString (firstId + i), m.name, m.source, "", ""])
   Db.importRows dbPath "syntax_node_in" syntaxRows
   Db.importRows dbPath "decl_stmt_in" stmtRows
   Db.importRows dbPath "src_ref" groups[2]!
@@ -213,7 +241,14 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   -- gigabyte of freed pages the file never gives back on its own.  Only on `full`: an incremental
   -- refresh's freelist is exactly what the NEXT refresh's staging writes into, so compacting it
   -- would trade seconds for pages about to be reallocated.
+  let failedNames := failed.foldl (fun (s : Std.HashSet String) (n, _) => s.insert n) ∅
+  recordHashes dbPath (stale.filter (!failedNames.contains ·.name))
   if full then Db.exec dbPath "vacuum;"
+  unless failed.isEmpty do
+    throw <| IO.userError <| String.intercalate "\n" <|
+      (failed.map fun (n, cause) => s!"{n}: {cause}").toList ++
+      [s!"{failed.size} of {stale.size} module(s) failed extraction; their hashes are not recorded, \
+        so the next `lean-refactor index` retries them"]
   return (stale.size, removed.size, orphaned)
 
 /-- `lean-refactor index [--full]`: refresh and print a one-line summary. Returns the process exit code. -/
