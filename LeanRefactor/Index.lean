@@ -65,7 +65,9 @@ private partial def scanDir (buildDir relDir : String) : IO (Array Module) := do
 
 /-- The `module` table as a map from name to the stored hash pair. -/
 private def storedModules (dbPath : String) : IO (Std.HashMap String (String × String)) := do
-  let sql := "select name, ilean_hash, olean_hash from module;"
+  -- A module whose extraction failed keeps its row with no hashes recorded (NULL); '' matches no
+  -- scanned hash, so it reads as stale and the next run retries it, as the failure report promises.
+  let sql := "select name, coalesce(ilean_hash, '') as ilean_hash, coalesce(olean_hash, '') as olean_hash from module;"
   let .arr rows ← Db.query dbPath sql | throw <| IO.userError s!"{dbPath}: `{sql}` did not return an array"
   let mut map : Std.HashMap String (String × String) := {}
   for row in rows do
