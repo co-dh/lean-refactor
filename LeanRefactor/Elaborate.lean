@@ -14,17 +14,18 @@ public structure HeaderError where
   parsed : Bool
   messages : MessageLog
 
-/-- The setup lake handed `lean` when it last built `mainModule`: `.lake/build/ir/<M>.setup.json`.
-    The last build's and not a fresh `lake setup-file`'s, because that one BUILDS the imports first,
-    and the tool reads the artefacts on disk as they are — a declaration edited ahead of a refactor
-    must not be rebuilt under the files still being read against its old form. -/
-public def setupOf (path : String) (mainModule : Name) : IO ModuleSetup := do
-  let file := mainModule.components.foldl (fun p c => p / c.toString) (System.FilePath.mk Db.irDir)
-    |>.addExtension "setup.json"
-  unless ← file.pathExists do
-    throw <| IO.userError s!"{path}: {file} does not exist, so lake has not built `{mainModule}` and \
-      the dynamic libraries its imports need are unknown; run `lake build {mainModule}` first"
-  ModuleSetup.load file
+/-- `lake setup-file path`, the setup Lake hands the editor for a file no target builds: its last
+    line of output is the `ModuleSetup`. -/
+private def lakeSetupFile (path : String) (built : System.FilePath) : IO ModuleSetup := do
+  let out ← IO.Process.output { cmd := "lake", args := #["setup-file", path] }
+  let fail (why : String) : IO ModuleSetup := throw <| IO.userError s!"{path}: {built} does not exist \
+    (no build wrote it) and `lake setup-file {path}` {why}; run `lake build` on the module first"
+  if out.exitCode != 0 then return ← fail s!"exited {out.exitCode}: {out.stderr.trimAscii}"
+  let some line := (out.stdout.splitOn "\n").reverse.find? (·.startsWith "{")
+    | fail s!"printed no setup: {out.stdout.trimAscii}"
+  match Json.parse line >>= fromJson? with
+  | .ok setup => return setup
+  | .error e => fail s!"printed a setup that does not parse: {e}"
 
 /-- Every `[name, hash]` pair anywhere in a lake trace: how a trace lists each input it hashed. -/
 private partial def hashPairs : Json → Array (String × String)
@@ -75,6 +76,18 @@ public def checkLibraries (path : String) (mainModule : Name) (setup : ModuleSet
           {copy} is at {now}: .lake mixes two builds, and loading the library would run native code \
           compiled against another form of the `.olean`s it is imported with.  {fix}"
 
+/-- The setup lake handed `lean` when it last built `mainModule`: `.lake/build/ir/<M>.setup.json`,
+    checked against the libraries on disk.  The last build's and not a fresh `lake setup-file`'s,
+    because that one BUILDS the imports first and the tool reads the artefacts on disk as they are;
+    only a file no build wrote a setup for (one no target builds) asks `lake setup-file`. -/
+public def setupOf (path : String) (mainModule : Name) : IO ModuleSetup := do
+  let file := mainModule.components.foldl (fun p c => p / c.toString) (System.FilePath.mk Db.irDir)
+    |>.addExtension "setup.json"
+  unless ← file.pathExists do return ← lakeSetupFile path file
+  let setup ← ModuleSetup.load file
+  checkLibraries path mainModule setup
+  return setup
+
 /-- Build the environment `header` imports, set up as `lean` sets it up under lake: the module's
     `dynlibs` loaded and its `plugins` handed to the import, so an imported `initialize` that calls
     an `@[extern]` finds the native symbol (without them: "Could not find native implementation of
@@ -82,11 +95,14 @@ public def checkLibraries (path : String) (mainModule : Name) (setup : ModuleSet
 public def headerEnv (path : String) (header : Elab.HeaderSyntax) (messages : MessageLog)
     (inputCtx : Parser.InputContext) (mainModule : Name) : IO (Environment × MessageLog × Options) := do
   let setup ← setupOf path mainModule
-  checkLibraries path mainModule setup
-  setup.dynlibs.forM Lean.loadDynlib
+  -- the toolchain's own libraries (Lake's, for a lakefile) are already this process's: loaded again
+  -- they register their environment extensions twice
+  let sysroot := (← findSysroot).toString
+  let theirs (l : System.FilePath) := !l.toString.startsWith sysroot
+  (setup.dynlibs.filter theirs).forM Lean.loadDynlib
   let opts := setup.options.toOptions
   let (env, messages) ← Elab.processHeader header opts messages inputCtx
-    (plugins := setup.plugins) (mainModule := mainModule)
+    (plugins := setup.plugins.filter theirs) (mainModule := mainModule)
   return (env, messages, opts)
 
 /-- Parse `source`'s import header, build the environment its imports define, and run the frontend

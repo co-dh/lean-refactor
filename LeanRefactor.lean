@@ -68,6 +68,16 @@ private def usageSitesIn (references : Lsp.ModuleRefs) (declModule declName : St
   | none => #[]
   | some info => info.usages.map siteOf
 
+/-- The name a reference record's constant is written by. A `private` declaration's records carry
+    `_private.<module>.0.<name>`, which no source spells, so without this every site of one is
+    invisible to a command given the name the source declares it by. -/
+private def userNameOf (name : String) : String :=
+  if name.startsWith "_private." then
+    match name.splitOn ".0." with
+    | _ :: rest@(_ :: _) => ".0.".intercalate rest
+    | _ => name
+  else name
+
 /-- The sites of `declName` whatever module declared it, with `part` picking which end of the record
     is wanted: `usages` where the name is used, `definition?` the BINDING site where it is introduced.
     They are separate edits — moving the uses alone leaves the file naming a declaration that no
@@ -77,7 +87,7 @@ private def sitesNamed (references : Lsp.ModuleRefs) (declName : String)
   let mut sites := #[]
   for (ident, info) in references do
     if let .const _ name := ident then
-      if name == declName then sites := sites ++ (part info).map siteOf
+      if userNameOf name == declName then sites := sites ++ (part info).map siteOf
   return sites
 
 /-- Uses written through NOTATION.  `∇ n` is `CartBicat.«∇» n` after expansion, but the source has
@@ -570,7 +580,6 @@ private def capPath : IO String := do
 private def leanArgs (path : String) : IO (Array String) := do
   let mainModule := (← IO.ofExcept (moduleNameOfPath path)).toName
   let setup ← Elaborate.setupOf path mainModule
-  Elaborate.checkLibraries path mainModule setup
   let flags := setup.dynlibs.map (s!"--load-dynlib={·}") ++ setup.plugins.map (s!"--plugin={·}")
   pure (#["lake", "env", "lean"] ++ flags ++ #[path])
 
@@ -833,49 +842,48 @@ private partial def syntaxHasIdent (name : String) (stx : Syntax) : Bool :=
   (stx.isIdent && stx.getId.toString == name) ||
     stx.getArgs.any (syntaxHasIdent name)
 
-/-- Replace only the parsed term after `:=` in a declaration.  The operation previews by default and
-    restores the source after either an elaboration failure or a capped repository-build failure. -/
-private def replaceDeclarationBody (path declName replacement : String) (apply : Bool) : IO UInt32 := do
+/-- The edit that replaces `declName`'s parsed term after `:=` (`body`) or its whole command. -/
+private def replacementEdit (path source : String) (fileMap : FileMap) (commands : Array Syntax)
+    (body : Bool) (declName replacement : String) : Except String Edit := do
+  unless body do
+    let ((start, stop), _) ← (declarationSite source commands declName).mapError (s!"{path}: " ++ ·)
+    -- the command's range runs on to the next command, so the blank lines that separate the two
+    -- are part of it: they are kept, or every replaced declaration ran into the one after it
+    let old := String.Pos.Raw.extract source start stop
+    let gap := old.drop (old.trimAsciiEnd.toString.length)
+    return { start, stop, line := (fileMap.toPosition start).line + 1,
+             replacement := replacement.trimAscii.toString ++ gap.toString }
+  let declaration ← (declarationSyntax commands declName).mapError (s!"{path}: " ++ ·)
+  let some declVal := firstSyntaxOfKind? ``Lean.Parser.Command.declValSimple declaration
+    | throw s!"{path}: `{declName}` has no simple `:=` body"
+  let some term := declVal.getArgs[1]?
+    | throw s!"{path}: `{declName}` has a malformed simple body"
+  let some range := term.getRange?
+    | throw s!"{path}: `{declName}` body has no source range"
+  return { start := range.start, stop := range.stop,
+           line := (fileMap.toPosition range.start).line + 1, replacement }
+
+/-- Replace declarations of one file, each its whole command or (`body`) only the parsed term after
+    `:=`.  Several pairs are one transaction: every replacement is applied to the one elaboration of
+    the file and the result is gated once, so a change that spans declarations -- a helper and its
+    callers -- costs one repository build and lands or is restored whole.  Preview by default. -/
+private def replaceDeclarations (path : String) (pairs : Array (String × String)) (body : Bool)
+    (apply : Bool) : IO UInt32 := do
   initSearchPath (← findSysroot) (← targetSearchPath)
   let (source, fileMap, commands, _) ← elaborateFile path
-  let some declaration ← okOr s!"{path}: " (declarationSyntax commands declName) | return 1
-  let some declVal := firstSyntaxOfKind? ``Lean.Parser.Command.declValSimple declaration
-    | IO.eprintln s!"{path}: `{declName}` has no simple `:=` body"
-      return 1
-  let some body := declVal.getArgs[1]?
-    | IO.eprintln s!"{path}: `{declName}` has a malformed simple body"
-      return 1
-  let some range := body.getRange?
-    | IO.eprintln s!"{path}: `{declName}` body has no source range"
-      return 1
-  let line := (fileMap.toPosition range.start).line + 1
-  let edit : Edit := {
-    start := range.start
-    stop := range.stop
-    line := (fileMap.toPosition range.start).line + 1
-    replacement := replacement
-  }
-  let updated := applyEdits source #[edit]
-  IO.println s!"replace body of `{declName}` in {path} (line {line})"
+  let what := if body then "body of " else "declaration "
+  let mut edits := #[]
+  for (declName, replacement) in pairs do
+    match replacementEdit path source fileMap commands body declName replacement with
+    | .error message => IO.eprintln message; return 1
+    | .ok edit =>
+        IO.println s!"replace {what}`{declName}` in {path} (line {edit.line})"
+        edits := edits.push edit
   unless apply do
     IO.println "preview only; pass --apply to write"
     return 0
-  gatedWrite path source updated s!"replacing the body of `{declName}`"
-
-/-- Replace one complete parsed declaration command. This is the structural counterpart of
-    `replace --body`: it is intended for changing a theorem's statement together with its proof while
-    retaining AST-selected boundaries, preview-by-default behavior, and transactional validation. -/
-private def replaceDeclaration (path declName replacement : String) (apply : Bool) : IO UInt32 := do
-  initSearchPath (← findSysroot) (← targetSearchPath)
-  let (source, _, commands, _) ← elaborateFile path
-  let some ((start, stop), _) ← okOr s!"{path}: " (declarationSite source commands declName) | return 1
-  let edit : Edit := { start, stop, line := 0, replacement := replacement.trimAscii.toString ++ "\n" }
-  let updated := applyEdits source #[edit]
-  IO.println s!"replace declaration `{declName}` in {path}"
-  unless apply do
-    IO.println "preview only; pass --apply to write"
-    return 0
-  gatedWrite path source updated s!"replacing declaration `{declName}`"
+  let names := ", ".intercalate (pairs.map (s!"`{·.1}`")).toList
+  gatedWrite path source (applyEdits source edits) s!"replacing the {what}{names}"
 
 /-- Remove one complete parsed declaration command. Preview by default; on application, restore the
     source if either the edited file or the capped repository build fails. -/
@@ -961,6 +969,15 @@ private def insertionPoint? (commands : Array Syntax) (ns : Name) : Option Strin
     state := scopeStep state cmd
   return best
 
+/-- A `private` declaration moved to another file is out of reach of every use it leaves behind in
+    its own, so it arrives without the modifier: the first line of its header that starts with
+    `private`, after any doc comment and attributes, loses it. -/
+private def public_ (text : String) : String :=
+  let lines := text.splitOn "\n"
+  match lines.findIdx? (·.startsWith "private ") with
+  | some i => "\n".intercalate (lines.set i ((lines[i]!.drop "private ".length).toString))
+  | none => text
+
 private def moveDeclaration (sourcePath declName targetPath : String) (apply : Bool)
     (omitBinders? : Option String := none) (targetNamespace? : Option String := none) : IO UInt32 := do
   initSearchPath (← findSysroot) (← targetSearchPath)
@@ -968,6 +985,7 @@ private def moveDeclaration (sourcePath declName targetPath : String) (apply : B
   let some ((start, stop), ns) ←
     okOr s!"{sourcePath}: " (declarationSite source sourceCommands declName) | return 1
   let declarationText := (String.Pos.Raw.extract source start stop).trimAscii.toString
+  let declarationText := if sourcePath == targetPath then declarationText else public_ declarationText
   let text := match omitBinders? with
     | some binders => "omit " ++ binders ++ " in\n" ++ declarationText
     | none => declarationText
@@ -1077,11 +1095,12 @@ private def commandCtxAt? (trees : Array Elab.InfoTree) (p : String.Pos.Raw) :
       info.stx.getRange?.bind fun r => if r.start ≤ p && p < r.stop then some c else none
     | _ => none
 
-/-- The global constants `id` names in `c`'s scope over `env`; a reading that leaves trailing
+/-- The global constants `id` names in `c`'s scope over `env`, by the names their sources declare
+    them by (a `private` one's, not its `_private` mangling); a reading that leaves trailing
     components as projections is not a name for a constant. -/
 private def resolvedAt (c : Elab.CommandContextInfo) (env : Environment) (id : Name) : List Name :=
   (ResolveName.resolveGlobalName env c.options c.currNamespace c.openDecls id).filterMap fun
-    | (n, []) => some n | _ => none
+    | (n, []) => some ((privateToUserName? n).getD n) | _ => none
 
 /-- The identifier a site's text is, read by the term parser, and whether it is `@`-explicit. -/
 private def siteIdent? (env : Environment) (text : String) : Option (Bool × Name) := do
@@ -1134,10 +1153,12 @@ private def spellingFor (trees : Array Elab.InfoTree) (start : String.Pos.Raw) (
   -- must already be in scope at the site, or the rewritten use could not elaborate.
   let added := c.env.addDeclCore 0
     (.axiomDecl { name := new, levelParams := [], type := .sort .zero, isUnsafe := false }) none (doCheck := false)
+  -- a `private` survivor, or a `private` name already taken, is in the environment by its mangling
+  let declared := c.env.contains new || c.env.contains (mkPrivateName c.env new)
   let env ← if survivor then
-      if c.env.contains new then pure c.env
+      if declared then pure c.env
       else .error s!"line {line}: the survivor `{new}` is not in scope here"
-    else if c.env.contains new then .error s!"line {line}: `{new}` is already declared"
+    else if declared then .error s!"line {line}: `{new}` is already declared"
     else match added with
       | Except.ok env => pure env
       | .error _ => .error s!"line {line}: cannot add `{new}` to the scope there to resolve against"
@@ -4188,7 +4209,7 @@ private def usage : String := String.intercalate "\n" [
   "replace",
   row "collapse d r" "replace duplicate d by its survivor r",
   row "  --drop-arg n" "... dropping argument n at every call",
-  row "replace d text" "replace d entirely",
+  row "replace (d text)..." "replace each d entirely, in one file and one build",
   row "  --body" "... replace only the body of d",
   row "remove d" "remove d",
   "",
@@ -4199,7 +4220,7 @@ private def usage : String := String.intercalate "\n" [
   row "insert-arg d n term" "insert term before argument n of every application of d, ⟨…⟩ included;",
   row "" "  a pattern gets _; a parameter with a default leaves the terms that omit it alone;",
   row "" "  refuses a file that does not elaborate, or a pattern the edit would not reach",
-  row "remove-param d binder n" "remove a parameter Lean reports unused",
+  row "remove-param d binder n" "remove a parameter that is unused, or only passed on to d itself",
   "",
   "cleanup",
   row "unused [f:line:col]" "remove unused binders",
@@ -4450,10 +4471,14 @@ def main (args : List String) : IO UInt32 := do
   | ["collapse", declName, replacement] =>
       if dropArg? == some 0 then IO.eprintln "`--drop-arg` is 1-based"; return 2
       return ← collapseGlob (selector?.getD wholeRepository) declName replacement dropArg? apply
-  | ["replace", declName, text] =>
+  | "replace" :: declName :: text :: more =>
+      let rec pairsOf : List String → Option (List (String × String))
+        | [] => some []
+        | d :: t :: rest => ((d, t) :: ·) <$> pairsOf rest
+        | [_] => none
+      let some rest := pairsOf more | IO.eprintln usage; return 2
       let .ok path ← fileOf selector? declName | return 2
-      if body then return ← replaceDeclarationBody path declName text apply
-      return ← replaceDeclaration path declName text apply
+      return ← replaceDeclarations path ((declName, text) :: rest).toArray body apply
   | ["remove", declName] =>
       let .ok path ← fileOf selector? declName | return 2
       return ← removeDeclaration path declName apply
@@ -4569,13 +4594,6 @@ def main (args : List String) : IO UInt32 := do
     | .ok edit => edits := edits.push edit
   if mode == "parameter" then
     let some binderName := binderName? | IO.eprintln "missing binder name"; return 2
-    let warningNeedle := s!"unused variable `{binderName}`"
-    let mut hasUnusedWarning := false
-    for msg in frontend.commandState.messages.toList do
-      if (toString (← msg.data.format)).contains warningNeedle then hasUnusedWarning := true
-    unless hasUnusedWarning do
-      IO.eprintln s!"refusing: Lean did not report `{binderName}` as unused"
-      return 1
     let declInfo? := ilean.references.get? (.const declModule declName)
     let some definitionSite := declInfo?.bind (·.definition?) |>.map siteOf
       | IO.eprintln "declaration definition is absent from this module's semantic references"
@@ -4593,6 +4611,19 @@ def main (args : List String) : IO UInt32 := do
       the argument being edited); edit those calls by hand first"
     return 1
   edits := kept
+  if mode == "parameter" then
+    let some binderName := binderName? | IO.eprintln "missing binder name"; return 2
+    let warningNeedle := s!"unused variable `{binderName}`"
+    let mut hasUnusedWarning := false
+    for msg in frontend.commandState.messages.toList do
+      if (toString (← msg.data.format)).contains warningNeedle then hasUnusedWarning := true
+    -- Lean counts a parameter as used when the declaration only hands it on to its own recursive
+    -- calls; those calls are among `sites`, so the file without the binder and without those
+    -- arguments still elaborating is what says no other use was left.
+    unless hasUnusedWarning do
+      unless (← elaborationErrors env sourcePath (applyEdits source edits)).isEmpty do
+        IO.eprintln s!"refusing: `{binderName}` is used beyond being passed on to `{declName}` itself"
+        return 1
   -- `insert-call-arg` produces a zero-width edit, which spans no text to report as removed; the
   -- preview is the only thing the caller sees before `--apply`, so it must name the real operation.
   for edit in edits do
@@ -4600,6 +4631,10 @@ def main (args : List String) : IO UInt32 := do
       IO.println s!"line {edit.line}: insert {repr edit.replacement}"
     else
       IO.println s!"line {edit.line}: remove {repr (String.Pos.Raw.extract source edit.start edit.stop)}"
+  if apply && mode == "parameter" then
+    -- the signature changes, so the callers in other files (taken first with `remove-arg --in`)
+    -- are held to it by the build
+    return ← gatedWrite sourcePath source (applyEdits source edits) s!"removing `{binderName?.getD ""}` from `{declName}`"
   if apply then
     IO.FS.writeFile sourcePath (applyEdits source edits)
     IO.println s!"applied {edits.size} edit(s) to {sourcePath}"

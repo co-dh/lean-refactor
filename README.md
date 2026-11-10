@@ -88,7 +88,7 @@ move
 replace
   collapse d r                            replace duplicate d by its survivor r
     --drop-arg n                          ... dropping argument n at every call
-  replace d text                          replace d entirely
+  replace (d text)...                     replace each d entirely, in one file and one build
     --body                                ... replace only the body of d
   remove d                                remove d
 
@@ -99,7 +99,7 @@ arguments
   insert-arg d n term                     insert term before argument n of every application of d, ⟨…⟩ included;
                                             a pattern gets _; a parameter with a default leaves the terms that omit it alone;
                                             refuses a file that does not elaborate, or a pattern the edit would not reach
-  remove-param d binder n                 remove a parameter Lean reports unused
+  remove-param d binder n                 remove a parameter that is unused, or only passed on to d itself
 
 cleanup
   unused [f:line:col]                     remove unused binders
