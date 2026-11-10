@@ -562,16 +562,16 @@ private def capPath : IO String := do
   let up (p : System.FilePath) : System.FilePath := p.parent.getD ⟨"."⟩
   pure (up (up (up (up exe))) / "scripts" / "cap").toString
 
-/-- Elaborating ONE file has to load the package's precompiled dynlibs itself.  `lake build` passes
-    `--load-dynlib` for a package with `precompileModules`, and `lake env lean <file>` does not, so
-    every `@[extern]` in the file's dependency cone fails as "could not find native implementation
-    of external declaration" and the gate rejects an edit that is in fact fine. -/
+/-- Elaborating ONE file has to load the precompiled dynlibs and plugins its imports need itself:
+    `lake build` passes them, `lake env lean <file>` does not, so every `@[extern]` in the cone fails
+    as "could not find native implementation of external declaration".  They come from the setup lake
+    wrote at the module's last build, because a dependency package's libraries (a nested package's
+    `require`) live in THAT package's `.lake`, which no listing of this one's finds. -/
 private def leanArgs (path : String) : IO (Array String) := do
-  let libDir : System.FilePath := ".lake" / "build" / "lib"
-  let mut flags : Array String := #[]
-  if ← libDir.pathExists then
-    for e in ← libDir.readDir do
-      if e.path.extension == some "so" then flags := flags.push s!"--load-dynlib={e.path}"
+  let mainModule := (← IO.ofExcept (moduleNameOfPath path)).toName
+  let setup ← Elaborate.setupOf path mainModule
+  Elaborate.checkLibraries path mainModule setup
+  let flags := setup.dynlibs.map (s!"--load-dynlib={·}") ++ setup.plugins.map (s!"--plugin={·}")
   pure (#["lake", "env", "lean"] ++ flags ++ #[path])
 
 /-- The check every transactional refactor is measured against.  NO TARGET is named on purpose: the

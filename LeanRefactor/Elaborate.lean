@@ -50,13 +50,17 @@ public def checkLibraries (path : String) (mainModule : Name) (setup : ModuleSet
       built against is unknown; {fix}"
   let json ← IO.ofExcept <| (Json.parse (← IO.FS.readFile trace)).mapError (s!"{trace}: " ++ ·)
   let recorded := hashPairs (json.getObjValD "inputs")
+  -- Lake's resolution of the workspace NOW: each package's `<root>/.lake/build/lib/lean` on the path.
+  let resolved := ((← IO.getEnv "LEAN_PATH").map System.SearchPath.parse |>.getD []).filterMap (·.parent)
   for lib in loaded do
     let some (_, built) := recorded.find? (·.1 == lib.toString) | continue
     -- A `.lake` copied from another tree keeps that tree's library paths in its setups while the
     -- imports read THIS tree's `.olean`s, so this tree's copy of the library must match as well.
+    -- A library already where the workspace resolves its package (a `require`d package's own
+    -- `.lake`) is the one in use; there is no copy of it under this package's `.lake`.
     let parts := lib.components
-    let local? := parts.findIdx? (· == ".lake") |>.map fun i =>
-      System.mkFilePath (parts.drop i)
+    let local? := if lib.parent.any resolved.contains then none
+      else parts.findIdx? (· == ".lake") |>.map fun i => System.mkFilePath (parts.drop i)
     let copies := match local? with
       | some l => if l.toString != lib.toString then #[lib, l] else #[lib]
       | none => #[lib]

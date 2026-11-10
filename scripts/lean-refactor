@@ -11,12 +11,33 @@
 #
 # `cap` bounds address space: belt to `claimElaboration`'s braces (LeanRefactor.lean), which catches
 # the KNOWN way to accumulate Lean `Environment`s — looping over files in one process — but not a
-# runaway that is not a file loop. See the measurements in scripts/cap.
+# runaway that is not a file loop. See the measurements in scripts/cap. Its limit is `CAP_MEM_MB` from
+# the environment, inherited by every build the tool starts, so a package that needs more sets it.
 #
 # Build on EVERY invocation, not just when the binary is missing: the workflow for a refactor the tool
 # cannot yet express is "improve the tool, then use the new operation", and a stale binary makes that
 # silently run the old code. A no-op lake resolve costs ~100 ms, once — `forkPerFile`'s children re-exec
 # `IO.appPath`, not this script, so it does not multiply.
+#
+# `-C <dir>`, first, as in `git -C`: run against the lake package at <dir>. A nested package
+# (`require parent from ".."`) has a `.lake` of its own, so the tool starts there to read its
+# `.ilean`s, write its index and build its default targets.
+#
+# `index` rewrites the one sqlite file every lookup reads, and other tools refresh it too, so two
+# writers at once are routine: they take turns on a lock beside the database.
 root=$(dirname "$(dirname "$(readlink -f "$0")")")
+if [ "$1" = -C ]; then
+  [ $# -ge 2 ] || { echo "lean-refactor: -C needs a directory" >&2; exit 2; }
+  cd "$2" || { echo "lean-refactor: -C $2: cannot enter that directory" >&2; exit 1; }
+  shift 2
+fi
+[ -f lakefile.lean ] || [ -f lakefile.toml ] || {
+  echo "lean-refactor: $(pwd) has no lakefile.lean or lakefile.toml; run from a lake package root or pass -C <dir>" >&2
+  exit 1
+}
 (cd "$root" && ./scripts/cap lake build -q) || exit 1
+if [ "$1" = index ]; then
+  mkdir -p .lake/build || exit 1
+  exec flock .lake/build/refactor-index.lock "$root/scripts/cap" lake env "$root/.lake/build/bin/lean-refactor" "$@"
+fi
 exec "$root/scripts/cap" lake env "$root/.lake/build/bin/lean-refactor" "$@"
