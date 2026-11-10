@@ -73,4 +73,38 @@ def unknownMatch (a : Nat) : Nat :=
 
 theorem gateDrops (a : Nat) (h : step a 11 = .ok 0) : a + 11 = 0 := Except.ok.inj h
 
+def matchSome (k : Nat) : Nat :=
+  match look k with
+  | none => 0
+  | some r => r + 1
+
+def body (a : Nat) : Except String Nat := step a 13
+
+def doLast (a : Nat) : Except String Nat := do
+  let y := a
+  step y 14
+
+def altRhs (a : Nat) (b : Bool) : Except String Nat :=
+  match b with
+  | true => step a 15
+  | false => .ok a
+
+def branch (a : Nat) (b : Bool) : Except String Nat :=
+  if b then step a 16 else .ok a
+
+def lam : Nat → Except String Nat := fun a => step a 17
+
+def arg (a : Nat) : Except String Nat := Except.map id (step a 18)
+
+structure Pair where
+  v : Except String Nat
+
+def field (a : Nat) : Pair := { v := step a 19 }
+
+def optBody (k : Nat) : Option Nat := look (k + 1)
+
+def proj (a : Nat) : Bool := (step a 12).toBool
+
+theorem mention : True := by simp [step]
+
 end Fix.Use

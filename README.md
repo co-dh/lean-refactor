@@ -78,7 +78,9 @@ rename
   infix d token                           give d the infix notation token
   notate d --form f                       write every application of d as f; $0, $1, ... are its explicit arguments
   unwrap d                                d's Except/Option result became plain: let x ← d a to :=, (← d a) to (d a),
-                                            let some r := d a | alt to let r := d a, d a = .ok r (some, pure) to d a = r
+                                            let some r := d a | alt to let r := d a, d a = .ok r (some, pure) to d a = r,
+                                            match d a with | .ok p (some p) to | p, its .error/none arms dropped;
+                                            where Except/Option is still expected, d a to pure (d a)
 
 move
   move d dest                             dest is another .lean file, or a declaration or section to sit before

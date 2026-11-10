@@ -2825,8 +2825,11 @@ private def notateStage (path declName form stagePath : String) : IO UInt32 := d
 `unwrap d` follows `d : … → Except ε α` (or `Option α`) becoming `d : … → α`.  Each use of `d`, from
 the info trees as for `notate`, is rewritten by the syntax around its call: `let x ← d a` and `x ← d a`
 to `:=`, `(← d a)` to `(d a)`, `let some r := d a | alt` and `let .ok r := d a | alt` to
-`let r := d a`, and an equation `d a = .ok r` (`Except.ok`, `some`, `pure`, either side) to `d a = r`.
-Any other shape is listed and left alone.  The callers fail BEFORE the edit, so "elaborates" cannot be
+`let r := d a`, an equation `d a = .ok r` (`Except.ok`, `some`, `pure`, either side) to `d a = r`, and
+`match d a with` keeps its `.ok p`/`some p` alternatives as `p` and drops `.error _`/`none`.  Anywhere
+else the elaborator still expects `Except`/`Option` of the call, it becomes `pure (d a)`.  An unapplied
+`d` no value is expected of (`simp [d]`) is reported as a mention; any other shape is listed and left
+alone.  The callers fail BEFORE the edit, so "elaborates" cannot be
 the gate: a rewrite is kept only if no error sits where it wrote, or where there was none before. -/
 
 /-- What `unwrap` strips from the other side of an equation or from a `let … | alt` pattern. -/
@@ -2846,11 +2849,58 @@ private partial def unwrappedArg? (c : Elab.CommandContextInfo) (env : Environme
   guard (names.any unwrapCtors.contains)
   args[0]?
 
-/-- The edits that unwrap the use of `d` whose identifier is `leaf`, or why its shape is not one
-    `unwrap` knows.  The call is the identifier under `@`, `(e).d` or `e |>.d`, and the application it
-    heads; brackets around the call are looked through. -/
+/-- The constructor names `fn` can denote in `c`'s scope; a leading-dot name is read against the two
+    types `d` may have returned. -/
+private def ctorNamesAt (c : Elab.CommandContextInfo) (env : Environment) (fn : Syntax) : List Name :=
+  if fn.isOfKind ``Lean.Parser.Term.dotIdent then [``Except, ``Option].map (· ++ fn[1].getId)
+  else if fn.isIdent then resolvedAt c env fn.getId else []
+
+/-- Whether pattern `stx` matches only the failure of the old result: `none` or `.error x`. -/
+private partial def failurePattern (c : Elab.CommandContextInfo) (env : Environment) (stx : Syntax) : Bool :=
+  if stx.isOfKind ``Lean.Parser.Term.paren then failurePattern c env stx[1]
+  else (ctorNamesAt c env stx).contains ``Option.none ||
+    ((appArgs stx).any (·.size == 1) && (ctorNamesAt c env stx[0]).contains ``Except.error)
+
+/-- `match d a with | .ok p => e | .error _ => f` (`some`/`none` alike) once `d a` is the plain value:
+    each success alternative keeps its body with the constructor taken off its pattern, each failure
+    alternative goes, a `_` alternative stays as written.  Refused for several discriminants or any
+    other pattern, where which alternatives survive is not decided by the constructor alone. -/
+private def unwrapMatch (c? : Option Elab.CommandContextInfo) (env : Environment) (source : String)
+    (m : Syntax) : Except String (Array Edit) := do
+  let some c := c? | throw "a `match` read outside any command's scope"
+  unless m[3].getSepArgs.size == 1 do throw "a `match` on several discriminants"
+  let alts := m[5][0].getArgs
+  let mut edits := #[]
+  let mut keep := #[]
+  for alt in alts do
+    let some pat := (alt[1].getSepArgs.flatMap (·.getSepArgs))[0]?.filter fun _ =>
+        alt[1].getSepArgs.size == 1 | throw "a `match` alternative with several patterns"
+    if let some arg := unwrappedArg? c env pat then
+      let some r := pat.getRange? | throw "a pattern with no source range"
+      let some a := arg.getRange? | throw "a pattern with no source range"
+      let e : Edit := { start := r.start, stop := r.stop, line := 0,
+                        replacement := String.Pos.Raw.extract source a.start a.stop }
+      edits := edits.push e
+      keep := keep.push true
+    else if failurePattern c env pat then keep := keep.push false
+    else if pat.isOfKind ``Lean.Parser.Term.hole then keep := keep.push true
+    else throw s!"a `match` alternative whose pattern is neither success, failure nor `_`"
+  let some first := keep.findIdx? id | throw "a `match` none of whose alternatives is a success"
+  let range (i : Nat) := (alts[i]!.getRange?).getD ⟨0, 0⟩
+  -- A failure alternative before the first kept one goes up to the next; after it, from the previous.
+  for i in [0:alts.size] do
+    unless keep[i]! do
+      edits := edits.push <| if i < first then { start := (range i).start, stop := (range (i + 1)).start, line := 0 }
+        else { start := (range (i - 1)).stop, stop := (range i).stop, line := 0 }
+  return edits
+
+/-- The edits that unwrap the use of `d` whose identifier is `leaf`, `none` for a mention with nothing
+    to unwrap, or why its shape is not one `unwrap` knows.  The call is the identifier under `@`, `(e).d`
+    or `e |>.d`, and the application it heads; brackets around the call are looked through.
+    `expectedHeads s` is the head constant of each expected type the elaborator recorded at `s`. -/
 private def unwrapSite (c? : Option Elab.CommandContextInfo) (env : Environment) (source : String)
-    (leaf : Syntax) (parents : List Syntax) : Except String (Array Edit) := do
+    (expectedHeads : Syntax → Array (Option Name))
+    (leaf : Syntax) (parents : List Syntax) : Except String (Option (Array Edit)) := do
   let text (s : Syntax) : String := match s.getRange? with
     | some r => String.Pos.Raw.extract source r.start r.stop | none => ""
   let replace (s : Syntax) (r : String) : Array Edit := match s.getRange? with
@@ -2881,25 +2931,36 @@ private def unwrapSite (c? : Option Elab.CommandContextInfo) (env : Environment)
   let some qr := q.getRange? | throw "the enclosing syntax has no source range"
   let unwrapped (s : Syntax) : Option Syntax := c?.bind (unwrappedArg? · env s)
   if q.isOfKind ``Lean.Parser.Term.liftMethod && sameRange q[1] inner then
-    return #[{ start := qr.start, stop := ir.start, line := 0 }]
-  if q.isOfKind ``Lean.Parser.Term.doExpr && sameRange q[0] inner then
-    let some decl := above[1]? | throw "a `do` element with no enclosing syntax"
+    return some #[{ start := qr.start, stop := ir.start, line := 0 }]
+  let decl? := above[1]?.filter fun d =>
+    d.isOfKind ``Lean.Parser.Term.doIdDecl || d.isOfKind ``Lean.Parser.Term.doPatDecl
+  if let some decl := decl?.filter fun _ => q.isOfKind ``Lean.Parser.Term.doExpr && sameRange q[0] inner then
     let some i := decl.getArgs.findIdx? (sameRange · q)
-      | throw s!"a `do` statement whose value is the call (inside `{decl.getKind}`)"
-    unless decl.isOfKind ``Lean.Parser.Term.doIdDecl || decl.isOfKind ``Lean.Parser.Term.doPatDecl do
-      throw s!"a `do` statement whose value is the call (inside `{decl.getKind}`)"
+      | throw s!"a `do` binding whose value is the call (inside `{decl.getKind}`)"
     if decl.isOfKind ``Lean.Parser.Term.doPatDecl && !decl[3].getArgs.isEmpty then
       throw s!"`{text decl[0]} ← … | alt`: a refutable pattern bound by `←`"
     let some arrow := decl[i - 1]? | throw "the `←` of the `do` binding is missing"
-    return replace arrow ":="
+    return some (replace arrow ":=")
   if q.isOfKind ``Lean.Parser.Term.doLetElse && sameRange q[4] inner then
-    let some arg := unwrapped q[2] | throw s!"`let {text q[2]} := … | …` does not bind `.ok r` or `some r`"
-    return replace q[2] (text arg) ++ #[{ start := ir.stop, stop := qr.stop, line := 0 }]
+    if let some arg := unwrapped q[2] then
+      return some (replace q[2] (text arg) ++ #[{ start := ir.stop, stop := qr.stop, line := 0 }])
   if q.isOfKind `«term_=_» then
     let other? := if sameRange q[0] inner then some q[2] else if sameRange q[2] inner then some q[0] else none
-    let some other := other? | throw "an equation the call is not a side of"
-    let some arg := unwrapped other | throw s!"an equation whose other side `{text other}` is not `.ok r`, `some r` or `pure r`"
-    return replace other (text arg)
+    if let some arg := other?.bind unwrapped then return some (replace other?.get! (text arg))
+  if q.isOfKind ``Lean.Parser.Term.matchDiscr && sameRange q[1] inner then
+    let some m := above.find? fun s =>
+        s.isOfKind ``Lean.Parser.Term.match || s.isOfKind ``Lean.Parser.Term.doMatch
+      | throw "a `match` discriminant with no `match` around it"
+    return some (← unwrapMatch c? env source m)
+  -- Every other position: the call is still where a value of the old result type is expected, so
+  -- it becomes `pure (d a)` -- decided by the elaborator's expected type there, not by the parent.
+  let heads := expectedHeads call ++ (if sameRange inner call then #[] else expectedHeads inner)
+  if heads.any fun h => h.any ([``Except, ``Option].contains ·) then
+    let r := if call.isIdent then s!"pure {text call}" else s!"pure ({text call})"
+    let e : Edit := { start := ir.start, stop := ir.stop, line := 0, replacement := r }
+    return some #[if fitsIn env source #[] e above then e else { e with replacement := s!"({r})" }]
+  -- An unapplied name no value is expected of (`simp [d]`, `rw [d]`, `unfold d`) is a mention.
+  if sameRange call leaf && heads.isEmpty then return none
   throw s!"the call sits inside `{q.getKind}`"
 
 /-- Position `p` of the original text in the text `edits` produce; inside an edit, that edit's start. -/
@@ -2937,25 +2998,45 @@ private def unwrapStage (path declName stagePath : String) : IO UInt32 := do
   let starts := starts.foldl (fun acc p => if acc.contains p then acc else acc.push p) #[]
   if starts.isEmpty then IO.println s!"{path}: no use of `{declName}`"; return 3
   let at_ (p : String.Pos.Raw) := let q := fileMap.toPosition p; s!"{path}:{q.line}:{q.column}"
+  -- The expected type the elaborator recorded at each term around a use, failed terms included
+  -- (the callers fail now), as the head constant of its reducible normal form.
+  let mut expected : Std.HashMap (Nat × Nat) (Array (Option Name)) := {}
+  for tree in trees do
+    for (ci, info) in tree.foldInfo (init := #[]) (fun ci i acc => acc.push (ci, i)) do
+      let (stx, lctx, ty?) : Syntax × LocalContext × Option Expr := match info with
+        | .ofTermInfo ti => (ti.stx, ti.lctx, ti.expectedType?)
+        | .ofPartialTermInfo pi => (pi.stx, pi.lctx, pi.expectedType?)
+        | _ => (.missing, {}, none)
+      let some ty := ty? | continue
+      let some r := stx.getRange? (canonicalOnly := true) | continue
+      unless starts.any fun p => r.start ≤ p && p < r.stop do continue
+      let head ← ci.runMetaM lctx do pure (← Meta.whnfR (← instantiateMVars ty)).getAppFn.constName?
+      expected := expected.alter (r.start.byteIdx, r.stop.byteIdx) fun hs => some ((hs.getD #[]).push head)
+  let expectedHeads (s : Syntax) : Array (Option Name) :=
+    (s.getRange?.bind fun r => expected[(r.start.byteIdx, r.stop.byteIdx)]?).getD #[]
   let mut sites : Array (Array Edit) := #[]
   let mut unknown := 0
+  let mut mentions := #[]
   for p in starts.qsort (·.byteIdx < ·.byteIdx) do
-    let site : Except String (Array Edit) := match frontend.commands.findSome? (syntaxAt p) with
+    let site : Except String (Option (Array Edit)) := match frontend.commands.findSome? (syntaxAt p) with
       | none => .error "the use has no source syntax"
       | some (leaf, parents) =>
         if !leaf.isIdent then .error s!"`{declName}` is written through notation"
         else
           let c? := commandCtxAt? trees p
-          unwrapSite c? ((c?.map (·.env)).getD frontend.commandState.env) source leaf parents
+          unwrapSite c? ((c?.map (·.env)).getD frontend.commandState.env) source expectedHeads leaf parents
     match site with
-    | .ok es => sites := sites.push (es.map fun e => { e with line := (fileMap.toPosition e.start).line })
+    | .ok (some es) => sites := sites.push (es.map fun e => { e with line := (fileMap.toPosition e.start).line })
+    | .ok none => mentions := mentions.push p
     | .error why => IO.println s!"{at_ p}: unrecognised, left as is: {why}"; unknown := unknown + 1
+  unless mentions.isEmpty do
+    IO.println s!"{path}: mention, no rewrite ({mentions.size}): {", ".intercalate (mentions.map at_).toList}"
   -- A rewrite inside another's dropped text (the `| alt` of a `let some`) goes with it.
   let edits := sites.flatten
   let edits := edits.filter fun e => !edits.any fun o =>
     o.start ≤ e.start && e.stop ≤ o.stop && !(o.start == e.start && o.stop == e.stop)
   let summary (kept dropped : Nat) :=
-    IO.println s!"{path}: unwrap `{declName}`: {sites.size} recognised, {kept} rewritten, {dropped} dropped by the error check, {unknown} unrecognised"
+    IO.println s!"{path}: unwrap `{declName}`: {sites.size} recognised, {kept} rewritten, {dropped} dropped by the error check, {mentions.size} mention(s), {unknown} unrecognised"
   if edits.isEmpty then summary 0 0; return 3
   -- The gate: errors of the original against errors of the edited text, both elaborated here.
   let errorsOf (src : String) : IO (Array (Nat × Position × String)) := do
@@ -4199,7 +4280,9 @@ private def usage : String := String.intercalate "\n" [
   row "infix d token" "give d the infix notation token",
   row "notate d --form f" "write every application of d as f; $0, $1, ... are its explicit arguments",
   row "unwrap d" "d's Except/Option result became plain: let x ← d a to :=, (← d a) to (d a),",
-  row "" "  let some r := d a | alt to let r := d a, d a = .ok r (some, pure) to d a = r",
+  row "" "  let some r := d a | alt to let r := d a, d a = .ok r (some, pure) to d a = r,",
+  row "" "  match d a with | .ok p (some p) to | p, its .error/none arms dropped;",
+  row "" "  where Except/Option is still expected, d a to pure (d a)",
   "",
   "move",
   row "move d dest" "dest is another .lean file, or a declaration or section to sit before",
