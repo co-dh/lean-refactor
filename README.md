@@ -24,11 +24,13 @@ lake build                                   # produces the .ilean data the tool
 
 Run from the target repository root. The target and this tool must be on the same Lean toolchain.
 
-A nested lake package (one with its own lakefile and `.lake`, such as `sub/` with `require parent from
-".."`) is a target of its own: `lean-refactor -C sub <op> …` runs there, as `git -C` does, so the index is
-`sub/.lake/build/refactor-index.db` and the verify step builds `sub`'s default targets. Every build the
-tool starts runs under `scripts/cap`, whose limit is `CAP_MEM_MB` from the environment (default 12288):
-a package that needs more says so on the command line, `CAP_MEM_MB=20480 lean-refactor -C sub …`.
+A nested lake package (one with its own lakefile and `.lake`, such as `sub/` with `require parent from ".."`)
+is a target of its own: `lean-refactor -C sub <op> …` runs there, as `git -C` does, so the index is
+`sub/.lake/build/refactor-index.db` and the verify step builds `sub`'s default targets. Run from the parent, a
+selection never takes a file of a nested package (its imports resolve through `sub/.lake`, not the parent's):
+the run skips it and names `-C sub` for it. Every build the tool starts runs under `scripts/cap`, whose limit
+is `CAP_MEM_MB` from the environment (default 12288): a package that needs more says so on the command line,
+`CAP_MEM_MB=20480 lean-refactor -C sub …`.
 
 ## Commands
 

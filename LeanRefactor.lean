@@ -419,6 +419,23 @@ private partial def leanFilesUnder (dir : System.FilePath) : IO (Array String) :
       files := files.push entry.path.toString
   pure files
 
+/-- The directories below the root that hold a lakefile of their own: nested lake packages.  Their
+    modules resolve through THEIR `.lake`, so this run's search path cannot elaborate them; each is a
+    target of its own, reached with `-C <dir>`. -/
+private partial def nestedPackages (dir : System.FilePath := ".") : IO (Array System.FilePath) := do
+  let mut out := #[]
+  for entry in ← dir.readDir do
+    if entry.fileName.startsWith "." || !(← entry.path.isDir) then continue
+    if (← (entry.path / "lakefile.lean").pathExists) || (← (entry.path / "lakefile.toml").pathExists) then
+      out := out.push (System.mkFilePath (entry.path.components.filter (· != ".")))
+    out := out ++ (← nestedPackages entry.path)
+  return out
+
+/-- The nested package (from `nestedPackages`) whose tree holds `path`, compared by path component. -/
+private def packageOf (packages : Array System.FilePath) (path : String) : Option System.FilePath :=
+  let parts (p : System.FilePath) := p.components.filter (· != ".")
+  packages.find? fun pkg => (parts path).take (parts pkg).length == parts pkg
+
 /-- Paths under `dir` whose name ends in `suffix`.  Separate from `leanFilesUnder`, which skips
     dot-directories on purpose: this one has to walk INSIDE `.lake` to see build artefacts. -/
 private partial def filesEndingIn (dir : System.FilePath) (suffix : String) : IO (Array String) := do
@@ -459,19 +476,36 @@ private def selectedFiles (pattern : String) (mentioning : Array String := #[]) 
   -- a reader should look there, and it survives the next file added to the directory.
   let (excluded, patterns) := all.partition (·.startsWith "!")
   let excludes := excluded.map (·.drop 1 |>.toString)
-  let matched := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
+  let inPattern := files.map (fun path => if path.startsWith "./" then (path.drop 2).toString else path)
     |>.filter fun path =>
       -- Lake's package configuration is no module of the package: it is elaborated by Lake alone.
       path != "lakefile.lean" && patterns.any (globMatches · path) && !excludes.any (globMatches · path)
+  let mentions (path : String) : IO Bool := do
+    if mentioning.isEmpty then return true
+    let source ← IO.FS.readFile path
+    return mentioning.any (fun token => source.contains token)
+  let wanted := String.intercalate ", " (mentioning.toList.map fun token => s!"`{token}`")
+  -- A nested package's file would elaborate against THIS package's search path and fail on its own
+  -- imports (`unknown module prefix`); it is named with the command that reaches it instead.
+  let packages ← nestedPackages
+  let (matched, foreign) := inPattern.partition (packageOf packages · |>.isNone)
+  for pkg in packages do
+    let mut theirs := #[]
+    for path in foreign do
+      -- Named outright, a nested file is reported whatever it mentions: the caller meant that package.
+      if packageOf packages path == some pkg && (matched.isEmpty || (← mentions path)) then
+        theirs := theirs.push path
+    unless theirs.isEmpty do
+      IO.eprintln s!"{theirs.size} file(s) matching `{pattern}`{if mentioning.isEmpty || matched.isEmpty then "" else s!" that mention {wanted}"} \
+        are in the nested lake package `{pkg}`, which has its own lakefile and `.lake`; this run skips \
+        them. Run `lean-refactor -C {pkg} …` for those (e.g. {theirs[0]!})"
   if matched.isEmpty then
-    IO.eprintln s!"`--in {pattern}` matched no Lean file"
+    IO.eprintln s!"`--in {pattern}` matched no Lean file of this package"
     return matched
   if mentioning.isEmpty then return matched
   let mut selected := #[]
   for path in matched do
-    let source ← IO.FS.readFile path
-    if mentioning.any (fun token => source.contains token) then selected := selected.push path
-  let wanted := String.intercalate ", " (mentioning.toList.map fun token => s!"`{token}`")
+    if ← mentions path then selected := selected.push path
   if selected.isEmpty then
     IO.eprintln s!"no file matching `{pattern}` mentions {wanted}"
   else if selected.size < matched.size then
