@@ -77,6 +77,8 @@ rename
     --inst "d a"                            ... only types defeq to this application, elaborated where each type sits
   infix d token                           give d the infix notation token
   notate d --form f                       write every application of d as f; $0, $1, ... are its explicit arguments
+  unwrap d                                d's Except/Option result became plain: let x ← d a to :=, (← d a) to (d a),
+                                            let some r := d a | alt to let r := d a, d a = .ok r (some, pure) to d a = r
 
 move
   move d dest                             dest is another .lean file, or a declaration or section to sit before

@@ -1,0 +1,12 @@
+namespace Fix.Ops
+
+def step (a b : Nat) : Nat := a + b
+
+def look (k : Nat) : Nat := k
+
+structure Box where
+  n : Nat
+
+def Box.get (b : Box) (k : Nat) : Nat := b.n + k
+
+end Fix.Ops

@@ -2232,8 +2232,8 @@ private def renameDeclStage (path stagePath : String) (renames : Array Rename) :
     not affected, which is not a failure. -/
 private def stagedGlob (pattern description : String)
     (stage : String → String → IO IO.Process.Output)
-    (apply : Bool) (mentioning : Array String := #[]) (selection? : Option (Array String) := none) :
-    IO UInt32 := do
+    (apply : Bool) (mentioning : Array String := #[]) (selection? : Option (Array String) := none)
+    (buildGate : Bool := true) : IO UInt32 := do
   if ← staleSplitParts then return 1
   let selected ← match selection? with
     | some files => pure files
@@ -2270,6 +2270,12 @@ private def stagedGlob (pattern description : String)
     IO.FS.writeFile path (← IO.FS.readFile (stagePathFor path))
   dropStagedFiles stagedFiles
   let restore := backups
+  -- `unwrap` runs where the repository did not build before the edit, so a build's exit code
+  -- cannot judge it; each stage child compared its file's errors before and after instead.
+  unless buildGate do
+    IO.println s!"{description}: {stagedFiles.size} file(s) written, each kept by its own before/after \
+      error comparison; no repository build (it failed before the edit)"
+    return 0
   let buildStarted ← IO.monoMsNow
   let build ← repositoryBuild
   IO.println s!"repository build in {(← IO.monoMsNow) - buildStarted} ms"
@@ -2791,6 +2797,179 @@ private def notateStage (path declName form stagePath : String) : IO UInt32 := d
   for edit in outermost.qsort (·.start.byteIdx < ·.start.byteIdx) do
     IO.println s!"{path}:{edit.line}: {repr (String.Pos.Raw.extract source edit.start edit.stop)} -> {repr edit.replacement}"
   IO.FS.writeFile stagePath (applyEdits source outermost)
+  return 0
+
+/-! ## A total function's callers
+
+`unwrap d` follows `d : … → Except ε α` (or `Option α`) becoming `d : … → α`.  Each use of `d`, from
+the info trees as for `notate`, is rewritten by the syntax around its call: `let x ← d a` and `x ← d a`
+to `:=`, `(← d a)` to `(d a)`, `let some r := d a | alt` and `let .ok r := d a | alt` to
+`let r := d a`, and an equation `d a = .ok r` (`Except.ok`, `some`, `pure`, either side) to `d a = r`.
+Any other shape is listed and left alone.  The callers fail BEFORE the edit, so "elaborates" cannot be
+the gate: a rewrite is kept only if no error sits where it wrote, or where there was none before. -/
+
+/-- What `unwrap` strips from the other side of an equation or from a `let … | alt` pattern. -/
+private def unwrapCtors : List Name := [``Except.ok, ``Option.some, ``Pure.pure, ``Except.pure]
+
+/-- The argument of `stx` when it is one of `unwrapCtors` applied to exactly one argument, through
+    brackets: `.ok r`, `Except.ok r`, `some r`, `pure r`.  A name resolves in `c`'s scope; a leading-dot
+    name is read against the two types `d` may have returned. -/
+private partial def unwrappedArg? (c : Elab.CommandContextInfo) (env : Environment) (stx : Syntax) :
+    Option Syntax := do
+  if stx.isOfKind ``Lean.Parser.Term.paren then return ← unwrappedArg? c env stx[1]
+  let args ← appArgs stx
+  guard (args.size == 1 && stx[1].getArgs.size == 1)
+  let fn := stx[0]
+  let names := if fn.isOfKind ``Lean.Parser.Term.dotIdent then [``Except, ``Option].map (· ++ fn[1].getId)
+    else if fn.isIdent then resolvedAt c env fn.getId else []
+  guard (names.any unwrapCtors.contains)
+  args[0]?
+
+/-- The edits that unwrap the use of `d` whose identifier is `leaf`, or why its shape is not one
+    `unwrap` knows.  The call is the identifier under `@`, `(e).d` or `e |>.d`, and the application it
+    heads; brackets around the call are looked through. -/
+private def unwrapSite (c? : Option Elab.CommandContextInfo) (env : Environment) (source : String)
+    (leaf : Syntax) (parents : List Syntax) : Except String (Array Edit) := do
+  let text (s : Syntax) : String := match s.getRange? with
+    | some r => String.Pos.Raw.extract source r.start r.stop | none => ""
+  let replace (s : Syntax) (r : String) : Array Edit := match s.getRange? with
+    | some g => #[{ start := g.start, stop := g.stop, line := 0, replacement := r }] | none => #[]
+  let heads (q call : Syntax) : Bool :=
+    (q.isOfKind ``Lean.Parser.Term.explicit && sameRange q[1] call) ||
+    ((q.isOfKind ``Lean.Parser.Term.proj || q.isOfKind ``Lean.Parser.Term.pipeProj) && sameRange q[2] call) ||
+    (q.isOfKind ``Lean.Parser.Term.app && sameRange q[0] call)
+  let mut call := leaf
+  let mut above := parents
+  repeat
+    match above with
+    | q :: rest =>
+      unless heads q call do break
+      call := q
+      above := rest
+    | [] => break
+  let mut inner := call
+  repeat
+    match above with
+    | q :: rest =>
+      unless q.isOfKind ``Lean.Parser.Term.paren && sameRange q[1] inner do break
+      inner := q
+      above := rest
+    | [] => break
+  let some q := above.head? | throw "the call has no enclosing syntax"
+  let some ir := inner.getRange? | throw "the call has no source range"
+  let some qr := q.getRange? | throw "the enclosing syntax has no source range"
+  let unwrapped (s : Syntax) : Option Syntax := c?.bind (unwrappedArg? · env s)
+  if q.isOfKind ``Lean.Parser.Term.liftMethod && sameRange q[1] inner then
+    return #[{ start := qr.start, stop := ir.start, line := 0 }]
+  if q.isOfKind ``Lean.Parser.Term.doExpr && sameRange q[0] inner then
+    let some decl := above[1]? | throw "a `do` element with no enclosing syntax"
+    let some i := decl.getArgs.findIdx? (sameRange · q)
+      | throw s!"a `do` statement whose value is the call (inside `{decl.getKind}`)"
+    unless decl.isOfKind ``Lean.Parser.Term.doIdDecl || decl.isOfKind ``Lean.Parser.Term.doPatDecl do
+      throw s!"a `do` statement whose value is the call (inside `{decl.getKind}`)"
+    if decl.isOfKind ``Lean.Parser.Term.doPatDecl && !decl[3].getArgs.isEmpty then
+      throw s!"`{text decl[0]} ← … | alt`: a refutable pattern bound by `←`"
+    let some arrow := decl[i - 1]? | throw "the `←` of the `do` binding is missing"
+    return replace arrow ":="
+  if q.isOfKind ``Lean.Parser.Term.doLetElse && sameRange q[4] inner then
+    let some arg := unwrapped q[2] | throw s!"`let {text q[2]} := … | …` does not bind `.ok r` or `some r`"
+    return replace q[2] (text arg) ++ #[{ start := ir.stop, stop := qr.stop, line := 0 }]
+  if q.isOfKind `«term_=_» then
+    let other? := if sameRange q[0] inner then some q[2] else if sameRange q[2] inner then some q[0] else none
+    let some other := other? | throw "an equation the call is not a side of"
+    let some arg := unwrapped other | throw s!"an equation whose other side `{text other}` is not `.ok r`, `some r` or `pure r`"
+    return replace other (text arg)
+  throw s!"the call sits inside `{q.getKind}`"
+
+/-- Position `p` of the original text in the text `edits` produce; inside an edit, that edit's start. -/
+private def shiftedBy (edits : Array Edit) (p : Nat) : Nat := Id.run do
+  let mut q : Int := p
+  for e in edits do
+    if e.stop.byteIdx ≤ p then q := q + e.replacement.utf8ByteSize - (e.stop.byteIdx - e.start.byteIdx : Nat)
+    else if e.start.byteIdx ≤ p then q := q - (p - e.start.byteIdx : Nat)
+  return q.toNat
+
+/-- Position `q` of the edited text in the original; inside a replacement, the start of what it replaced. -/
+private def unshiftedBy (edits : Array Edit) (q : Nat) : Nat := Id.run do
+  let mut delta : Int := 0
+  for e in edits.qsort (·.start.byteIdx < ·.start.byteIdx) do
+    let start := e.start.byteIdx + delta
+    if (q : Int) < start then return (q - delta).toNat
+    if (q : Int) < start + e.replacement.utf8ByteSize then return e.start.byteIdx
+    delta := delta + e.replacement.utf8ByteSize - (e.stop.byteIdx - e.start.byteIdx : Nat)
+  return (q - delta).toNat
+
+private def unwrapStage (path declName stagePath : String) : IO UInt32 := do
+  claimElaboration path
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let source ← IO.FS.readFile path
+  initSearchPath (← findSysroot) (← targetSearchPath)
+  let (inputCtx, importEnv, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
+    | .ok result => pure result
+    | .error e =>
+        for msg in e.messages.toList do IO.eprintln (← msg.toString)
+        return 1
+  let fileMap := inputCtx.fileMap
+  let trees := frontend.commandState.infoState.trees.toArray
+  let (references, _) ← (Server.findModuleRefs fileMap trees (localVars := false)).toLspModuleRefs
+  let starts := (sitesNamed references declName (·.usages)).map (fileMap.lspPosToUtf8Pos ·.range.start)
+  let starts := starts.foldl (fun acc p => if acc.contains p then acc else acc.push p) #[]
+  if starts.isEmpty then IO.println s!"{path}: no use of `{declName}`"; return 3
+  let at_ (p : String.Pos.Raw) := let q := fileMap.toPosition p; s!"{path}:{q.line}:{q.column}"
+  let mut sites : Array (Array Edit) := #[]
+  let mut unknown := 0
+  for p in starts.qsort (·.byteIdx < ·.byteIdx) do
+    let site : Except String (Array Edit) := match frontend.commands.findSome? (syntaxAt p) with
+      | none => .error "the use has no source syntax"
+      | some (leaf, parents) =>
+        if !leaf.isIdent then .error s!"`{declName}` is written through notation"
+        else
+          let c? := commandCtxAt? trees p
+          unwrapSite c? ((c?.map (·.env)).getD frontend.commandState.env) source leaf parents
+    match site with
+    | .ok es => sites := sites.push (es.map fun e => { e with line := (fileMap.toPosition e.start).line })
+    | .error why => IO.println s!"{at_ p}: unrecognised, left as is: {why}"; unknown := unknown + 1
+  -- A rewrite inside another's dropped text (the `| alt` of a `let some`) goes with it.
+  let edits := sites.flatten
+  let edits := edits.filter fun e => !edits.any fun o =>
+    o.start ≤ e.start && e.stop ≤ o.stop && !(o.start == e.start && o.stop == e.stop)
+  let summary (kept dropped : Nat) :=
+    IO.println s!"{path}: unwrap `{declName}`: {sites.size} recognised, {kept} rewritten, {dropped} dropped by the error check, {unknown} unrecognised"
+  if edits.isEmpty then summary 0 0; return 3
+  -- The gate: errors of the original against errors of the edited text, both elaborated here.
+  let errorsOf (src : String) : IO (Array (Nat × Position × String)) := do
+    let fm := FileMap.ofString src
+    return (← elaborationErrors importEnv path src).map fun (pos, m) => ((fm.ofPosition pos).byteIdx, pos, m)
+  let before ← errorsOf source
+  let commands := frontend.commands.filterMap (·.getRange?)
+  let mut kept := edits.qsort (·.start.byteIdx < ·.start.byteIdx)
+  let mut remaining := #[]
+  repeat
+    let was := before.map (shiftedBy kept ·.1)
+    let written := kept.map fun e => let s := shiftedBy kept e.start.byteIdx; (s, s + e.replacement.utf8ByteSize)
+    let after ← errorsOf (applyEdits source kept)
+    let bad := after.filter fun (q, _) => !was.contains q || written.any fun (s, t) => s ≤ q && q ≤ t
+    remaining := after
+    if bad.isEmpty then break
+    let blamed := bad.filterMap fun (q, _) => commands.find? fun r =>
+      r.start.byteIdx ≤ unshiftedBy kept q && unshiftedBy kept q < r.stop.byteIdx
+    let next := kept.filter fun e => !blamed.any fun r => r.start ≤ e.start && e.stop ≤ r.stop
+    for (_, pos, m) in bad do
+      IO.println s!"error after the rewrite at {pos.line}:{pos.column}: {(m.splitOn "\n").headD ""}"
+    if next.size == kept.size then
+      IO.println s!"{path}: an error the rewrite caused lies outside every rewritten command; file left as is"
+      kept := #[]; break
+    IO.println s!"{path}: {kept.size - next.size} rewrite(s) in the command(s) holding those errors dropped"
+    kept := next
+    if kept.isEmpty then break
+  let rewrote := sites.filter (·.all fun e => kept.any fun k => k.start == e.start && k.stop == e.stop)
+  summary rewrote.size (sites.size - rewrote.size)
+  if kept.isEmpty then return 3
+  for e in kept do
+    IO.println s!"{path}:{e.line}: {repr (String.Pos.Raw.extract source e.start e.stop)} -> {repr e.replacement}"
+  for (_, pos, m) in remaining do
+    IO.println s!"error remains, as before the rewrite, at {pos.line}:{pos.column}: {(m.splitOn "\n").headD ""}"
+  IO.FS.writeFile stagePath (applyEdits source kept)
   return 0
 
 /-- The source ranges of every pattern of every `match` the elaborator ran.  `fun ⟨a, b⟩`, `let ⟨a, b⟩ :=`,
@@ -3998,6 +4177,8 @@ private def usage : String := String.intercalate "\n" [
   row "  --inst \"d a\"" "  ... only types defeq to this application, elaborated where each type sits",
   row "infix d token" "give d the infix notation token",
   row "notate d --form f" "write every application of d as f; $0, $1, ... are its explicit arguments",
+  row "unwrap d" "d's Except/Option result became plain: let x ← d a to :=, (← d a) to (d a),",
+  row "" "  let some r := d a | alt to let r := d a, d a = .ok r (some, pure) to d a = r",
   "",
   "move",
   row "move d dest" "dest is another .lean file, or a declaration or section to sit before",
@@ -4248,6 +4429,12 @@ def main (args : List String) : IO UInt32 := do
       return ← stagedGlob (selector?.getD wholeRepository) s!"inserted `{term}` before argument {n} of `{declName}`"
         (fun path stage => spawnSelf (#["insert-arg-stage", path, stage, declName, index, term] ++ extra))
         apply (mentioning := if ctor then #[] else #[shortName declName])
+  | ["unwrap-stage", path, declName, stagePath] =>
+      return ← unwrapStage path declName stagePath
+  | ["unwrap", declName] =>
+      return ← stagedGlob (selector?.getD wholeRepository) s!"unwrapped the callers of `{declName}`"
+        (fun path stage => spawnSelf #["unwrap-stage", path, declName, stage]) apply
+        (mentioning := #[shortName declName]) (buildGate := false)
   | ["notate-stage", path, declName, form, stagePath] =>
       return ← notateStage path declName form stagePath
   | ["notate", declName] =>
