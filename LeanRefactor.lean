@@ -22,6 +22,7 @@ fall back to textual matching.
 -/
 
 open Lean Lean.Parser Lean.Server LeanRefactor.Fork LeanRefactor.SyntaxQuery
+open LeanRefactor.Index (nestedPackages packageOf)
 
 namespace LeanRefactor
 
@@ -419,22 +420,6 @@ private partial def leanFilesUnder (dir : System.FilePath) : IO (Array String) :
       files := files.push entry.path.toString
   pure files
 
-/-- The directories below the root that hold a lakefile of their own: nested lake packages.  Their
-    modules resolve through THEIR `.lake`, so this run's search path cannot elaborate them; each is a
-    target of its own, reached with `-C <dir>`. -/
-private partial def nestedPackages (dir : System.FilePath := ".") : IO (Array System.FilePath) := do
-  let mut out := #[]
-  for entry in ← dir.readDir do
-    if entry.fileName.startsWith "." || !(← entry.path.isDir) then continue
-    if (← (entry.path / "lakefile.lean").pathExists) || (← (entry.path / "lakefile.toml").pathExists) then
-      out := out.push (System.mkFilePath (entry.path.components.filter (· != ".")))
-    out := out ++ (← nestedPackages entry.path)
-  return out
-
-/-- The nested package (from `nestedPackages`) whose tree holds `path`, compared by path component. -/
-private def packageOf (packages : Array System.FilePath) (path : String) : Option System.FilePath :=
-  let parts (p : System.FilePath) := p.components.filter (· != ".")
-  packages.find? fun pkg => (parts path).take (parts pkg).length == parts pkg
 
 /-- Paths under `dir` whose name ends in `suffix`.  Separate from `leanFilesUnder`, which skips
     dot-directories on purpose: this one has to walk INSIDE `.lake` to see build artefacts. -/
@@ -1475,7 +1460,8 @@ private def refreshedIndex? : IO (Option String) := do
   if ← staleSplitParts then return none
   let dbPath := Db.indexPath
   try
-    _ ← Index.refresh dbPath buildDir false
+    -- The root's rows only, but scoped, so the nested packages' rows `index` wrote are kept.
+    _ ← Index.refresh dbPath buildDir false (← nestedPackages) none
     pure (some dbPath)
   catch e =>
     IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
@@ -4291,7 +4277,7 @@ private def usage : String := String.intercalate "\n" [
   "       literally writes it — `≫`, `⊆ₛ`.  Not a declaration, so the index has no row for it.",
   "",
   "query",
-  row "index [--full]" "build or refresh the index",
+  row "index [--full] [-K k=v]" "build or refresh the index: the root and every nested lake package",
   row "uses d" "modules that use d",
   row "stmt frag" "signatures of declarations whose name has frag in it",
   row "dup [--min-nodes n]" "repeated source subtrees",
@@ -4419,6 +4405,12 @@ def main (args : List String) : IO UInt32 := do
   let args := args.filter fun a =>
     !["--apply", "--uses-only", "--no-index", "--body", "--syntax", "--keep",
       "--same-statement", "--same-proof"].contains a
+  -- Repeatable, so not a `stripFlag`; and before them, which would take `-K` as a flag's value.
+  let rec lakeOpts : List String → List String × Array String
+    | "-K" :: kv :: rest => let (r, ks) := lakeOpts rest; (r, #["-K", kv] ++ ks)
+    | a :: rest => let (r, ks) := lakeOpts rest; (a :: r, ks)
+    | [] => ([], #[])
+  let (args, lakeArgs) := lakeOpts args
   -- Once here, not once per file in every child: without it each import fails on its own.
   if (← IO.getEnv "LEAN_PATH").isNone then
     unless ← ((← IO.currentDir) / ".lake" / "build" / "lib" / "lean").isDir do
@@ -4451,8 +4443,12 @@ def main (args : List String) : IO UInt32 := do
   | [] | ["--help"] | ["-h"] => IO.println usage; return 0
   -- The refresh imports every stale module, and `Index.run` reaches it without going through
   -- `refreshedIndex?`, so the split-part guard has to be repeated here.
-  | ["index"] => return ← if ← staleSplitParts then pure 1 else Index.run false
-  | ["index", "--full"] => return ← if ← staleSplitParts then pure 1 else Index.run true
+  | ["index"] => return ← if ← staleSplitParts then pure 1 else Index.run false lakeArgs
+  | ["index", "--full"] => return ← if ← staleSplitParts then pure 1 else Index.run true lakeArgs
+  -- The child half of `index` for a nested lake package; only `Index.run` calls it.
+  | "index-package" :: dbPath :: pkg :: packages =>
+      return ← if ← staleSplitParts then pure 1 else
+        Index.runPackage dbPath pkg (packages.toArray.map System.FilePath.mk)
   -- The child half of the index's syntax-tree pass: elaborate `path`, print its `syntax_node`
   -- records and then its `decl_stmt_in` records (cells joined by `fieldSep`, records by
   -- `recordSep`, the two groups by `groupSep`) on stdout, and exit.  Only the index driver calls

@@ -130,6 +130,13 @@ guessed — write the module as its path to say which you meant.
 `index` recreates it. Positions in `decl_range` and `use_site` are zero-based UTF-16 LSP positions;
 `syntax_node.b0` and `b1` are byte offsets into the source file. The DDL is `LeanRefactor.Db.schemaSql`.
 
+Run from the root, `index` also refreshes every nested lake package into the same database, so one query
+answers for the whole repository; `module.source` stays root-relative (`sub/Sub/X.lean`). Each nested package
+is refreshed by a child of the tool under `lake env` in that package, because its modules import through its
+own search path; `-K key=value` (repeatable) goes to that `lake`, for a lakefile that reads a dependency's path
+from a configuration option. A nested package with no build is named on stderr and keeps its rows; a child
+that fails sets the exit code. `lean-refactor -C sub index` still writes `sub`'s own database.
+
 The nine tables below are the whole readable schema. (Two more, `syntax_node_in` and
 `decl_stmt_in`, exist only inside a refresh: it fills them, interns their names into IDs, and empties
 them again.) **Bold** columns form the primary key; `use_site` and `dep` have none — they are fact

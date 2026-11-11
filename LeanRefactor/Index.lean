@@ -63,18 +63,43 @@ private partial def scanDir (buildDir relDir : String) : IO (Array Module) := do
           ileanHash, oleanHash, relPath := rel }
   return acc
 
-/-- The `module` table as a map from name to the stored hash pair. -/
-private def storedModules (dbPath : String) : IO (Std.HashMap String (String × String)) := do
+/-- The directories below `dir` that hold a lakefile of their own: nested lake packages.  Their
+    modules resolve through THEIR `.lake`, so the root's search path cannot elaborate them; each is a
+    target of its own, reached with `-C <dir>`, and `index` reaches it by a child under its `lake env`. -/
+public partial def nestedPackages (dir : System.FilePath := ".") : IO (Array System.FilePath) := do
+  let mut out := #[]
+  for entry in ← dir.readDir do
+    if entry.fileName.startsWith "." || !(← entry.path.isDir) then continue
+    if (← (entry.path / "lakefile.lean").pathExists) || (← (entry.path / "lakefile.toml").pathExists) then
+      out := out.push (System.mkFilePath (entry.path.components.filter (· != ".")))
+    out := out ++ (← nestedPackages entry.path)
+  return out
+
+/-- The innermost nested package (from `nestedPackages`) whose tree holds `path`, compared by path
+    component.  Innermost, because a package nested in a nested package owns its own files. -/
+public def packageOf (packages : Array System.FilePath) (path : String) : Option System.FilePath :=
+  let parts (p : System.FilePath) := p.components.filter (· != ".")
+  packages.foldl (init := none) fun best pkg =>
+    if (parts path).take (parts pkg).length == parts pkg &&
+        best.all (fun b => (parts b).length < (parts pkg).length) then some pkg else best
+
+/-- The `module` table as a map from name to the stored hash pair, restricted to the rows whose
+    source is `owned` by the package being refreshed: one database holds every package of the
+    repository, and a refresh must neither re-extract nor drop another package's modules. -/
+private def storedModules (dbPath : String) (owned : String → Bool) :
+    IO (Std.HashMap String (String × String)) := do
   -- A module whose extraction failed keeps its row with no hashes recorded (NULL); '' matches no
   -- scanned hash, so it reads as stale and the next run retries it, as the failure report promises.
-  let sql := "select name, coalesce(ilean_hash, '') as ilean_hash, coalesce(olean_hash, '') as olean_hash from module;"
+  let sql := "select name, source, coalesce(ilean_hash, '') as ilean_hash, \
+    coalesce(olean_hash, '') as olean_hash from module;"
   let .arr rows ← Db.query dbPath sql | throw <| IO.userError s!"{dbPath}: `{sql}` did not return an array"
   let mut map : Std.HashMap String (String × String) := {}
   for row in rows do
     let field (k : String) : IO String := match row.getObjValAs? String k with
       | .ok v => pure v
       | .error e => throw <| IO.userError s!"{dbPath}: module row {row.compress}: column {k}: {e}"
-    map := map.insert (← field "name") (← field "ilean_hash", ← field "olean_hash")
+    if owned (← field "source") then
+      map := map.insert (← field "name") (← field "ilean_hash", ← field "olean_hash")
   return map
 
 /-- The scanned modules whose hash pair differs from the stored pair, plus scanned modules not
@@ -175,14 +200,21 @@ private def withSources (scanned : Array Module) : IO (Array Module × Nat) := d
 
     Each stale module also gets its `syntax_node` rows: the tree is a byproduct of the elaboration
     that built the olean, so the same `(ilean_hash, olean_hash)` key keeps it in step, and the
-    DELETE-and-re-insert is the same `deletePartitions` path as every other per-module row. -/
-public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × Nat) := do
+    DELETE-and-re-insert is the same `deletePartitions` path as every other per-module row.
+
+    `me` is the package being refreshed, as a directory relative to the repository root (`none` for
+    the root itself), and `packages` every nested package of that root: the refresh owns exactly the
+    stored modules whose source `packageOf` places in `me`, and stores its sources root-relative, so
+    one database answers for every package of the repository. -/
+public def refresh (dbPath buildDir : String) (full : Bool) (packages : Array System.FilePath)
+    (me : Option System.FilePath) : IO (Nat × Nat × Nat) := do
+  let pre := (me.map (·.toString ++ "/")).getD ""
   if full then
     -- Drop the WAL and SHM too, so a stale write-ahead log cannot be replayed into the fresh file.
     for f in #[dbPath, dbPath ++ "-wal", dbPath ++ "-shm"] do Db.removeIfPresent f
   _ ← Db.ensureSchema dbPath
   let (scanned, orphaned) ← withSources (← scanDir buildDir "")
-  let stored ← storedModules dbPath
+  let stored ← storedModules dbPath fun source => packageOf packages source == me
   let stale := staleModules scanned stored
   let removed := removedModules scanned stored
   deletePartitions dbPath (stale.map (·.name) ++ removed)
@@ -232,20 +264,15 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
   -- Numbering from the largest id ever handed out, not from the row count: a module deleted and
   -- re-inserted must get a fresh id, or the untouched modules' syntax nodes point at the wrong one.
   let firstId ← (· + 1) <$> Db.queryNat dbPath "select coalesce(max(id), 0) as m from module;" "m"
-  Db.importRows dbPath "module" (stale.mapIdx fun i m => Db.row #[toString (firstId + i), m.name, m.source, "", ""])
+  Db.importRows dbPath "module" (stale.mapIdx fun i m => Db.row #[toString (firstId + i), m.name, pre ++ m.source, "", ""])
   Db.importRows dbPath "syntax_node_in" syntaxRows
   Db.importRows dbPath "decl_stmt_in" stmtRows
   Db.importRows dbPath "src_ref" groups[2]!
   Db.importRows dbPath "open_ns" groups[3]!
   internStagedNodes dbPath
   attachStatements dbPath
-  -- A full extract stages every module's nodes and then deletes them, which leaves a quarter of a
-  -- gigabyte of freed pages the file never gives back on its own.  Only on `full`: an incremental
-  -- refresh's freelist is exactly what the NEXT refresh's staging writes into, so compacting it
-  -- would trade seconds for pages about to be reallocated.
   let failedNames := failed.foldl (fun (s : Std.HashSet String) (n, _) => s.insert n) ∅
   recordHashes dbPath (stale.filter (!failedNames.contains ·.name))
-  if full then Db.exec dbPath "vacuum;"
   unless failed.isEmpty do
     throw <| IO.userError <| String.intercalate "\n" <|
       (failed.map fun (n, cause) => s!"{n}: {cause}").toList ++
@@ -253,20 +280,77 @@ public def refresh (dbPath buildDir : String) (full : Bool) : IO (Nat × Nat × 
         so the next `lean-refactor index` retries them"]
   return (stale.size, removed.size, orphaned)
 
-/-- `lean-refactor index [--full]`: refresh and print a one-line summary. Returns the process exit code. -/
-public def run (full : Bool) : IO UInt32 := do
-  let buildDir := Db.buildDir
-  unless ← System.FilePath.isDir buildDir do
-    IO.eprintln s!"{buildDir} does not exist; run `lake build` first"
+/-- Refresh the modules of one package (`me`, `none` for the root) into `dbPath` and print a
+    one-line summary naming the package. -/
+private def refreshPackage (dbPath : String) (full : Bool) (packages : Array System.FilePath)
+    (me : Option System.FilePath) : IO Unit := do
+  let t0 ← IO.monoMsNow
+  let (reExtracted, dropped, orphaned) ← refresh dbPath Db.buildDir full packages me
+  let elapsed := (← IO.monoMsNow) - t0
+  let sql := "select source from module;"
+  let .arr rows ← Db.query dbPath sql | throw <| IO.userError s!"{dbPath}: `{sql}` did not return an array"
+  let mut owned := 0
+  for r in rows do
+    match r.getObjValAs? String "source" with
+    | .ok s => if packageOf packages s == me then owned := owned + 1
+    | .error e => throw <| IO.userError s!"{dbPath}: module row {r.compress}: column source: {e}"
+  IO.println s!"{(me.map toString).getD "."}: indexed {owned} module(s): {reExtracted} re-extracted, \
+    {dropped} dropped, {orphaned} skipped as source-less artefacts, in {elapsed} ms"
+  -- Before the next package's child writes to the same stream, so the lines keep their order.
+  (← IO.getStdout).flush
+
+/-- `lean-refactor index [--full] [-K key=value]…`: refresh the root package, then every nested lake
+    package of the repository into the SAME database, and print a summary line per package.  Returns
+    the process exit code.
+
+    A nested package's modules import through ITS search path (its own `.lake` and requirements), so
+    each is refreshed by a child of this binary under that package's `lake env`, one package at a
+    time — one Lean environment per process.  `lakeArgs` (`-K key=value`) go to that `lake`, for a
+    lakefile whose dependency paths are configuration options.  The child inherits `scripts/cap`'s
+    limit, and the lock the launcher holds on this database. -/
+public def run (full : Bool) (lakeArgs : Array String) : IO UInt32 := do
+  unless ← System.FilePath.isDir Db.buildDir do
+    IO.eprintln s!"{Db.buildDir} does not exist; run `lake build` first"
     return 1
   let dbPath := Db.indexPath
-  let t0 ← IO.monoMsNow
-  let (reExtracted, dropped, orphaned) ← refresh dbPath buildDir full
-  let elapsed := (← IO.monoMsNow) - t0
-  -- Exactly the set the scan found: every stale row is deleted and re-inserted under the same name.
-  let scanned ← Db.queryNat dbPath "select count(*) as n from module;" "n"
-  IO.println s!"indexed {scanned} module(s): {reExtracted} re-extracted, {dropped} dropped, \
-    {orphaned} skipped as source-less artefacts, in {elapsed} ms"
+  let packages ← nestedPackages
+  refreshPackage dbPath full packages none
+  let root ← IO.currentDir
+  let self := (← IO.appPath).toString
+  let mut status : UInt32 := 0
+  for pkg in packages do
+    -- Not an error: a fresh checkout or worktree has not built every package, and failing would
+    -- block every index of the root.  Said, with the command that fixes it, never skipped silently.
+    unless ← (pkg / Db.buildDir).isDir do
+      IO.eprintln s!"{pkg}: nested lake package not built ({pkg}/{Db.buildDir} missing), so its \
+        modules keep the rows of its last index; build it with `lake -d {pkg} build`, then rerun \
+        `lean-refactor index`"
+      continue
+    let args := lakeArgs ++ #["env", self, "index-package", (root / dbPath).toString, pkg.toString] ++
+      packages.map toString
+    let out ← IO.Process.output { cmd := "lake", args, cwd := some pkg }
+    unless out.stdout.isEmpty do IO.print out.stdout
+    unless out.stderr.isEmpty do IO.eprint out.stderr
+    if out.exitCode != 0 then
+      IO.eprintln s!"{pkg}: `lake {" ".intercalate (lakeArgs ++ #["env"]).toList} lean-refactor \
+        index-package` exited {out.exitCode}; its stderr is above.  A dependency path its lakefile \
+        reads from a configuration option is passed as `lean-refactor index -K key=value`"
+      status := out.exitCode
+  -- A full extract stages every module's nodes and then deletes them, which leaves a quarter of a
+  -- gigabyte of freed pages the file never gives back on its own.  Only on `full`: an incremental
+  -- refresh's freelist is exactly what the NEXT refresh's staging writes into, so compacting it
+  -- would trade seconds for pages about to be reallocated.
+  if full then Db.exec dbPath "vacuum;"
+  return status
+
+/-- `lean-refactor index-package DB PKG PACKAGES…`, the child half of `run`: run in the nested package
+    `PKG` under its `lake env`, refresh its modules into the root's database `DB`. -/
+public def runPackage (dbPath : String) (me : System.FilePath) (packages : Array System.FilePath) :
+    IO UInt32 := do
+  unless ← System.FilePath.isDir Db.buildDir do
+    IO.eprintln s!"{me}/{Db.buildDir} does not exist; run `lake build` in {me} first"
+    return 1
+  refreshPackage dbPath false packages (some me)
   return 0
 
 end LeanRefactor.Index
