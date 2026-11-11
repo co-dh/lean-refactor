@@ -3271,7 +3271,7 @@ private def coerceStage (path stagePath : String) (cs : Array Coercion) : IO UIn
     imports has settled, because its elaboration reads their `.olean`s.  With `--apply` each wave is
     written and its modules built before the next; in a preview, a file with rewrites holds back its
     importers, which only an applied run can elaborate. -/
-private def coerceGlob (pattern : String) (cs : Array Coercion) (apply : Bool) : IO UInt32 := do
+private def coerceGlob (stage pattern : String) (cs : Array Coercion) (apply : Bool) : IO UInt32 := do
   if ← staleSplitParts then return 1
   let files ← selectedFiles pattern
   if files.isEmpty then return 1
@@ -3298,7 +3298,7 @@ private def coerceGlob (pattern : String) (cs : Array Coercion) (apply : Bool) :
     let ready := pending.filter fun i => settled[i]!.isNone && imports[i]!.all (settled[·]! == some true)
     if ready.isEmpty then break
     let outputs ← mapFilesParallel jobs (ready.map (files[·]!)) fun p =>
-      spawnSelf (#["coerce-stage", p, stagePathFor p] ++ args)
+      spawnSelf (#[stage, p, stagePathFor p] ++ args)
     for (i, o) in ready.zip outputs do
       IO.print o.stdout; IO.eprint o.stderr
       let path := files[i]!
@@ -3319,6 +3319,166 @@ private def coerceGlob (pattern : String) (cs : Array Coercion) (apply : Bool) :
         settled := settled.set! i (some false); status := 1
   unless apply do IO.println "preview only; pass --apply to write"
   return status
+
+/-! ## Dropping a conversion that has become redundant
+
+`uncoerce (A B f)...` follows a binder whose type went from `A` to `B`: the source still applies
+`f : A → B` to a term that is already a `B`, or where an `A` is expected again.  The file is elaborated
+with markers that make both meetings elaborate: a `Coe B A` through an axiom `back`, so `f x` with
+`x : B` reads `f (back x)` and `f x` in an `A` position reads `back (f x)`; and, for `f = A.g`, an
+identity `B.g`, so the field access `x.g` with `x : B` resolves.  A round trip `f (g y)` through a
+listed `g : B → A` is dropped only where `simp` proves `f (g y) = y`.  Each marker read off the info
+trees names a conversion's range and its argument's; the edit is judged by `errorGate`, unmarked. -/
+
+private def uncoerceMarker (kind : String) (i : Nat) : Name := .mkSimple s!"lean-refactor-uncoerce-{kind}-{i}"
+
+/-- `env` with each conversion's `back` axiom, its `Coe B A` through it, `fwd` (`f` read back as a
+    constant), the identity `B.g` where `f` is `A.g` and `B.g` does not exist, and every round trip
+    `simp` proves. -/
+private def withRedundancy (cs : Array Coercion) (env : Environment) (opts : Options) : IO Environment := do
+  let run (env : Environment) (text : String) : IO (Environment × Option Message) := do
+    let st ← Elab.IO.processCommands (Parser.mkInputContext text "<uncoerce>") {} (Elab.Command.mkState env {} opts)
+    return (st.commandState.env, st.commandState.messages.toList.find? (·.severity == .error))
+  let (env, err?) ← run env <| String.join (cs.mapIdx fun i c =>
+    s!"axiom {uncoerceMarker "back" i} : {c.dst} → {c.src}\nnoncomputable instance : Coe ({c.dst}) ({c.src}) := \
+    ⟨{uncoerceMarker "back" i}⟩\ndef {uncoerceMarker "fwd" i} (x : {c.src}) : {c.dst} := {c.conv} x\n").toList
+  if let some m := err? then throw <| IO.userError s!"the conversions do not elaborate: {← m.toString}"
+  let mut env := env
+  for i in [0:cs.size] do
+    let some (.defnInfo d) := env.find? (uncoerceMarker "fwd" i) | continue
+    let some (.axiomInfo b) := env.find? (uncoerceMarker "back" i) | continue
+    let .lam _ a body _ := d.value | continue
+    let .forallE _ dst _ _ := b.type | continue
+    match body.getAppFn.constName?, a.getAppFn.constName?, dst.getAppFn.constName? with
+    | some (.str t g), some ah, some bh =>
+        if t == ah && !env.contains (.str bh g) then
+          let (e, err?) ← run env s!"def {Name.str bh g} (x : {cs[i]!.dst}) : {cs[i]!.dst} := x\n"
+          if let some m := err? then throw <| IO.userError s!"the identity {Name.str bh g} does not elaborate: {← m.toString}"
+          env := e
+    | _, _, _ => pure ()
+    for j in [0:cs.size] do
+      if cs[j]!.src != cs[i]!.dst || cs[j]!.dst != cs[i]!.src then continue
+      let (e, err?) ← run env s!"theorem {uncoerceMarker s!"trip-{j}" i} (y : {cs[i]!.dst}) : \
+        {cs[i]!.conv} ({cs[j]!.conv} y) = y := by simp\n"
+      if err?.isNone then env := e
+  return env
+
+private def uncoerceStage (path stagePath : String) (cs : Array Coercion) : IO UInt32 := do
+  claimElaboration path
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let source ← IO.FS.readFile path
+  initSearchPath (← findSysroot) (← targetSearchPath)
+  let (inputCtx, importEnv, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName)
+      (prepare := withRedundancy cs) (refresh := true) with
+    | .ok result => pure result
+    | .error e =>
+        for msg in e.messages.toList do IO.eprintln (← msg.toString)
+        return 1
+  let fileMap := inputCtx.fileMap
+  let env := frontend.commandState.env
+  let lineOf (p : String.Pos.Raw) := (fileMap.toPosition p).line
+  -- Each conversion's constant, its `A`, and its identity `B.g` when one was declared here.
+  let backs := (Array.range cs.size).map (uncoerceMarker "back")
+  let mut convs := #[]
+  let mut srcs := #[]
+  let mut ids := #[]
+  for i in [0:cs.size] do
+    let some (.defnInfo d) := env.find? (uncoerceMarker "fwd" i) | throw <| IO.userError s!"{path}: marker of {cs[i]!.conv} was not declared"
+    let .lam _ a body _ := d.value | throw <| IO.userError s!"{path}: marker of {cs[i]!.conv} is no function: {d.value}"
+    let some f := body.getAppFn.constName? | throw <| IO.userError s!"{path}: {cs[i]!.conv} is not a constant: {body}"
+    convs := convs.push f; srcs := srcs.push a
+    let some (.axiomInfo b) := env.find? backs[i]! | throw <| IO.userError s!"{path}: marker {backs[i]!} was not declared"
+    ids := ids.push <| match b.type, f with
+      | .forallE _ dst _ _, .str _ g => (dst.getAppFn.constName?.map (Name.str · g)).filter fun n => env.contains n && !importEnv.contains n
+      | _, _ => none
+  let trips := (Array.range cs.size).flatMap fun i => ((Array.range cs.size).filter fun j =>
+    env.contains (uncoerceMarker s!"trip-{j}" i)).map (i, ·)
+  for i in [0:cs.size] do
+    for j in [0:cs.size] do
+      if cs[j]!.src == cs[i]!.dst && cs[j]!.dst == cs[i]!.src && !trips.contains (i, j) then
+        IO.println s!"{path}: simp does not prove {cs[i]!.conv} ({cs[j]!.conv} y) = y; that round trip is kept"
+  let argOf (k : Nat) (e : Expr) : Option Expr := if e.isAppOf convs[k]! && e.isApp then some e.appArg! else none
+  let nodes := frontend.commandState.infoState.trees.foldl (fun acc t => termNodes none none t acc) #[]
+  let exprs ← nodes.mapM fun (ci, ti, _) => ci.runMetaM ti.lctx (instantiateMVars ti.expr)
+  let parents := nodes.foldl (fun s (_, _, p?) => match p? with | some j => s.insert j | none => s)
+    (∅ : Std.HashSet Nat)
+  let marks : Std.HashMap Nat (Array (Nat × Expr)) :=
+    parents.fold (fun m j => m.insert j (markerArgs backs exprs[j]!)) {}
+  -- (site range, the argument it drops to) of every redundant conversion.
+  let mut sites : Array (Syntax.Range × Expr) := #[]
+  let mut unplaced := 0
+  for (ci, ti, parent?) in nodes, e in exprs do
+    -- A node elaborating to the same term as its parent (parentheses) leaves the site to the parent.
+    if parent?.any (exprs[·]! == e) then continue
+    let mut found : Array Expr := #[]
+    for k in [0:cs.size] do
+      if let some id := ids[k]! then if e.isAppOf id && e.isApp then found := found.push e.appArg!
+      let some x := argOf k e | continue
+      -- `back y`: the argument is a `B` as it stands.  A marker deeper in it (`a + b` with `a b : B`,
+      -- whose binop coerces the leaves) leaves the argument as written to the gate.
+      if x.isAppOfArity backs[k]! 1 then found := found.push x.appArg!
+      else if !(markerArgs #[backs[k]!] x).isEmpty then found := found.push x
+      for (_, j) in trips.filter (·.1 == k) do if let some y := argOf j x then found := found.push y
+      let expectedA ← match parent? with
+        | some j => pure <| (marks.getD j #[]).contains (k, e)
+        | none => match ti.expectedType? with
+          | none => pure false
+          | some ex => try ci.runMetaM ti.lctx do Meta.isDefEq (← instantiateMVars ex) srcs[k]!
+              catch err => IO.println s!"{path}: not judged, the expected type does not unify: {err}"; pure false
+      if expectedA then found := found.push x
+    -- Faithful only when this node and every node inside it elaborating to the same conversion (the
+    -- notation a bracket holds) are the source's own syntax at their ranges.
+    let own (stx : Syntax) := stx.getRange? (canonicalOnly := true) |>.filter fun r => frontend.commands.any fun c =>
+      (nodesSpanning c r.start.byteIdx r.stop.byteIdx).any (· == stx)
+    let source? := own ti.stx |>.filter fun r => (nodes.zip exprs).all fun ((_, t, _), x) =>
+      x != e || !(t.stx.getRange?.any fun q => r.start ≤ q.start && q.stop ≤ r.stop) || (own t.stx).isSome
+    for y in found.toList.eraseDups do
+      match source? with
+      | some r => unless sites.any (· == (r, y)) do sites := sites.push (r, y)
+      | none =>
+        IO.println s!"{path}:{ti.stx.getPos?.map (lineOf ·) |>.getD 0}: a redundant conversion in a macro or \
+          notation expansion, with no source range of its own; not rewritten"
+        unplaced := unplaced + 1
+  let ambiguous := sites.filter fun (r, y) => sites.any fun (r', y') => r' == r && y' != y
+  for (r, _) in ambiguous do
+    IO.println s!"{path}:{lineOf r.start}: drops to two different arguments; not rewritten"
+  -- Innermost first, so a site holding another is written around the inner rewrite.
+  let mut written : Array Edit := #[]
+  for (r, y) in (sites.filter (!ambiguous.contains ·)).qsort fun (r, _) (s, _) =>
+      r.stop.byteIdx - r.start.byteIdx < s.stop.byteIdx - s.start.byteIdx do
+    -- The argument as written: the widest node inside the site elaborating to it.
+    let inside := (nodes.zip exprs).filterMap fun ((_, ti, _), x) => ti.stx.getRange?.filter fun q =>
+      x == y && r.start ≤ q.start && q.stop ≤ r.stop && !(q.start == r.start && q.stop == r.stop)
+    let some q := inside.foldl (fun b? q => match b? with
+        | some b => if q.stop.byteIdx - q.start.byteIdx > b.stop.byteIdx - b.start.byteIdx then some q else b?
+        | none => some q) none
+      | IO.println s!"{path}:{lineOf r.start}: the argument has no source range inside the conversion; not rewritten"
+        continue
+    -- Brackets go when the parse keeps the bare argument as one node there; a bare argument gets them
+    -- when it does not.
+    let text := textWithEdits source q.start q.stop written
+    let inner? := (Parser.runParserCategory env `term text).toOption.bind fun s =>
+      if s.isOfKind ``Lean.Parser.Term.paren then s[1].getRange?.map fun i => String.Pos.Raw.extract text i.start i.stop
+      else none
+    let candidates := inner?.toArray ++ #[text, s!"({text})"]
+    let above := (frontend.commands.findSome? (syntaxAt r.start)).map (fun (s, ps) => s :: ps) |>.getD []
+      |>.filter fun s => s.getRange?.any fun p => p.start ≤ r.start && r.stop ≤ p.stop
+    let edit (t : String) : Edit := { start := r.start, stop := r.stop, line := lineOf r.start, replacement := t }
+    let some replacement := candidates.find? fun t => fitsIn env source written (edit t) above
+      | IO.println s!"{path}:{lineOf r.start}: `{text}` does not parse in place of the conversion; not rewritten"
+        continue
+    written := written.push (edit replacement)
+  let edits := written.filter fun e => !written.any fun o =>
+    o.start ≤ e.start && e.stop ≤ o.stop && !(o.start == e.start && o.stop == e.stop)
+  if edits.isEmpty then
+    for m in frontend.commandState.messages.toList.filter (·.severity == .error) do
+      IO.println s!"{path}:{m.pos.line}:{m.pos.column}: error, no redundant conversion: {((← m.toString).splitOn "\n").headD ""}"
+    IO.println s!"{path}: no redundant conversion"
+    return 3
+  let (kept, remaining) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
+  IO.println s!"{path}: uncoerce: {sites.size} site(s) in {edits.size} edit(s), {kept.size} kept, \
+    {edits.size - kept.size} dropped by the error check, {unplaced} in macro expansions, {ambiguous.size} ambiguous"
+  writeStage path source stagePath kept remaining
 
 /-- The source ranges of every pattern of every `match` the elaborator ran.  `fun ⟨a, b⟩`, `let ⟨a, b⟩ :=`,
     `if let`, a `do` pattern, `intro ⟨a, b⟩` and an equation-style definition all reach the elaborator as
@@ -4532,6 +4692,9 @@ private def usage : String := String.intercalate "\n" [
   row "coerce (A B f)..." "a type changed: where a term e of type A meets the expected type B, write",
   row "" "  e.f when f is A.f, else (f e), at the sites the elaborator coerces through a temporary",
   row "" "  Coe A B; module after module in import order, other errors reported with file:line",
+  row "uncoerce (A B f)..." "a type changed back: drop the conversion f : A → B where its argument is",
+  row "" "  already a B, or where an A is expected again (f x to x), and f (g y) to y for a listed",
+  row "" "  g : B → A when simp proves it; the sites from the elaborator, as for coerce",
   "",
   "move",
   row "move d dest" "dest is another .lean file, or a declaration or section to sit before",
@@ -4805,7 +4968,15 @@ def main (args : List String) : IO UInt32 := do
       let some cs := parseCoercions triples
         | IO.eprintln "coerce takes (A B f) triples, e.g. `coerce Nat USize Nat.toUSize USize Nat USize.toNat`"; return 2
       if cs.isEmpty then IO.eprintln "coerce needs at least one (A B f) triple"; return 2
-      return ← coerceGlob (selector?.getD wholeRepository) cs apply
+      return ← coerceGlob "coerce-stage" (selector?.getD wholeRepository) cs apply
+  | "uncoerce-stage" :: path :: stagePath :: triples =>
+      let some cs := parseCoercions triples | IO.eprintln "uncoerce-stage: expected (A B f) triples"; return 2
+      return ← uncoerceStage path stagePath cs
+  | "uncoerce" :: triples =>
+      let some cs := parseCoercions triples
+        | IO.eprintln "uncoerce takes (A B f) triples, e.g. `uncoerce Nat USize Nat.toUSize USize Nat USize.toNat`"; return 2
+      if cs.isEmpty then IO.eprintln "uncoerce needs at least one (A B f) triple"; return 2
+      return ← coerceGlob "uncoerce-stage" (selector?.getD wholeRepository) cs apply
   | ["notate-stage", path, declName, form, stagePath] =>
       return ← notateStage path declName form stagePath
   | ["notate", declName] =>

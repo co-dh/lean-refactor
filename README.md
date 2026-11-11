@@ -88,6 +88,9 @@ rename
   coerce (A B f)...                       a type changed: where a term e of type A meets the expected type B, write
                                             e.f when f is A.f, else (f e), at the sites the elaborator coerces through a temporary
                                             Coe A B; module after module in import order, other errors reported with file:line
+  uncoerce (A B f)...                     a type changed back: drop the conversion f : A → B where its argument is
+                                            already a B, or where an A is expected again (f x to x), and f (g y) to y for a listed
+                                            g : B → A when simp proves it; the sites from the elaborator, as for coerce
 
 move
   move d dest                             dest is another .lean file, or a declaration or section to sit before
