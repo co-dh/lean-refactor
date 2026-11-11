@@ -1154,6 +1154,11 @@ private partial def referenceIdents (stx : Syntax) : Array Syntax :=
 private def spellingFor (trees : Array Elab.InfoTree) (start : String.Pos.Raw) (line : Nat)
     (old new : Name) (text : String) (survivor := false) (underOpen := false) : Except String String := do
   let some c := commandCtxAt? trees start | .error s!"line {line}: no command scope recorded"
+  -- `.c` resolves in the namespace of the type expected there, so only the last component moves.
+  if text.startsWith "." then
+    unless old.getPrefix == new.getPrefix do
+      .error s!"line {line}: `{text}` names `{old}` in its type's namespace, and `{new}` is in another"
+    return s!".{new.updatePrefix .anonymous}"
   let some (explicit, id) := siteIdent? c.env text
     | .error s!"line {line}: `{text}` does not parse as an identifier"
   -- A part that is a token of the scope (`prefix`) is written `«prefix»`, or the edit does not parse.
@@ -1275,7 +1280,9 @@ private def renameEdits (scan : ScannedFile) (r : Rename) (withDefinition : Bool
       | none => false
     let replacement ← spellingFor scan.trees start line old new (String.Pos.Raw.extract scan.source start stop) survivor underOpen
     edits := edits.push { start, stop, line, replacement }
-  return dedupeEdits edits
+  -- The `c` of a `.c` the info trees recorded is a second, unrecorded identifier inside that site.
+  return dedupeEdits <| edits.filter fun e => !edits.any fun o =>
+    o.start ≤ e.start && e.stop ≤ o.stop && !(o.start == e.start && o.stop == e.stop)
 
 /-- The conflict check every batch of renames must pass: two renames claiming the SAME span with
     different replacements is refused and the caller told to run them separately.  Identical
@@ -1303,15 +1310,37 @@ private def reportLines (path source : String) (edits : Array Edit) : Array Stri
 private def reportEdits (path source : String) (edits : Array Edit) : IO Unit := do
   for line in reportLines path source edits do IO.println line
 
+/-- The source ranges of every pattern of every `match` the elaborator ran.  `fun ⟨a, b⟩`, `let ⟨a, b⟩ :=`,
+    `if let`, a `do` pattern, `intro ⟨a, b⟩` and an equation-style definition all reach the elaborator as
+    a `match` whose patterns are the author's own syntax, so their ranges are original. -/
+private def patternRanges (infos : Array (Elab.ContextInfo × Elab.TermInfo)) : Array Syntax.Range := Id.run do
+  let mut ranges := #[]
+  for (_, ti) in infos do
+    unless ti.stx.isOfKind ``Lean.Parser.Term.match do continue
+    for alts in ti.stx.getArgs do
+      unless alts.isOfKind ``Lean.Parser.Term.matchAlts do continue
+      for alt in alts[0].getArgs do
+        for pats in alt[1].getSepArgs do
+          for pat in pats.getSepArgs do
+            if let some r := pat.getRange? (canonicalOnly := true) then ranges := ranges.push r
+  return ranges
+
 /-- Rewrite every reference in `path` named by `renames`.  The declarations' own binding sites are
-    left alone; use `rename-decl` to move both. -/
-private def renameReferences (path moduleName : String) (renames : Array Rename) (apply : Bool) :
-    IO UInt32 := do
+    left alone; use `rename-decl` to move both.  `inPattern?` keeps only the uses in a pattern (`true`)
+    or only those in a term (`false`): a use is in a pattern when a pattern of a `match` the
+    elaborator ran (`patternRanges`) holds it. -/
+private def renameReferences (path moduleName : String) (renames : Array Rename) (apply : Bool)
+    (inPattern? : Option Bool := none) : IO UInt32 := do
   match ← scanFile path moduleName with
   | .error code => return code
   | .ok scan =>
     let some edits ←
       okOr s!"{path}: " (batchRenameEdits scan renames (withDefinition := false)) | return 1
+    let pats := patternRanges (termInfos scan.trees)
+    let (inP, inT) := edits.partition fun e => pats.any fun r => r.start ≤ e.start && e.stop ≤ r.stop
+    if inPattern?.isSome then
+      IO.println s!"{path}: {inT.size} use(s) in term position, {inP.size} in pattern position"
+    let edits := match inPattern? with | some true => inP | some false => inT | none => edits
     if edits.isEmpty then IO.println s!"{path}: no reference to {renameList renames}"; return 0
     reportEdits path scan.source edits
     unless apply do IO.println "preview only; pass --apply to write"; return 0
@@ -2226,11 +2255,12 @@ private def semanticDupReport (column what : String) (minSize : Nat) : IO UInt32
     in preview: which spelling of the new name a use site takes is a question for name resolution
     in that site's own scope (its namespace, its `open`s), and only the elaborated file has it. -/
 private def renameGlob (dbPath? : Option String) (pattern : String) (renames : Array Rename)
-    (apply : Bool) : IO UInt32 := do
+    (apply : Bool) (inPattern? : Option Bool := none) : IO UInt32 := do
   let selected ← renameSelection dbPath? pattern renames
   if selected.isEmpty then return 1
   let outputs ← mapFilesParallel (← scanJobs) selected fun path =>
-    spawnSelf (#["rename-file", path] ++ renameArgs renames ++ (if apply then #["--apply"] else #[]))
+    spawnSelf (#["rename-file", path] ++ renameArgs renames ++ (if apply then #["--apply"] else #[]) ++
+      (match inPattern? with | some true => #["--patterns-only"] | some false => #["--terms-only"] | none => #[]))
   let status ← reportOutputs outputs
   if let some dbPath := dbPath? then
     for r in renames do warnSilentDependents dbPath r.declName
@@ -3480,21 +3510,6 @@ private def uncoerceStage (path stagePath : String) (cs : Array Coercion) : IO U
     {edits.size - kept.size} dropped by the error check, {unplaced} in macro expansions, {ambiguous.size} ambiguous"
   writeStage path source stagePath kept remaining
 
-/-- The source ranges of every pattern of every `match` the elaborator ran.  `fun ⟨a, b⟩`, `let ⟨a, b⟩ :=`,
-    `if let`, a `do` pattern, `intro ⟨a, b⟩` and an equation-style definition all reach the elaborator as
-    a `match` whose patterns are the author's own syntax, so their ranges are original. -/
-private def patternRanges (infos : Array (Elab.ContextInfo × Elab.TermInfo)) : Array Syntax.Range := Id.run do
-  let mut ranges := #[]
-  for (_, ti) in infos do
-    unless ti.stx.isOfKind ``Lean.Parser.Term.match do continue
-    for alts in ti.stx.getArgs do
-      unless alts.isOfKind ``Lean.Parser.Term.matchAlts do continue
-      for alt in alts[0].getArgs do
-        for pats in alt[1].getSepArgs do
-          for pat in pats.getSepArgs do
-            if let some r := pat.getRange? (canonicalOnly := true) then ranges := ranges.push r
-  return ranges
-
 /-- The type each explicit parameter of `c` takes where its result is expected at `ty?`: the
     parameters are opened as metavariables and the result unified with `ty?`, so `Except.ok`'s
     argument at `Except ε QValue` is a `QValue`, as the elaborator would have it. -/
@@ -3965,7 +3980,7 @@ private def wholeRepository : String := "**.lean"
     repository-wide pass, and only same-kind renames share a scan; a mixed batch would run two
     machineries and could only report the outcome of one. -/
 private def renameAll (selector? : Option String) (renames : Array Rename)
-    (apply usesOnly noIndex : Bool) : IO UInt32 := do
+    (apply usesOnly noIndex : Bool) (inPattern? : Option Bool := none) : IO UInt32 := do
   let dbPath? ← if noIndex then pure none else refreshedIndex?
   let mut kinds := #[]
   for r in renames do
@@ -3992,7 +4007,7 @@ private def renameAll (selector? : Option String) (renames : Array Rename)
       -- `--uses-only` leaves the binding site alone, so each file still elaborates on its own and
       -- the cheap per-file path applies.  A real rename moves the binding site too, which no
       -- ordering of per-file edits keeps valid, so it stages every file and builds once.
-      if usesOnly then renameGlob dbPath? pattern renames apply
+      if usesOnly then renameGlob dbPath? pattern renames apply inPattern?
       else renameDeclGlob dbPath? pattern renames apply
   | .token _ =>
       let mut status : UInt32 := 0
@@ -4675,6 +4690,8 @@ private def usage : String := String.intercalate "\n" [
   "rename",
   row "rename (old r)..." "old is a declaration, a module, a .lean file, or a notation token",
   row "  --uses-only" "write r where old is used, but not where it is declared",
+  row "  --terms-only" "... only the uses in a term: a match/fun/let pattern keeps old",
+  row "  --patterns-only" "... only the uses in such a pattern",
   row "  --no-index" "find the files by elaborating them, not from the index",
   row "rename-binder d old new" "rename one bound variable of d, in its signature and its proof",
   row "rename-var old new" "rename a variable-bound binder, and its uses, repository-wide",
@@ -4789,13 +4806,19 @@ def main (args : List String) : IO UInt32 := do
   let apply := args.contains "--apply"
   let sameStatement := args.contains "--same-statement"
   let sameProof := args.contains "--same-proof"
-  let usesOnly := args.contains "--uses-only"
+  -- Which uses a rename moves: only those in a pattern, only those in a term, or all.
+  let inPattern? : Option Bool := if args.contains "--patterns-only" then some true
+    else if args.contains "--terms-only" then some false else none
+  if args.contains "--patterns-only" && args.contains "--terms-only" then
+    IO.eprintln "--terms-only and --patterns-only select disjoint uses; pass one"; return 2
+  -- A pattern or a term is a use, never the binding site.
+  let usesOnly := args.contains "--uses-only" || inPattern?.isSome
   let noIndex := args.contains "--no-index"
   let body := args.contains "--body"
   let syntaxMatch := args.contains "--syntax"
   keepFailedEdit.set (args.contains "--keep")
   let args := args.filter fun a =>
-    !["--apply", "--uses-only", "--no-index", "--body", "--syntax", "--keep",
+    !["--apply", "--uses-only", "--terms-only", "--patterns-only", "--no-index", "--body", "--syntax", "--keep",
       "--same-statement", "--same-proof"].contains a
   -- Repeatable, so not a `stripFlag`; and before them, which would take `-K` as a flag's value.
   let rec lakeOpts : List String → List String × Array String
@@ -4879,7 +4902,7 @@ def main (args : List String) : IO UInt32 := do
   | "rename" :: rest =>
       match parseRenames rest with
       | .error message => IO.eprintln message; return 2
-      | .ok renames => return ← renameAll selector? renames apply usesOnly noIndex
+      | .ok renames => return ← renameAll selector? renames apply usesOnly noIndex inPattern?
   -- One argument is a file of the pairs: a sweep's list is too long to type and the shell's
   -- splitting tools are not to be trusted with it.
   | ["remove-import", file] =>
@@ -4898,7 +4921,7 @@ def main (args : List String) : IO UInt32 := do
       let some moduleName ← okOr "" (moduleNameOfPath path) | return 2
       match parseRenames rest with
       | .error message => IO.eprintln message; return 2
-      | .ok renames => return ← renameReferences path moduleName renames apply
+      | .ok renames => return ← renameReferences path moduleName renames apply inPattern?
   | ["collapse-stage", path, stagePath, declName, replacement] =>
       return ← collapseStage path stagePath declName replacement none
   | ["collapse-stage", path, stagePath, declName, replacement, argIndex] =>

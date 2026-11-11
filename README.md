@@ -71,6 +71,8 @@ query
 rename
   rename (old r)...                       old is a declaration, a module, a .lean file, or a notation token
     --uses-only                           write r where old is used, but not where it is declared
+    --terms-only                          ... only the uses in a term: a match/fun/let pattern keeps old
+    --patterns-only                       ... only the uses in such a pattern
     --no-index                            find the files by elaborating them, not from the index
   rename-binder d old new                 rename one bound variable of d, in its signature and its proof
   rename-var old new                      rename a variable-bound binder, and its uses, repository-wide
