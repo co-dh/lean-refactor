@@ -3624,7 +3624,13 @@ private def retypeStage (path stagePath src dst : String) (conv? : Option String
         text := applyEdits text kept; remaining := rest; count := count + kept.size
       break
     rounds := rounds + 1
-    let (kept, _) ← errorGate menv path text (fe.commands.filterMap (·.getRange?)) (plan.map (·.edit))
+    let gate (edits : Array Edit) := (·.1) <$> errorGate menv path text (fe.commands.filterMap (·.getRange?)) edits
+    let mut kept ← gate (plan.map (·.edit))
+    -- An error outside every retyped command (a caller) blames no one retype: judge each alone, then together.
+    if kept.isEmpty && plan.size > 1 then
+      IO.println s!"{path}: judging the {plan.size} retypes one at a time"
+      let alone ← plan.filterM fun t => return !(← gate #[t.edit]).isEmpty
+      unless alone.isEmpty do kept ← gate (alone.map (·.edit))
     let isKept (e : Edit) := kept.any fun k => k.start == e.start && k.stop == e.stop
     retyped := retyped.map (shiftedBy kept ·)
     dropped := dropped.map (shiftedBy kept ·)

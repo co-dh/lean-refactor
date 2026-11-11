@@ -12,6 +12,9 @@ def pat : Option Nat → Vec
   | none => mk 0
 def auto (f : Fin n) : Vec := mk n
 def other (n : Nat) : Vec := have h : n + 0 = n := Nat.add_zero n; mk n
+def asFun (n : Nat) : Vec := mk n
+def user : Nat → Vec := asFun
+def fine (n : Nat) : Vec := mk n
 
 section
 variable (z : Nat)

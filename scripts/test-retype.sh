@@ -7,7 +7,8 @@
 # its declarations want, and a retyped binder used as a `Nat` (converted by `--convert`).
 # `Fix/Left.lean` holds every site retype must leave and report: a structure field, a term that is no
 # variable, a pattern-bound and an auto-bound variable, a `variable` one declaration disagrees with,
-# and a retype that causes an error of another kind.  `Fix/Down.lean` (imports `Use`) is elaborated
+# and retypes that cause an error of another kind, in their own command or in a caller (`user`), which
+# must not take the good retype `fine` down with them.  `Fix/Down.lean` (imports `Use`) is elaborated
 # only once `Use` has been written and built.
 #
 # Builds the fixture in a scratch copy (so `.lake` never lands in the checked-in fixture).
@@ -49,7 +50,7 @@ check "$preview" 'Fix/Left.lean:11:17: `n`: bound by a pattern; left for coerce 
 check "$preview" 'Fix/Left.lean:13:33: `n` has no written binder (auto-bound); left for coerce or by hand'
 check "$preview" 'Fix/Left.lean:14:53: error after the rewrite'
 check "$preview" 'Fix/Left.lean:14:70: `n`: retyping its binder was dropped by the error check'
-check "$preview" 'Fix/Left.lean:17:10: variable `z` is wanted as USize by 1 of the 2 declarations binding it; not retyped'
+check "$preview" 'Fix/Left.lean:20:10: variable `z` is wanted as USize by 1 of the 2 declarations binding it; not retyped'
 check "$applied_log" 'Fix/Use.lean:8: convert "n" -> "n.toNat"'
 check "$use" 'def single (n : USize) : Vec := mk n'
 check "$use" 'def group (n : USize) (m : Nat) : Vec'
@@ -62,6 +63,9 @@ check "$use" 'theorem ex : ∃ n : USize, (mk n).name = "v"'
 check "$use" 'variable (w : USize)'
 check "$left" 'variable (z : Nat)'
 check "$left" 'def other (n : Nat) : Vec'
+check "$left" 'def asFun (n : Nat) : Vec'
+check "$left" 'def fine (n : USize) : Vec := mk n'
+check "$preview" 'Fix/Left.lean: judging the 3 retypes one at a time'
 check "$left" 'def field : Old := { size := usz }'
 check "$down" 'def down (j : USize) : Vec := single j'
 
