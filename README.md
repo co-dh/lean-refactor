@@ -93,6 +93,10 @@ rename
   uncoerce (A B f)...                     a type changed back: drop the conversion f : A → B where its argument is
                                             already a B, or where an A is expected again (f x to x), and f (g y) to y for a listed
                                             g : B → A when simp proves it; the sites from the elaborator, as for coerce
+  retype A B                              a type changed: where a variable whose binder writes A meets an expected B, write B in
+                                            that binder (splitting its group), and B for a written result type A whose body is a B;
+                                            to a fixed point in each file, files in import order as for coerce; what is left is reported
+    --convert g                             ... and write (g x) where a retyped x : B is used as an A
 
 move
   move d dest                             dest is another .lean file, or a declaration or section to sit before
