@@ -567,6 +567,20 @@ private def elaborationErrors (env : Environment) (path source : String) :
   let frontend ← Elab.IO.processCommands ctx parserState (Elab.Command.mkState env {} {})
   errorsOf frontend.commandState.messages
 
+/-- `source` elaborated against `env` with no options, as `elaborationErrors` elaborates it, kept
+    whole.  With `old?`, such an elaboration of another text, the commands before the first byte
+    the texts differ in are reused instead of elaborated again: the language server's reuse. -/
+private def elaborateReusing (env : Environment) (path source : String)
+    (old? : Option Elab.IncrementalState := none) : IO (Except MessageLog Elab.IncrementalState) := do
+  let ctx := Parser.mkInputContext source path
+  let (_, parserState, headerMessages) ← Parser.parseHeader ctx
+  if headerMessages.hasErrors then return .error headerMessages
+  return .ok (← Elab.IO.processCommandsIncrementally ctx parserState (Elab.Command.mkState env {} {}) old?)
+
+/-- A progress line on stderr, flushed now: a staging that runs for minutes otherwise says nothing. -/
+private def progress (line : String) : IO Unit := do
+  let e ← IO.getStderr; e.putStrLn line; e.flush
+
 private def elaboratesCleanly (env : Environment) (path source : String) : IO Bool := do
   return (← elaborationErrors env path source).isEmpty
 
@@ -1430,6 +1444,14 @@ private def reportOutputs (outputs : Array IO.Process.Output) : IO UInt32 := do
     parent is by construction the up-to-date build that a `lake exe` would have selected. -/
 private def spawnSelf (args : Array String) : IO IO.Process.Output := do
   IO.Process.output { cmd := (← IO.appPath).toString, args }
+
+/-- `spawnSelf` with the child's stderr passed straight through, so a staging child's progress lines
+    show while it runs instead of after it exits; its stdout is still collected. -/
+private def spawnSelfStreaming (args : Array String) : IO IO.Process.Output := do
+  let child ← IO.Process.spawn
+    { cmd := (← IO.appPath).toString, args, stdout := .piped, stderr := .inherit, stdin := .null }
+  let stdout ← child.stdout.readToEnd
+  return { exitCode := ← child.wait, stdout, stderr := "" }
 
 /-- Run one `lean-refactor` subcommand per matching file, each in a CHILD process.
 
@@ -2700,6 +2722,21 @@ private partial def nodesSpanning (stx : Syntax) (b0 b1 : Nat) : Array Syntax :=
 
 private def hasNodeSpanning (stx : Syntax) (b0 b1 : Nat) : Bool := !(nodesSpanning stx b0 b1).isEmpty
 
+/-- What `nodesSpanning` finds, for every range at once: each non-`null` node of `stx` filed under its
+    exact byte range.  One walk of the commands, where `nodesSpanning` per term node walks them all once
+    per node, which made a site search quadratic in the file. -/
+private partial def indexNodes (m : Std.HashMap (Nat × Nat) (Array Syntax)) (stx : Syntax) :
+    Std.HashMap (Nat × Nat) (Array Syntax) :=
+  let m := match stx.isOfKind nullKind, stx.getRange? with
+    | false, some r => m.alter (r.start.byteIdx, r.stop.byteIdx) fun xs => some ((xs.getD #[]).push stx)
+    | _, _ => m
+  stx.getArgs.foldl indexNodes m
+
+/-- `stx`'s range when `stx` IS the source's node there (in `index`, from `indexNodes` over the
+    commands): an expansion can carry the range of the notation it came from. -/
+private def ownRange? (index : Std.HashMap (Nat × Nat) (Array Syntax)) (stx : Syntax) : Option Syntax.Range :=
+  stx.getRange? (canonicalOnly := true) |>.filter fun r => (index.getD (r.start.byteIdx, r.stop.byteIdx) #[]).contains stx
+
 /-- `text` parses as ONE argument: `f text g` is `f` applied to exactly `text` and `g`.  The trailing
     `g` is what catches a `fun`/`match`, which would swallow anything after it. -/
 private def isAtomic (env : Environment) (text : String) : Bool :=
@@ -3045,19 +3082,32 @@ private def unshiftedBy (edits : Array Edit) (q : Nat) : Nat := Id.run do
 /-- The gate of a staging that runs where the file did not elaborate before the edit, so a build
     cannot judge it: the errors of `source` against those of the edited text, both elaborated against
     `importEnv`.  An error that is new, or that sits in rewritten text, drops every edit of the command
-    holding it, until none is left.  Gives back the edits kept and the errors that remain. -/
+    holding it, until none is left.  Gives back the edits kept, the errors that remain, and, when an
+    edit is kept, the elaboration of `source` with them.  `before?`, an elaboration of `source` as
+    `elaborateReusing` makes it, spares elaborating it again; every edited text reuses its commands
+    up to the first edit, so a gate costs the commands from there on, not the whole file. -/
 private def errorGate (importEnv : Environment) (path source : String) (commands : Array Syntax.Range)
-    (edits : Array Edit) : IO (Array Edit × Array (Nat × Position × String)) := do
-  let errorsOf (src : String) : IO (Array (Nat × Position × String)) := do
+    (edits : Array Edit) (before? : Option Elab.IncrementalState := none) :
+    IO (Array Edit × Array (Nat × Position × String) × Option Elab.IncrementalState) := do
+  let errorsOf (src : String) (old? : Option Elab.IncrementalState) := do
     let fm := FileMap.ofString src
-    return (← elaborationErrors importEnv path src).map fun (pos, m) => ((fm.ofPosition pos).byteIdx, pos, m)
-  let before ← errorsOf source
+    let (log, st?) ← match old?.filter (·.inputCtx.inputString == src) with
+      | some st => pure (st.commandState.messages, some st)
+      | none => pure <| match ← elaborateReusing importEnv path src old? with
+        | .error log => (log, none)
+        | .ok st => (st.commandState.messages, some st)
+    let errors ← (log.toList.filter (·.severity == .error)).toArray.mapM fun m =>
+      return ((fm.ofPosition m.pos).byteIdx, m.pos, ← m.toString)
+    return (errors, st?)
+  let (before, base?) ← errorsOf source before?
   let mut kept := edits.qsort (·.start.byteIdx < ·.start.byteIdx)
   let mut remaining := #[]
+  let mut last? := none
   repeat
     let was := before.map (shiftedBy kept ·.1)
     let written := kept.map fun e => let s := shiftedBy kept e.start.byteIdx; (s, s + e.replacement.utf8ByteSize)
-    let after ← errorsOf (applyEdits source kept)
+    let (after, st?) ← errorsOf (applyEdits source kept) base?
+    last? := st?
     let bad := after.filter fun (q, _) => !was.contains q || written.any fun (s, t) => s ≤ q && q ≤ t
     remaining := after
     if bad.isEmpty then break
@@ -3072,7 +3122,7 @@ private def errorGate (importEnv : Environment) (path source : String) (commands
     IO.println s!"{path}: {kept.size - next.size} rewrite(s) in the command(s) holding those errors dropped"
     kept := next
     if kept.isEmpty then break
-  return (kept, remaining)
+  return (kept, remaining, if kept.isEmpty then none else last?)
 
 /-- Print the kept edits and the errors left, and stage the edited source; 3 when nothing is kept. -/
 private def writeStage (path source stagePath : String) (kept : Array Edit)
@@ -3143,7 +3193,7 @@ private def unwrapStage (path declName stagePath : String) : IO UInt32 := do
   let summary (kept dropped : Nat) :=
     IO.println s!"{path}: unwrap `{declName}`: {sites.size} recognised, {kept} rewritten, {dropped} dropped by the error check, {mentions.size} mention(s), {unknown} unrecognised"
   if edits.isEmpty then summary 0 0; return 3
-  let (kept, remaining) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
+  let (kept, remaining, _) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
   let rewrote := sites.filter (·.all fun e => kept.any fun k => k.start == e.start && k.stop == e.stop)
   summary rewrote.size (sites.size - rewrote.size)
   writeStage path source stagePath kept remaining
@@ -3243,6 +3293,7 @@ private def conversionSites (path : String) (fileMap : FileMap) (frontend : Elab
     (∅ : Std.HashSet Nat)
   let marks : Std.HashMap Nat (Array (Nat × Expr)) :=
     parents.fold (fun m j => m.insert j (markerArgs markers exprs[j]!)) {}
+  let index := frontend.commands.foldl indexNodes {}
   -- Every site; a node with no original range sits in a macro expansion.
   let mut sites : Array Site := #[]
   let mut unplaced := 0
@@ -3260,10 +3311,10 @@ private def conversionSites (path : String) (fileMap : FileMap) (frontend : Elab
               let ex ← instantiateMVars expected
               pure ((← Meta.isDefEq ty types[k]!.1) && (← Meta.isDefEq ex types[k]!.2) && !(← Meta.isDefEq ty ex))
           catch e => IO.println s!"{at_ ti.stx}: not judged, its type does not infer: {e}"; pure #[]
+    if found.isEmpty then continue
     -- Faithful only when the node's syntax IS the source's at that range: an expansion can carry the
     -- range of the notation it came from (`SEVEN` elaborating its expansion `seven`).
-    let source? := ti.stx.getRange? (canonicalOnly := true) |>.filter fun r => frontend.commands.any fun c =>
-      (nodesSpanning c r.start.byteIdx r.stop.byteIdx).any (· == ti.stx)
+    let source? := ownRange? index ti.stx
     for k in found do
       match source? with
       | some r => unless sites.any (fun s => s.k == k && s.r == r) do
@@ -3324,7 +3375,7 @@ private def coerceStage (path stagePath : String) (cs : Array Coercion) : IO UIn
       IO.println s!"{path}:{m.pos.line}:{m.pos.column}: error, no conversion site: {((← m.toString).splitOn "\n").headD ""}"
     IO.println s!"{path}: no conversion site"
     return 3
-  let (kept, remaining) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
+  let (kept, remaining, _) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
   IO.println s!"{path}: coerce: {sites.size} site(s) in {edits.size} edit(s), {kept.size} kept, \
     {edits.size - kept.size} dropped by the error check, {unplaced} in macro expansions, {ambiguous.size} ambiguous"
   writeStage path source stagePath kept remaining
@@ -3359,7 +3410,7 @@ private def coerceGlob (stage pattern : String) (args : Array String) (apply : B
     let ready := pending.filter fun i => settled[i]!.isNone && imports[i]!.all (settled[·]! == some true)
     if ready.isEmpty then break
     let outputs ← mapFilesParallel jobs (ready.map (files[·]!)) fun p =>
-      spawnSelf (#[stage, p, stagePathFor p] ++ args)
+      spawnSelfStreaming (#[stage, p, stagePathFor p] ++ args)
     for (i, o) in ready.zip outputs do
       IO.print o.stdout; IO.eprint o.stderr
       let path := files[i]!
@@ -3605,9 +3656,19 @@ private def retypeStage (path stagePath src dst : String) (conv? : Option String
   let mut count := 0
   let mut rounds := 0
   let mut remaining : Array (Nat × Position × String) := #[]
+  -- `text` elaborated as the gate elaborates it (no options), once known: the first round's `fe` has
+  -- the module's options, every later one is the gate's own elaboration of the kept edits.
+  let mut base? : Option Elab.IncrementalState := none
   repeat
     let (sites, _) ← conversionSites path fileMap fe cs markers types
     let (plan, reports, needs) := retypePlan path text src dst fileMap fe.commandState.env fe sites retyped dropped
+    progress s!"{path}: round {rounds + 1}: {sites.size} site(s), {plan.size} retype(s) planned"
+    if base?.isNone then
+      base? ← match ← elaborateReusing menv path text with
+        | .ok st => pure (some st)
+        | .error log =>
+          for m in log.toList do IO.eprintln (← m.toString)
+          throw <| IO.userError s!"{path}: the header does not parse for the error check"
     let errors ← (fe.commandState.messages.toList.filter (·.severity == .error)).toArray.mapM fun m =>
       return ((fileMap.ofPosition m.pos).byteIdx, m.pos, ← m.toString)
     remaining := errors
@@ -3618,19 +3679,25 @@ private def retypeStage (path stagePath src dst : String) (conv? : Option String
           retyped to {dst}, is used where {src} is needed{if conv?.isSome then "" else "; left for coerce"}"
       if let some _ := conv? then
         let edits ← conversionEdits fe.commandState.env path text fileMap cs dots (needs.map (1, ·.r))
-        let (kept, rest) ← errorGate menv path text (fe.commands.filterMap (·.getRange?)) edits
+        let (kept, rest, _) ← errorGate menv path text (fe.commands.filterMap (·.getRange?)) edits base?
         for e in kept do
           IO.println s!"{path}:{e.line}: convert {repr (String.Pos.Raw.extract text e.start e.stop)} -> {repr e.replacement}"
         text := applyEdits text kept; remaining := rest; count := count + kept.size
       break
     rounds := rounds + 1
-    let gate (edits : Array Edit) := (·.1) <$> errorGate menv path text (fe.commands.filterMap (·.getRange?)) edits
-    let mut kept ← gate (plan.map (·.edit))
+    let gate (edits : Array Edit) := do
+      let (kept, _, st?) ← errorGate menv path text (fe.commands.filterMap (·.getRange?)) edits base?
+      pure (kept, st?)
+    let all ← gate (plan.map (·.edit))
+    let mut kept := all.1
+    let mut next? := all.2
     -- An error outside every retyped command (a caller) blames no one retype: judge each alone, then together.
     if kept.isEmpty && plan.size > 1 then
       IO.println s!"{path}: judging the {plan.size} retypes one at a time"
-      let alone ← plan.filterM fun t => return !(← gate #[t.edit]).isEmpty
-      unless alone.isEmpty do kept ← gate (alone.map (·.edit))
+      let alone ← plan.filterM fun t => return !(← gate #[t.edit]).1.isEmpty
+      unless alone.isEmpty do
+        let together ← gate (alone.map (·.edit))
+        kept := together.1; next? := together.2
     let isKept (e : Edit) := kept.any fun k => k.start == e.start && k.stop == e.stop
     retyped := retyped.map (shiftedBy kept ·)
     dropped := dropped.map (shiftedBy kept ·)
@@ -3645,10 +3712,12 @@ private def retypeStage (path stagePath src dst : String) (conv? : Option String
     if kept.isEmpty then continue
     count := count + kept.size
     text := applyEdits text kept
-    let ctx := Parser.mkInputContext text path
-    let (_, ps, _) ← Parser.parseHeader ctx
-    fileMap := ctx.fileMap
-    fe ← Elab.IO.processCommands ctx ps (Elab.Command.mkState menv {} {})
+    -- The gate's last elaboration is of `text` under the markers: the next round's.
+    let some st := next? | throw <| IO.userError s!"{path}: the error check kept {kept.size} retype(s) but \
+      handed back no elaboration of them"
+    fileMap := st.inputCtx.fileMap
+    fe := st.toState
+    base? := some st
   for (_, pos, m) in remaining do
     IO.println s!"{path}:{pos.line}:{pos.column}: error of another kind remains: {(m.splitOn "\n").headD ""}"
   IO.println s!"{path}: retype: {count} edit(s) in {rounds} round(s)"
@@ -3741,6 +3810,7 @@ private def uncoerceStage (path stagePath : String) (cs : Array Coercion) : IO U
   let marks : Std.HashMap Nat (Array (Nat × Expr)) :=
     parents.fold (fun m j => m.insert j (markerArgs backs exprs[j]!)) {}
   -- (site range, the argument it drops to) of every redundant conversion.
+  let index := frontend.commands.foldl indexNodes {}
   let mut sites : Array (Syntax.Range × Expr) := #[]
   let mut unplaced := 0
   for (ci, ti, parent?) in nodes, e in exprs do
@@ -3764,8 +3834,8 @@ private def uncoerceStage (path stagePath : String) (cs : Array Coercion) : IO U
       if expectedA then found := found.push x
     -- Faithful only when this node and every node inside it elaborating to the same conversion (the
     -- notation a bracket holds) are the source's own syntax at their ranges.
-    let own (stx : Syntax) := stx.getRange? (canonicalOnly := true) |>.filter fun r => frontend.commands.any fun c =>
-      (nodesSpanning c r.start.byteIdx r.stop.byteIdx).any (· == stx)
+    if found.isEmpty then continue
+    let own := ownRange? index
     let source? := own ti.stx |>.filter fun r => (nodes.zip exprs).all fun ((_, t, _), x) =>
       x != e || !(t.stx.getRange?.any fun q => r.start ≤ q.start && q.stop ≤ r.stop) || (own t.stx).isSome
     for y in found.toList.eraseDups do
@@ -3811,7 +3881,7 @@ private def uncoerceStage (path stagePath : String) (cs : Array Coercion) : IO U
       IO.println s!"{path}:{m.pos.line}:{m.pos.column}: error, no redundant conversion: {((← m.toString).splitOn "\n").headD ""}"
     IO.println s!"{path}: no redundant conversion"
     return 3
-  let (kept, remaining) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
+  let (kept, remaining, _) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
   IO.println s!"{path}: uncoerce: {sites.size} site(s) in {edits.size} edit(s), {kept.size} kept, \
     {edits.size - kept.size} dropped by the error check, {unplaced} in macro expansions, {ambiguous.size} ambiguous"
   writeStage path source stagePath kept remaining
