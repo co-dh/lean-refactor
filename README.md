@@ -52,14 +52,14 @@ usage: lean-refactor command [args] [--in g] [--apply]
           'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'
           Default: the file the index says declares d; every file the index recorded a use of
           d in for inspect; the whole repository for the sweeps (rename, infix, unused,
-          unused-simp, modularize, insert-arg).
+          unused-simp, modularize, insert-arg, coerce).
 
   d  declaration, full name      r  replacement      n  index, counting from 1
   tok  a notation token: the symbol a `notation`/`infixl` command introduces, as the source
        literally writes it — `≫`, `⊆ₛ`.  Not a declaration, so the index has no row for it.
 
 query
-  index [--full]                          build or refresh the index
+  index [--full] [-K k=v]                 build or refresh the index: the root and every nested lake package
   uses d                                  modules that use d
   stmt frag                               signatures of declarations whose name has frag in it
   dup [--min-nodes n]                     repeated source subtrees
@@ -85,6 +85,9 @@ rename
                                             let some r := d a | alt to let r := d a, d a = .ok r (some, pure) to d a = r,
                                             match d a with | .ok p (some p) to | p, its .error/none arms dropped;
                                             where Except/Option is still expected, d a to pure (d a)
+  coerce (A B f)...                       a type changed: where a term e of type A meets the expected type B, write
+                                            e.f when f is A.f, else (f e), at the sites the elaborator coerces through a temporary
+                                            Coe A B; module after module in import order, other errors reported with file:line
 
 move
   move d dest                             dest is another .lean file, or a declaration or section to sit before

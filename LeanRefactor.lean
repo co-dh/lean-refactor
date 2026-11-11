@@ -2662,11 +2662,13 @@ private def renderForm (pieces : Array FormPiece) (args : Array String) :
       out := out ++ arg
   return (out, spans)
 
-private partial def hasNodeSpanning (stx : Syntax) (b0 b1 : Nat) : Bool :=
+/-- The nodes of `stx` spanning exactly bytes `b0`–`b1`. -/
+private partial def nodesSpanning (stx : Syntax) (b0 b1 : Nat) : Array Syntax :=
   -- A `null` node only groups (an application's argument list), so it is not one term.
-  (!stx.isOfKind nullKind && match stx.getRange? with
-    | some r => r.start.byteIdx == b0 && r.stop.byteIdx == b1
-    | none => false) || stx.getArgs.any (hasNodeSpanning · b0 b1)
+  (if !stx.isOfKind nullKind && stx.getRange?.any (fun r => r.start.byteIdx == b0 && r.stop.byteIdx == b1)
+    then #[stx] else #[]) ++ stx.getArgs.flatMap (nodesSpanning · b0 b1)
+
+private def hasNodeSpanning (stx : Syntax) (b0 b1 : Nat) : Bool := !(nodesSpanning stx b0 b1).isEmpty
 
 /-- `text` parses as ONE argument: `f text g` is `f` applied to exactly `text` and `g`.  The trailing
     `g` is what catches a `fun`/`match`, which would swallow anything after it. -/
@@ -3010,12 +3012,56 @@ private def unshiftedBy (edits : Array Edit) (q : Nat) : Nat := Id.run do
     delta := delta + e.replacement.utf8ByteSize - (e.stop.byteIdx - e.start.byteIdx : Nat)
   return (q - delta).toNat
 
+/-- The gate of a staging that runs where the file did not elaborate before the edit, so a build
+    cannot judge it: the errors of `source` against those of the edited text, both elaborated against
+    `importEnv`.  An error that is new, or that sits in rewritten text, drops every edit of the command
+    holding it, until none is left.  Gives back the edits kept and the errors that remain. -/
+private def errorGate (importEnv : Environment) (path source : String) (commands : Array Syntax.Range)
+    (edits : Array Edit) : IO (Array Edit × Array (Nat × Position × String)) := do
+  let errorsOf (src : String) : IO (Array (Nat × Position × String)) := do
+    let fm := FileMap.ofString src
+    return (← elaborationErrors importEnv path src).map fun (pos, m) => ((fm.ofPosition pos).byteIdx, pos, m)
+  let before ← errorsOf source
+  let mut kept := edits.qsort (·.start.byteIdx < ·.start.byteIdx)
+  let mut remaining := #[]
+  repeat
+    let was := before.map (shiftedBy kept ·.1)
+    let written := kept.map fun e => let s := shiftedBy kept e.start.byteIdx; (s, s + e.replacement.utf8ByteSize)
+    let after ← errorsOf (applyEdits source kept)
+    let bad := after.filter fun (q, _) => !was.contains q || written.any fun (s, t) => s ≤ q && q ≤ t
+    remaining := after
+    if bad.isEmpty then break
+    let blamed := bad.filterMap fun (q, _) => commands.find? fun r =>
+      r.start.byteIdx ≤ unshiftedBy kept q && unshiftedBy kept q < r.stop.byteIdx
+    let next := kept.filter fun e => !blamed.any fun r => r.start ≤ e.start && e.stop ≤ r.stop
+    for (_, pos, m) in bad do
+      IO.println s!"{path}:{pos.line}:{pos.column}: error after the rewrite: {(m.splitOn "\n").headD ""}"
+    if next.size == kept.size then
+      IO.println s!"{path}: an error the rewrite caused lies outside every rewritten command; file left as is"
+      kept := #[]; break
+    IO.println s!"{path}: {kept.size - next.size} rewrite(s) in the command(s) holding those errors dropped"
+    kept := next
+    if kept.isEmpty then break
+  return (kept, remaining)
+
+/-- Print the kept edits and the errors left, and stage the edited source; 3 when nothing is kept. -/
+private def writeStage (path source stagePath : String) (kept : Array Edit)
+    (remaining : Array (Nat × Position × String)) : IO UInt32 := do
+  for (_, pos, m) in remaining do
+    IO.println s!"{path}:{pos.line}:{pos.column}: error remains, as before the rewrite: {(m.splitOn "\n").headD ""}"
+  if kept.isEmpty then return 3
+  for e in kept do
+    IO.println s!"{path}:{e.line}: {repr (String.Pos.Raw.extract source e.start e.stop)} -> {repr e.replacement}"
+  IO.FS.writeFile stagePath (applyEdits source kept)
+  return 0
+
 private def unwrapStage (path declName stagePath : String) : IO UInt32 := do
   claimElaboration path
   let moduleName ← IO.ofExcept (moduleNameOfPath path)
   let source ← IO.FS.readFile path
   initSearchPath (← findSysroot) (← targetSearchPath)
-  let (inputCtx, importEnv, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName) with
+  let (inputCtx, importEnv, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName)
+      (refresh := true) with
     | .ok result => pure result
     | .error e =>
         for msg in e.messages.toList do IO.eprintln (← msg.toString)
@@ -3067,41 +3113,212 @@ private def unwrapStage (path declName stagePath : String) : IO UInt32 := do
   let summary (kept dropped : Nat) :=
     IO.println s!"{path}: unwrap `{declName}`: {sites.size} recognised, {kept} rewritten, {dropped} dropped by the error check, {mentions.size} mention(s), {unknown} unrecognised"
   if edits.isEmpty then summary 0 0; return 3
-  -- The gate: errors of the original against errors of the edited text, both elaborated here.
-  let errorsOf (src : String) : IO (Array (Nat × Position × String)) := do
-    let fm := FileMap.ofString src
-    return (← elaborationErrors importEnv path src).map fun (pos, m) => ((fm.ofPosition pos).byteIdx, pos, m)
-  let before ← errorsOf source
-  let commands := frontend.commands.filterMap (·.getRange?)
-  let mut kept := edits.qsort (·.start.byteIdx < ·.start.byteIdx)
-  let mut remaining := #[]
-  repeat
-    let was := before.map (shiftedBy kept ·.1)
-    let written := kept.map fun e => let s := shiftedBy kept e.start.byteIdx; (s, s + e.replacement.utf8ByteSize)
-    let after ← errorsOf (applyEdits source kept)
-    let bad := after.filter fun (q, _) => !was.contains q || written.any fun (s, t) => s ≤ q && q ≤ t
-    remaining := after
-    if bad.isEmpty then break
-    let blamed := bad.filterMap fun (q, _) => commands.find? fun r =>
-      r.start.byteIdx ≤ unshiftedBy kept q && unshiftedBy kept q < r.stop.byteIdx
-    let next := kept.filter fun e => !blamed.any fun r => r.start ≤ e.start && e.stop ≤ r.stop
-    for (_, pos, m) in bad do
-      IO.println s!"error after the rewrite at {pos.line}:{pos.column}: {(m.splitOn "\n").headD ""}"
-    if next.size == kept.size then
-      IO.println s!"{path}: an error the rewrite caused lies outside every rewritten command; file left as is"
-      kept := #[]; break
-    IO.println s!"{path}: {kept.size - next.size} rewrite(s) in the command(s) holding those errors dropped"
-    kept := next
-    if kept.isEmpty then break
+  let (kept, remaining) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
   let rewrote := sites.filter (·.all fun e => kept.any fun k => k.start == e.start && k.stop == e.stop)
   summary rewrote.size (sites.size - rewrote.size)
-  if kept.isEmpty then return 3
-  for e in kept do
-    IO.println s!"{path}:{e.line}: {repr (String.Pos.Raw.extract source e.start e.stop)} -> {repr e.replacement}"
-  for (_, pos, m) in remaining do
-    IO.println s!"error remains, as before the rewrite, at {pos.line}:{pos.column}: {(m.splitOn "\n").headD ""}"
-  IO.FS.writeFile stagePath (applyEdits source kept)
-  return 0
+  writeStage path source stagePath kept remaining
+
+/-! ## Converting where one type meets another
+
+`coerce (A B f)...` follows a field or binder whose type changed: wherever a term of type `A` meets
+the expected type `B`, it writes `f` applied to that term.  The sites are the elaborator's, never an
+error message's: the file is elaborated with a `Coe A B` instance going through a marker `def` that
+applies `f`.  The marker is no coercion declaration, so the elaborator's unfolding of the inserted
+coercion stops at it, and every coerced term stands in the enclosing term node's elaborated
+expression as the marker applied to it — the child node elaborating to that argument is the site,
+with its own source range.  The edited text is then judged by `errorGate`, without the instances. -/
+
+/-- One conversion: where a term of type `src` meets the expected type `dst`, apply `conv`. -/
+private structure Coercion where
+  src : String
+  dst : String
+  conv : String
+  deriving Inhabited
+
+private def parseCoercions : List String → Option (Array Coercion)
+  | [] => some #[]
+  | a :: b :: f :: rest => (#[{ src := a, dst := b, conv := f : Coercion }] ++ ·) <$> parseCoercions rest
+  | _ => none
+
+/-- The `i`th conversion's marker: a name no source can spell without guillemets. -/
+private def coerceMarker (i : Nat) : String := s!"lean-refactor-coerce-{i}"
+
+/-- `env` with each conversion's marker and a `Coe` instance through it. -/
+private def withCoercions (cs : Array Coercion) (env : Environment) (opts : Options) : IO Environment := do
+  let text := String.join (cs.mapIdx fun i c => s!"def «{coerceMarker i}» (x : {c.src}) : {c.dst} := \
+    {c.conv} x\ninstance : Coe ({c.src}) ({c.dst}) := ⟨«{coerceMarker i}»⟩\n").toList
+  let st ← Elab.IO.processCommands (Parser.mkInputContext text "<coerce>") {} (Elab.Command.mkState env {} opts)
+  if let some m := st.commandState.messages.toList.find? (·.severity == .error) then
+    throw <| IO.userError s!"the conversions do not elaborate: {← m.toString}"
+  return st.commandState.env
+
+/-- Every term node of an info tree: its context, and the index of the nearest enclosing term node. -/
+private partial def termNodes (ci? : Option Elab.ContextInfo) (parent? : Option Nat) :
+    Elab.InfoTree → Array (Elab.ContextInfo × Elab.TermInfo × Option Nat) →
+      Array (Elab.ContextInfo × Elab.TermInfo × Option Nat)
+  | .context ctx t, acc => termNodes (ctx.mergeIntoOuter? ci?) parent? t acc
+  | .node info kids, acc =>
+    let (parent?, acc) := match ci?, info with
+      | some ci, .ofTermInfo ti => (some acc.size, acc.push (ci, ti, parent?))
+      | _, _ => (parent?, acc)
+    kids.foldl (fun acc k => termNodes ci? parent? k acc) acc
+  | .hole _, acc => acc
+
+/-- Each marker application in `e`: which conversion, and the term it converts. -/
+private def markerArgs (markers : Array Name) (e : Expr) : Array (Nat × Expr) := runST fun σ => do
+  let acc : ST.Ref σ (Array (Nat × Expr)) ← ST.mkRef #[]
+  e.forEach (ω := σ) (m := ST σ) fun
+    | .app (.const n _) a => if let some i := markers.findIdx? (· == n) then acc.modify (·.push (i, a)) else pure ()
+    | _ => pure ()
+  acc.get
+
+private def coerceStage (path stagePath : String) (cs : Array Coercion) : IO UInt32 := do
+  claimElaboration path
+  let moduleName ← IO.ofExcept (moduleNameOfPath path)
+  let source ← IO.FS.readFile path
+  initSearchPath (← findSysroot) (← targetSearchPath)
+  let (inputCtx, importEnv, frontend) ← match ← Elaborate.frontendOf path source (parseName moduleName)
+      (prepare := withCoercions cs) (refresh := true) with
+    | .ok result => pure result
+    | .error e =>
+        for msg in e.messages.toList do IO.eprintln (← msg.toString)
+        return 1
+  let fileMap := inputCtx.fileMap
+  let env := frontend.commandState.env
+  let at_ (stx : Syntax) := match stx.getPos? with
+    | some p => let q := fileMap.toPosition p; s!"{path}:{q.line}:{q.column}"
+    | none => s!"{path}: (no position)"
+  let markers := (Array.range cs.size).map (Name.mkSimple ∘ coerceMarker)
+  -- Read off each marker: its type `A → B`, and `T.f` written `e.f` when it applies `T.f` to `x : T …` alone.
+  let mut types := #[]
+  let mut dots := #[]
+  for m in markers do
+    let some (.defnInfo d) := env.find? m | throw <| IO.userError s!"{path}: marker {m} was not declared"
+    let .forallE _ a b _ := d.type | throw <| IO.userError s!"{path}: marker {m} is no function: {d.type}"
+    types := types.push (a, b)
+    dots := dots.push <| match d.value, a.getAppFn.constName? with
+      | .lam _ _ (.app (.const (.str t f) _) (.bvar 0)) _, some h => if t == h then some f else none
+      | _, _ => none
+  let nodes := frontend.commandState.infoState.trees.foldl (fun acc t => termNodes none none t acc) #[]
+  let exprs ← nodes.mapM fun (ci, ti, _) => ci.runMetaM ti.lctx (instantiateMVars ti.expr)
+  let parents := nodes.foldl (fun s (_, _, p?) => match p? with | some j => s.insert j | none => s)
+    (∅ : Std.HashSet Nat)
+  let marks : Std.HashMap Nat (Array (Nat × Expr)) :=
+    parents.fold (fun m j => m.insert j (markerArgs markers exprs[j]!)) {}
+  -- (conversion, range) of every site; a node with no original range sits in a macro expansion.
+  let mut sites : Array (Nat × Syntax.Range) := #[]
+  let mut unplaced := 0
+  for (ci, ti, parent?) in nodes, x in exprs do
+    let found ← match parent? with
+      -- A node elaborating to the same term as its parent (parentheses) leaves the site to the parent.
+      | some j => pure <| if exprs[j]! == x then #[] else
+          ((marks.getD j #[]).filter (·.2 == x)).map (·.1) |>.toList.eraseDups.toArray
+      -- A root has no enclosing term to hold the marker (a definition's body): its expected type decides.
+      | none => match ti.expectedType? with
+        | none => pure #[]
+        | some expected =>
+          try (Array.range cs.size).filterM fun k => ci.runMetaM ti.lctx do
+              let ty ← Meta.inferType x
+              let ex ← instantiateMVars expected
+              pure ((← Meta.isDefEq ty types[k]!.1) && (← Meta.isDefEq ex types[k]!.2) && !(← Meta.isDefEq ty ex))
+          catch e => IO.println s!"{at_ ti.stx}: not judged, its type does not infer: {e}"; pure #[]
+    -- Faithful only when the node's syntax IS the source's at that range: an expansion can carry the
+    -- range of the notation it came from (`SEVEN` elaborating its expansion `seven`).
+    let source? := ti.stx.getRange? (canonicalOnly := true) |>.filter fun r => frontend.commands.any fun c =>
+      (nodesSpanning c r.start.byteIdx r.stop.byteIdx).any (· == ti.stx)
+    for k in found do
+      match source? with
+      | some r => unless sites.any (· == (k, r)) do sites := sites.push (k, r)
+      | none =>
+        IO.println s!"{at_ ti.stx}: a {cs[k]!.src} → {cs[k]!.dst} site in a macro or notation expansion, \
+          with no source range of its own; not rewritten"
+        unplaced := unplaced + 1
+  -- One range wanting two conversions is ambiguous: neither is written.
+  let ambiguous := sites.filter fun (k, r) => sites.any fun (k', r') => r' == r && k' != k
+  for (k, r) in ambiguous do
+    IO.println s!"{path}:{(fileMap.toPosition r.start).line}: wants both {cs[k]!.conv} and another \
+      conversion; not rewritten"
+  let clear := sites.filter (!ambiguous.contains ·)
+  -- Innermost first, so a site holding another is written around the inner rewrite.
+  let mut written : Array Edit := #[]
+  for (k, r) in clear.qsort fun (_, r) (_, s) => r.stop.byteIdx - r.start.byteIdx < s.stop.byteIdx - s.start.byteIdx do
+    let text := textWithEdits source r.start r.stop written
+    -- An identifier, or a projection ending in one (`(g n).count`), takes `.f` into that name, which the
+    -- elaborator reads as one more field; anything else goes through `fillForm`, which brackets it unless
+    -- the parse reads it as one node in its hole (`SEVEN.f` would be one name).
+    let ident := (Parser.runParserCategory env `term text).toOption.any fun s =>
+      s.isIdent || (s.isOfKind ``Lean.Parser.Term.proj && s.getArgs.back?.any (·.isIdent))
+    let some replacement := (match dots[k]!, ident with
+      | some f, true => some s!"{text}.{f}"
+      | some f, false => fillForm env #[.hole 0, .text s!".{f}"] #[text]
+      | none, _ => fillForm env #[.text s!"({cs[k]!.conv} ", .hole 0, .text ")"] #[text])
+      | IO.println s!"{path}:{(fileMap.toPosition r.start).line}: `{text}` with {cs[k]!.conv} applied does not parse; not rewritten"
+        continue
+    written := written.push { start := r.start, stop := r.stop, line := (fileMap.toPosition r.start).line, replacement }
+  let edits := written.filter fun e => !written.any fun o =>
+    o.start ≤ e.start && e.stop ≤ o.stop && !(o.start == e.start && o.stop == e.stop)
+  if edits.isEmpty then
+    for m in frontend.commandState.messages.toList.filter (·.severity == .error) do
+      IO.println s!"{path}:{m.pos.line}:{m.pos.column}: error, no conversion site: {((← m.toString).splitOn "\n").headD ""}"
+    IO.println s!"{path}: no conversion site"
+    return 3
+  let (kept, remaining) ← errorGate importEnv path source (frontend.commands.filterMap (·.getRange?)) edits
+  IO.println s!"{path}: coerce: {sites.size} site(s) in {edits.size} edit(s), {kept.size} kept, \
+    {edits.size - kept.size} dropped by the error check, {unplaced} in macro expansions, {ambiguous.size} ambiguous"
+  writeStage path source stagePath kept remaining
+
+/-- Stage the selected files in import order: a file is elaborated once every selected module it
+    imports has settled, because its elaboration reads their `.olean`s.  With `--apply` each wave is
+    written and its modules built before the next; in a preview, a file with rewrites holds back its
+    importers, which only an applied run can elaborate. -/
+private def coerceGlob (pattern : String) (cs : Array Coercion) (apply : Bool) : IO UInt32 := do
+  if ← staleSplitParts then return 1
+  let files ← selectedFiles pattern
+  if files.isEmpty then return 1
+  let mods ← files.mapM fun p => IO.ofExcept (moduleNameOfPath p)
+  let mut imports : Array (Array Nat) := #[]
+  for p in files do
+    let (is, _, log) ← Elab.parseImports (← IO.FS.readFile p) p
+    if log.hasErrors then
+      for m in log.toList do IO.eprintln (← m.toString)
+      return 1
+    imports := imports.push (is.filterMap fun i => mods.findIdx? (· == i.module.toString))
+  let args := cs.flatMap fun c => #[c.src, c.dst, c.conv]
+  let jobs ← scanJobs
+  -- none: not staged yet; some true: its importers may be elaborated; some false: they may not.
+  let mut settled : Array (Option Bool) := files.map fun _ => none
+  let mut status : UInt32 := 0
+  repeat
+    let pending := (Array.range files.size).filter (settled[·]!.isNone)
+    for i in pending do
+      if let some j := imports[i]!.find? (settled[·]! == some false) then
+        IO.println s!"{files[i]!}: not elaborated: it imports {mods[j]!}, which \
+          {if apply then "does not build" else "has rewrites that only --apply writes"}"
+        settled := settled.set! i (some false)
+    let ready := pending.filter fun i => settled[i]!.isNone && imports[i]!.all (settled[·]! == some true)
+    if ready.isEmpty then break
+    let outputs ← mapFilesParallel jobs (ready.map (files[·]!)) fun p =>
+      spawnSelf (#["coerce-stage", p, stagePathFor p] ++ args)
+    for (i, o) in ready.zip outputs do
+      IO.print o.stdout; IO.eprint o.stderr
+      let path := files[i]!
+      if o.exitCode == 0 || o.exitCode == 3 then
+        if o.exitCode == 0 && apply then IO.FS.writeFile path (← IO.FS.readFile (stagePathFor path))
+        dropStagedFiles #[path]
+        settled := settled.set! i (some (o.exitCode == 3 || apply))
+      else
+        IO.eprintln s!"{path}: staging child exited {o.exitCode}; file left as it was"
+        settled := settled.set! i (some false); status := 1
+    unless apply do continue
+    for i in ready do
+      unless settled[i]! == some true do continue
+      let b ← IO.Process.output { cmd := ← capPath, args := #["lake", "build", mods[i]!] }
+      if b.exitCode != 0 then
+        IO.eprint b.stdout; IO.eprint b.stderr
+        IO.eprintln s!"{files[i]!}: `lake build {mods[i]!}` failed after the rewrite; its importers wait"
+        settled := settled.set! i (some false); status := 1
+  unless apply do IO.println "preview only; pass --apply to write"
+  return status
 
 /-- The source ranges of every pattern of every `match` the elaborator ran.  `fun ⟨a, b⟩`, `let ⟨a, b⟩ :=`,
     `if let`, a `do` pattern, `intro ⟨a, b⟩` and an equation-style definition all reach the elaborator as
@@ -4279,7 +4496,7 @@ private def usage : String := String.intercalate "\n" [
   "          'Lib/Basic.lean' | 'Lib/*.lean' | 'Lib/*.lean,!Lib/Slow.lean'",
   "          Default: the file the index says declares d; every file the index recorded a use of",
   "          d in for inspect; the whole repository for the sweeps (rename, infix, unused,",
-  "          unused-simp, modularize, insert-arg).",
+  "          unused-simp, modularize, insert-arg, coerce).",
   "",
   "  d  declaration, full name      r  replacement      n  index, counting from 1",
   "  tok  a notation token: the symbol a `notation`/`infixl` command introduces, as the source",
@@ -4312,6 +4529,9 @@ private def usage : String := String.intercalate "\n" [
   row "" "  let some r := d a | alt to let r := d a, d a = .ok r (some, pure) to d a = r,",
   row "" "  match d a with | .ok p (some p) to | p, its .error/none arms dropped;",
   row "" "  where Except/Option is still expected, d a to pure (d a)",
+  row "coerce (A B f)..." "a type changed: where a term e of type A meets the expected type B, write",
+  row "" "  e.f when f is A.f, else (f e), at the sites the elaborator coerces through a temporary",
+  row "" "  Coe A B; module after module in import order, other errors reported with file:line",
   "",
   "move",
   row "move d dest" "dest is another .lean file, or a declaration or section to sit before",
@@ -4578,6 +4798,14 @@ def main (args : List String) : IO UInt32 := do
       return ← stagedGlob (selector?.getD wholeRepository) s!"unwrapped the callers of `{declName}`"
         (fun path stage => spawnSelf #["unwrap-stage", path, declName, stage]) apply
         (mentioning := #[shortName declName]) (buildGate := false)
+  | "coerce-stage" :: path :: stagePath :: triples =>
+      let some cs := parseCoercions triples | IO.eprintln "coerce-stage: expected (A B f) triples"; return 2
+      return ← coerceStage path stagePath cs
+  | "coerce" :: triples =>
+      let some cs := parseCoercions triples
+        | IO.eprintln "coerce takes (A B f) triples, e.g. `coerce Nat USize Nat.toUSize USize Nat USize.toNat`"; return 2
+      if cs.isEmpty then IO.eprintln "coerce needs at least one (A B f) triple"; return 2
+      return ← coerceGlob (selector?.getD wholeRepository) cs apply
   | ["notate-stage", path, declName, form, stagePath] =>
       return ← notateStage path declName form stagePath
   | ["notate", declName] =>

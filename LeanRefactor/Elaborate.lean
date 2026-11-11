@@ -79,13 +79,19 @@ public def checkLibraries (path : String) (mainModule : Name) (setup : ModuleSet
 /-- The setup lake handed `lean` when it last built `mainModule`: `.lake/build/ir/<M>.setup.json`,
     checked against the libraries on disk.  The last build's and not a fresh `lake setup-file`'s,
     because that one BUILDS the imports first and the tool reads the artefacts on disk as they are;
-    only a file no build wrote a setup for (one no target builds) asks `lake setup-file`. -/
-public def setupOf (path : String) (mainModule : Name) : IO ModuleSetup := do
+    only a file no build wrote a setup for (one no target builds) asks `lake setup-file`.
+    `refresh` is for the operations that run on a module that does not build (its imports changed
+    under it): there the last build's setup is out of date by construction, so lake's is taken. -/
+public def setupOf (path : String) (mainModule : Name) (refresh := false) : IO ModuleSetup := do
   let file := mainModule.components.foldl (fun p c => p / c.toString) (System.FilePath.mk Db.irDir)
     |>.addExtension "setup.json"
   unless ← file.pathExists do return ← lakeSetupFile path file
   let setup ← ModuleSetup.load file
-  checkLibraries path mainModule setup
+  try checkLibraries path mainModule setup
+  catch e =>
+    unless refresh do throw e
+    IO.eprintln s!"{path}: the setup of its last build is out of date, so `lake setup-file`'s is used: {e}"
+    return ← lakeSetupFile path file
   return setup
 
 /-- Build the environment `header` imports, set up as `lean` sets it up under lake: the module's
@@ -93,8 +99,9 @@ public def setupOf (path : String) (mainModule : Name) : IO ModuleSetup := do
     an `@[extern]` finds the native symbol (without them: "Could not find native implementation of
     external declaration"), and the module's options in force. -/
 public def headerEnv (path : String) (header : Elab.HeaderSyntax) (messages : MessageLog)
-    (inputCtx : Parser.InputContext) (mainModule : Name) : IO (Environment × MessageLog × Options) := do
-  let setup ← setupOf path mainModule
+    (inputCtx : Parser.InputContext) (mainModule : Name) (refresh := false) :
+    IO (Environment × MessageLog × Options) := do
+  let setup ← setupOf path mainModule refresh
   -- the toolchain's own libraries (Lake's, for a lakefile) are already this process's: loaded again
   -- they register their environment extensions twice
   let sysroot := (← findSysroot).toString
@@ -110,16 +117,20 @@ public def headerEnv (path : String) (header : Elab.HeaderSyntax) (messages : Me
     The environment handed back is the one the IMPORTS built, which is what re-elaborating an edit
     of the same file needs; `frontend.commandState.env` is the one the commands left behind.
     With `stop?`, the commands end after the first that leaves it true of the environment: reading
-    one declaration's elaborated form costs the commands up to it, not the whole file. -/
+    one declaration's elaborated form costs the commands up to it, not the whole file.
+    `prepare` extends the imported environment before the commands run (declarations the file does
+    not write, such as temporary instances); the environment handed back stays the imports' own.
+    `refresh` as in `setupOf`. -/
 public def frontendOf (path source : String) (mainModule : Name)
-    (stop? : Option (Environment → Bool) := none) :
+    (stop? : Option (Environment → Bool) := none)
+    (prepare : Environment → Options → IO Environment := fun env _ => pure env) (refresh := false) :
     IO (Except HeaderError (Parser.InputContext × Environment × Elab.Frontend.State)) := do
   let inputCtx := Parser.mkInputContext source path
   let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
   if headerMessages.hasErrors then return .error { parsed := false, messages := headerMessages }
-  let (env, headerMessages, opts) ← headerEnv path header headerMessages inputCtx mainModule
+  let (env, headerMessages, opts) ← headerEnv path header headerMessages inputCtx mainModule refresh
   if headerMessages.hasErrors then return .error { parsed := true, messages := headerMessages }
-  let commandState := Elab.Command.mkState env {} opts
+  let commandState := Elab.Command.mkState (← prepare env opts) {} opts
   let some stop := stop?
     | return .ok (inputCtx, env, ← Elab.IO.processCommands inputCtx parserState commandState)
   let mut st : Elab.Frontend.State := { commandState, parserState, cmdPos := parserState.pos }
