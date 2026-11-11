@@ -21,10 +21,8 @@
 #
 # `-C <dir>`, first, as in `git -C`: run against the lake package at <dir>. A nested package
 # (`require parent from ".."`) has a `.lake` of its own, so the tool starts there to read its
-# `.ilean`s, write its index and build its default targets.
-#
-# `index` rewrites the one sqlite file every lookup reads, and other tools refresh it too, so two
-# writers at once are routine: they take turns on a lock beside the database.
+# `.ilean`s and build its default targets; its index rows still go to the ONE database at the
+# repository root, which the tool finds and locks itself (`Db.locate`, `Db.withIndexLock`).
 root=$(dirname "$(dirname "$(readlink -f "$0")")")
 if [ "$1" = -C ]; then
   [ $# -ge 2 ] || { echo "lean-refactor: -C needs a directory" >&2; exit 2; }
@@ -36,8 +34,4 @@ fi
   exit 1
 }
 (cd "$root" && ./scripts/cap lake build -q) || exit 1
-if [ "$1" = index ]; then
-  mkdir -p .lake/build || exit 1
-  exec flock .lake/build/refactor-index.lock "$root/scripts/cap" lake env "$root/.lake/build/bin/lean-refactor" "$@"
-fi
 exec "$root/scripts/cap" lake env "$root/.lake/build/bin/lean-refactor" "$@"

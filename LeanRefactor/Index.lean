@@ -1,7 +1,7 @@
 module
 
 import Lean
-import LeanRefactor.Db
+public import LeanRefactor.Db
 import LeanRefactor.Fork
 import LeanRefactor.IleanRows
 import LeanRefactor.OleanRows
@@ -63,17 +63,29 @@ private partial def scanDir (buildDir relDir : String) : IO (Array Module) := do
           ileanHash, oleanHash, relPath := rel }
   return acc
 
-/-- The directories below `dir` that hold a lakefile of their own: nested lake packages.  Their
-    modules resolve through THEIR `.lake`, so the root's search path cannot elaborate them; each is a
-    target of its own, reached with `-C <dir>`, and `index` reaches it by a child under its `lake env`. -/
-public partial def nestedPackages (dir : System.FilePath := ".") : IO (Array System.FilePath) := do
+/-- The directories below the repository `root` that hold a lakefile of their own: nested lake
+    packages, relative to `root`.  Their modules resolve through THEIR `.lake`, so the root's search
+    path cannot elaborate them; each is a target of its own, reached with `-C <dir>`, and `index`
+    reaches it by a child under its `lake env`. -/
+public partial def nestedPackages (root : System.FilePath) (rel : System.FilePath := ".") :
+    IO (Array System.FilePath) := do
   let mut out := #[]
-  for entry in ← dir.readDir do
+  for entry in ← (root / rel).readDir do
     if entry.fileName.startsWith "." || !(← entry.path.isDir) then continue
-    if (← (entry.path / "lakefile.lean").pathExists) || (← (entry.path / "lakefile.toml").pathExists) then
-      out := out.push (System.mkFilePath (entry.path.components.filter (· != ".")))
-    out := out ++ (← nestedPackages entry.path)
+    let sub := System.mkFilePath ((rel / entry.fileName).components.filter (· != "."))
+    if ← Db.isPackage entry.path then out := out.push sub
+    out := out ++ (← nestedPackages root sub)
   return out
+
+/-- Say, once per line on stderr, which nested package still holds a database of its own: the
+    repository has one index, at its root, and a reader that opens the nested file gets stale rows.
+    Not deleted here: it is the person's file, and saying so is enough to stop it being read. -/
+public def warnStaleIndexes (r : Db.Repo) (packages : Array System.FilePath) : IO Unit := do
+  for pkg in packages do
+    let stale := r.root / pkg / Db.indexPath
+    if ← stale.pathExists then
+      IO.eprintln s!"{stale}: stale index of nested package `{pkg}`; the repository's one index is \
+        {r.db}, so this file can be deleted"
 
 /-- The innermost nested package (from `nestedPackages`) whose tree holds `path`, compared by path
     component.  Innermost, because a package nested in a nested package owns its own files. -/
@@ -208,7 +220,6 @@ private def withSources (scanned : Array Module) : IO (Array Module × Nat) := d
     one database answers for every package of the repository. -/
 public def refresh (dbPath buildDir : String) (full : Bool) (packages : Array System.FilePath)
     (me : Option System.FilePath) : IO (Nat × Nat × Nat) := do
-  let pre := (me.map (·.toString ++ "/")).getD ""
   if full then
     -- Drop the WAL and SHM too, so a stale write-ahead log cannot be replayed into the fresh file.
     for f in #[dbPath, dbPath ++ "-wal", dbPath ++ "-shm"] do Db.removeIfPresent f
@@ -264,7 +275,7 @@ public def refresh (dbPath buildDir : String) (full : Bool) (packages : Array Sy
   -- Numbering from the largest id ever handed out, not from the row count: a module deleted and
   -- re-inserted must get a fresh id, or the untouched modules' syntax nodes point at the wrong one.
   let firstId ← (· + 1) <$> Db.queryNat dbPath "select coalesce(max(id), 0) as m from module;" "m"
-  Db.importRows dbPath "module" (stale.mapIdx fun i m => Db.row #[toString (firstId + i), m.name, pre ++ m.source, "", ""])
+  Db.importRows dbPath "module" (stale.mapIdx fun i m => Db.row #[toString (firstId + i), m.name, (me.map (· / m.source |>.toString)).getD m.source, "", ""])
   Db.importRows dbPath "syntax_node_in" syntaxRows
   Db.importRows dbPath "decl_stmt_in" stmtRows
   Db.importRows dbPath "src_ref" groups[2]!
@@ -307,41 +318,56 @@ private def refreshPackage (dbPath : String) (full : Bool) (packages : Array Sys
     each is refreshed by a child of this binary under that package's `lake env`, one package at a
     time — one Lean environment per process.  `lakeArgs` (`-K key=value`) go to that `lake`, for a
     lakefile whose dependency paths are configuration options.  The child inherits `scripts/cap`'s
-    limit, and the lock the launcher holds on this database. -/
+    limit, and the lock this run holds on the database.
+
+    Run in a nested package (`-C <dir>`), it refreshes that package and the packages nested in it into
+    the ROOT's database: the repository has one index, and `--full`, which discards it, runs only
+    from the root. -/
 public def run (full : Bool) (lakeArgs : Array String) : IO UInt32 := do
   unless ← System.FilePath.isDir Db.buildDir do
     IO.eprintln s!"{Db.buildDir} does not exist; run `lake build` first"
     return 1
-  let dbPath := Db.indexPath
-  let packages ← nestedPackages
-  refreshPackage dbPath full packages none
-  let root ← IO.currentDir
-  let self := (← IO.appPath).toString
-  let mut status : UInt32 := 0
-  for pkg in packages do
-    -- Not an error: a fresh checkout or worktree has not built every package, and failing would
-    -- block every index of the root.  Said, with the command that fixes it, never skipped silently.
-    unless ← (pkg / Db.buildDir).isDir do
-      IO.eprintln s!"{pkg}: nested lake package not built ({pkg}/{Db.buildDir} missing), so its \
-        modules keep the rows of its last index; build it with `lake -d {pkg} build`, then rerun \
-        `lean-refactor index`"
-      continue
-    let args := lakeArgs ++ #["env", self, "index-package", (root / dbPath).toString, pkg.toString] ++
-      packages.map toString
-    let out ← IO.Process.output { cmd := "lake", args, cwd := some pkg }
-    unless out.stdout.isEmpty do IO.print out.stdout
-    unless out.stderr.isEmpty do IO.eprint out.stderr
-    if out.exitCode != 0 then
-      IO.eprintln s!"{pkg}: `lake {" ".intercalate (lakeArgs ++ #["env"]).toList} lean-refactor \
-        index-package` exited {out.exitCode}; its stderr is above.  A dependency path its lakefile \
-        reads from a configuration option is passed as `lean-refactor index -K key=value`"
-      status := out.exitCode
-  -- A full extract stages every module's nodes and then deletes them, which leaves a quarter of a
-  -- gigabyte of freed pages the file never gives back on its own.  Only on `full`: an incremental
-  -- refresh's freelist is exactly what the NEXT refresh's staging writes into, so compacting it
-  -- would trade seconds for pages about to be reallocated.
-  if full then Db.exec dbPath "vacuum;"
-  return status
+  let repo ← Db.locate
+  if let some me := repo.pkg then
+    if full then
+      IO.eprintln s!"`index --full` discards the repository's one database, {repo.db}, with every \
+        package's rows; run it from the root {repo.root}, not from the nested package `{me}`"
+      return 1
+  let dbPath := repo.db
+  let all ← nestedPackages repo.root
+  warnStaleIndexes repo all
+  let inside (p : System.FilePath) := match repo.pkg with
+    | some me => p != me && p.components.take me.components.length == me.components
+    | none => true
+  let root := repo.root
+  Db.withIndexLock repo do
+    refreshPackage dbPath full all repo.pkg
+    let self := (← IO.appPath).toString
+    let mut status : UInt32 := 0
+    for pkg in all.filter inside do
+      -- Not an error: a fresh checkout or worktree has not built every package, and failing would
+      -- block every index of the root.  Said, with the command that fixes it, never skipped silently.
+      unless ← (root / pkg / Db.buildDir).isDir do
+        IO.eprintln s!"{pkg}: nested lake package not built ({pkg}/{Db.buildDir} missing), so its \
+          modules keep the rows of its last index; build it with `lake -d {root / pkg} build`, then rerun \
+          `lean-refactor index`"
+        continue
+      let args := lakeArgs ++ #["env", self, "index-package", dbPath, pkg.toString] ++
+        all.map toString
+      let out ← IO.Process.output { cmd := "lake", args, cwd := some (root / pkg) }
+      unless out.stdout.isEmpty do IO.print out.stdout
+      unless out.stderr.isEmpty do IO.eprint out.stderr
+      if out.exitCode != 0 then
+        IO.eprintln s!"{pkg}: `lake {" ".intercalate (lakeArgs ++ #["env"]).toList} lean-refactor \
+          index-package` exited {out.exitCode}; its stderr is above.  A dependency path its lakefile \
+          reads from a configuration option is passed as `lean-refactor index -K key=value`"
+        status := out.exitCode
+    -- A full extract stages every module's nodes and then deletes them, which leaves a quarter of a
+    -- gigabyte of freed pages the file never gives back on its own.  Only on `full`: an incremental
+    -- refresh's freelist is exactly what the NEXT refresh's staging writes into, so compacting it
+    -- would trade seconds for pages about to be reallocated.
+    if full then Db.exec dbPath "vacuum;"
+    return status
 
 /-- `lean-refactor index-package DB PKG PACKAGES…`, the child half of `run`: run in the nested package
     `PKG` under its `lake env`, refresh its modules into the root's database `DB`. -/

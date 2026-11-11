@@ -25,8 +25,10 @@ lake build                                   # produces the .ilean data the tool
 Run from the target repository root. The target and this tool must be on the same Lean toolchain.
 
 A nested lake package (one with its own lakefile and `.lake`, such as `sub/` with `require parent from ".."`)
-is a target of its own: `lean-refactor -C sub <op> …` runs there, as `git -C` does, so the index is
-`sub/.lake/build/refactor-index.db` and the verify step builds `sub`'s default targets. Run from the parent, a
+is a target of its own: `lean-refactor -C sub <op> …` runs there, as `git -C` does, so it reads
+`sub`'s `.ilean`s and the verify step builds `sub`'s default targets; its index rows still live in the ONE
+database at the repository root (the outermost lakefile below the git top level), and a query from `sub`
+gets its source paths relative to `sub`. Run from the parent, a
 selection never takes a file of a nested package (its imports resolve through `sub/.lake`, not the parent's):
 the run skips it and names `-C sub` for it. Every build the tool starts runs under `scripts/cap`, whose limit
 is `CAP_MEM_MB` from the environment (default 12288): a package that needs more says so on the command line,
@@ -135,7 +137,9 @@ answers for the whole repository; `module.source` stays root-relative (`sub/Sub/
 is refreshed by a child of the tool under `lake env` in that package, because its modules import through its
 own search path; `-K key=value` (repeatable) goes to that `lake`, for a lakefile that reads a dependency's path
 from a configuration option. A nested package with no build is named on stderr and keeps its rows; a child
-that fails sets the exit code. `lean-refactor -C sub index` still writes `sub`'s own database.
+that fails sets the exit code. `lean-refactor -C sub index` refreshes `sub` and the packages nested in it
+into the root's database; `--full` runs only from the root. A database found under a nested package is left
+from an older version of the tool: every run that refreshes the index names it on stderr as stale, and it can be deleted.
 
 The nine tables below are the whole readable schema. (Two more, `syntax_node_in` and
 `decl_stmt_in`, exist only inside a refresh: it fills them, interns their names into IDs, and empties

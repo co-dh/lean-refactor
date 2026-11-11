@@ -23,8 +23,9 @@ public def useSitesByFile (dbPath declName : String) : IO (Std.HashMap String (A
   let sql := s!"select m.source as source, u.l1 as l1, u.c1 as c1, u.l2 as l2, u.c2 as c2
 from use_site u join module m on m.name = u.use_module
 where u.name = '{Db.escaped declName}' and u.is_definition = 0"
+  let here ← Db.localizer
   let rows ← Db.queryRows dbPath sql fun row => do
-    let source ← (row.getObjValAs? String "source").toOption
+    let source := here (← (row.getObjValAs? String "source").toOption)
     let l1 ← (row.getObjValAs? Nat "l1").toOption
     let c1 ← (row.getObjValAs? Nat "c1").toOption
     let l2 ← (row.getObjValAs? Nat "l2").toOption
@@ -48,6 +49,7 @@ where name = '{Db.escaped declName}' and is_definition = 0 group by use_module o
     compiler's own declarations are dropped — an equation lemma repeats its parent's signature. -/
 public def declStatements (dbPath fragment : String) :
     IO (Array (String × String × Nat × String)) := do
+  let here ← Db.localizer
   Db.queryRows dbPath s!"select i.user_name as n, m.source as s, r.sl1 + 1 as l, i.stmt as t
 from decl_info i
 join module m on m.name = i.module
@@ -58,20 +60,21 @@ order by m.source, r.sl1" fun row => do
     let s ← (row.getObjValAs? String "s").toOption
     let l ← (row.getObjValAs? Nat "l").toOption
     let t ← (row.getObjValAs? String "t").toOption
-    pure (n, s, l, t)
+    pure (n, here s, l, t)
 
 /-- The source paths that DECLARE `declName`, and the module names with them.  This is what lets a
     command take a declaration and no file: the index already knows where the binding site is, so
     naming the file at the call site only repeats what it says.  Normally one row; two mean the same
     name is declared in two modules, and the caller has to say which with the file selector. -/
 public def declaringModules (dbPath declName : String) : IO (Array (String × String)) := do
+  let here ← Db.localizer
   Db.queryRows dbPath s!"select distinct m.name as n, m.source as s
 from decl_info i join module m on m.name = i.module
 where i.user_name = '{Db.escaped declName}' or i.name = '{Db.escaped declName}'
 order by m.source" fun row => do
     let n ← (row.getObjValAs? String "n").toOption
     let s ← (row.getObjValAs? String "s").toOption
-    pure (n, s)
+    pure (n, here s)
 
 /-- Whether the index knows a MODULE by this name — `Freyd.S1_45`, as an import writes it. -/
 public def isModule (dbPath name : String) : IO Bool := do
@@ -111,6 +114,7 @@ public structure DupMember where
     does not filter one.  Compiler-written declarations are dropped: an equation lemma repeats its
     parent's statement, and there are thousands of them. -/
 public def dupGroups (dbPath column : String) (minSize : Nat) : IO (Array (Array DupMember)) := do
+  let here ← Db.localizer
   let rows ← Db.queryRows dbPath s!"select i.{column} as k, i.user_name as n, i.module as md, m.source as s,
        coalesce(r.sl1 + 1, 0) as l, i.skel_size as z
 from decl_info i
@@ -128,7 +132,7 @@ order by k, m.source, l" fun row => do
     let k := (get "k").getD (toString ((getN "k").getD 0))
     let name ← get "n"
     let module ← get "md"
-    let source ← get "s"
+    let source := here (← get "s")
     let line ← getN "l"
     let size ← getN "z"
     pure (k, ({ name, module, source, line, size } : DupMember))
@@ -177,6 +181,7 @@ public structure CloneGroup where
     its parent does not repeat keeps its group, which is the case that matters: the shared step
     inside two shared proofs is worth naming once. -/
 public def cloneGroups (dbPath : String) (minNodes : Nat) : IO (Array CloneGroup) := do
+  let here ← Db.localizer
   let sql := s!"with big as (
   select n.hash as h, n.module as md, n.parent as pa, n.b0 as b0, n.b1 as b1, n.nodes as nodes
   from syntax_node n where n.nodes >= {minNodes}
@@ -209,7 +214,7 @@ group by b.h order by b.nodes desc, count(*) desc"
     let list (α) [FromJson α] (col : String) : Option (List α) := do
       let text ← (row.getObjValAs? String col).toOption
       (Json.parse text >>= fromJson?).toOption
-    let sources ← list String "ss"
+    let sources := (← list String "ss").map here
     let b0s ← list Nat "b0s"
     let b1s ← list Nat "b1s"
     guard (sources.length == b0s.length && sources.length == b1s.length)
@@ -351,9 +356,10 @@ order by l, c") fun row => do
 /-- The `module.source` path of every module, keyed by its `module.name` — the join the path-facing
     callers need when a query returns module names. -/
 public def moduleSources (dbPath : String) : IO (Std.HashMap String String) := do
+  let here ← Db.localizer
   let rows ← Db.queryRows dbPath "select name, source from module" fun row => do
     let name ← (row.getObjValAs? String "name").toOption
-    let source ← (row.getObjValAs? String "source").toOption
+    let source := here (← (row.getObjValAs? String "source").toOption)
     pure (name, source)
   return rows.foldl (init := ({} : Std.HashMap String String)) fun map (name, source) =>
     map.insert name source
@@ -430,10 +436,11 @@ public structure GraphNode where
     what keeps the overlays it writes aligned with the page's node indices.  Line 0 means the
     `.ilean` did not place the declaration. -/
 public def graphNodes (dbPath : String) : IO (Array GraphNode) := do
+  let here ← Db.localizer
   Db.queryRows dbPath "select n, k, s, l, t from graph_node" fun row => do
     let name ← (row.getObjValAs? String "n").toOption
     let kind ← (row.getObjValAs? String "k").toOption
-    let source ← (row.getObjValAs? String "s").toOption
+    let source := here (← (row.getObjValAs? String "s").toOption)
     let line ← (row.getObjValAs? Nat "l").toOption
     pure { name, kind, source, line, stmt := (row.getObjValAs? String "t").toOption.getD "" }
 

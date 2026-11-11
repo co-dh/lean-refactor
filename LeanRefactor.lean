@@ -472,13 +472,15 @@ private def selectedFiles (pattern : String) (mentioning : Array String := #[]) 
   let wanted := String.intercalate ", " (mentioning.toList.map fun token => s!"`{token}`")
   -- A nested package's file would elaborate against THIS package's search path and fail on its own
   -- imports (`unknown module prefix`); it is named with the command that reaches it instead.
-  let packages ← nestedPackages
-  let (matched, foreign) := inPattern.partition (packageOf packages · |>.isNone)
+  let repo ← Db.locate
+  let packages ← nestedPackages repo.root
+  let pkgOf (path : String) := packageOf packages (repo.fromHere path)
+  let (matched, foreign) := inPattern.partition (pkgOf · == repo.pkg)
   for pkg in packages do
     let mut theirs := #[]
     for path in foreign do
       -- Named outright, a nested file is reported whatever it mentions: the caller meant that package.
-      if packageOf packages path == some pkg && (matched.isEmpty || (← mentions path)) then
+      if pkgOf path == some pkg && (matched.isEmpty || (← mentions path)) then
         theirs := theirs.push path
     unless theirs.isEmpty do
       IO.eprintln s!"{theirs.size} file(s) matching `{pattern}`{if mentioning.isEmpty || matched.isEmpty then "" else s!" that mention {wanted}"} \
@@ -1458,10 +1460,14 @@ private def refreshedIndex? : IO (Option String) := do
   -- the hang it was written to prevent — measured at 37 minutes of a `modularize --glob` that had
   -- printed nothing.
   if ← staleSplitParts then return none
-  let dbPath := Db.indexPath
+  let repo ← Db.locate
+  let dbPath := repo.db
   try
-    -- The root's rows only, but scoped, so the nested packages' rows `index` wrote are kept.
-    _ ← Index.refresh dbPath buildDir false (← nestedPackages) none
+    -- This package's rows only, in the repository's one database, so the other packages' rows
+    -- `index` wrote are kept.
+    let packages ← nestedPackages repo.root
+    Index.warnStaleIndexes repo packages
+    _ ← Db.withIndexLock repo (Index.refresh dbPath buildDir false packages repo.pkg)
     pure (some dbPath)
   catch e =>
     IO.eprintln s!"refactor index unavailable ({toString e}); falling back to per-file elaboration"
@@ -1831,9 +1837,12 @@ private def moveDecls (pairs : Array (String × String)) (apply : Bool) : IO UIn
   -- A module that imported the source keeps seeing every declaration it saw: it imports each
   -- destination too, right after its import of the source.  Narrowing these is a later pass.
   let mut importers : Array (String × String × Array Edit) := #[]
-  for (m, imported) in (← Query.importEdges Db.indexPath).toList do
+  let dbPath := (← Db.locate).db
+  -- The path from the index, not from the module name: an importer may sit in another package.
+  let indexed ← Query.moduleSources dbPath
+  for (m, imported) in (← Query.importEdges dbPath).toList do
     unless imported.contains sourceModule do continue
-    let some path ← okOr "" (modulePath m) | return 2
+    let some path := indexed[m]? | IO.eprintln s!"{m}: the index records its imports but no source; run `lean-refactor index`"; return 2
     let text ← IO.FS.readFile path
     let inputCtx := Parser.mkInputContext text path
     let (hdr, _, _) ← Parser.parseHeader inputCtx

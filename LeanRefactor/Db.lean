@@ -18,6 +18,59 @@ public def buildDir : String := ".lake/build/lib/lean"
 public def irDir : String := ".lake/build/ir"
 public def indexPath : String := ".lake/build/refactor-index.db"
 
+/-- Where the current lake package sits in its repository.  `root` is the repository root (absolute),
+    `pkg` this package relative to it (`none` at the root).  The repository has ONE index, at
+    `root / indexPath`, whichever package a command runs in; the sources in it are root-relative. -/
+public structure Repo where
+  root : System.FilePath
+  pkg  : Option System.FilePath
+
+public def isPackage (dir : System.FilePath) : IO Bool := do
+  return (← (dir / "lakefile.lean").pathExists) || (← (dir / "lakefile.toml").pathExists)
+
+/-- The outermost directory holding a lakefile on the way from `dir` up to the git top level (the
+    first directory with a `.git`, a file in a worktree), or up to `/` when there is none. -/
+private partial def outermostPackage (dir best : System.FilePath) : IO System.FilePath := do
+  let best ← if ← isPackage dir then pure dir else pure best
+  if ← (dir / ".git").pathExists then return best
+  match dir.parent with
+  | some up => if up == dir then return best else outermostPackage up best
+  | none => return best
+
+/-- The `Repo` of the current directory, a lake package root. -/
+public def locate : IO Repo := do
+  let cwd ← IO.currentDir
+  let root ← outermostPackage cwd cwd
+  let rel := cwd.components.drop root.components.length
+  return { root, pkg := if rel.isEmpty then none else some (System.mkFilePath rel) }
+
+/-- The repository's one database, absolute. -/
+public def Repo.db (r : Repo) : String := (r.root / indexPath).toString
+
+/-- A root-relative `source` as a path relative to this package, component-wise: inside the package
+    its prefix drops, outside it climbs out with `..`. -/
+public def Repo.here (r : Repo) (source : String) : String :=
+  let pkg := (r.pkg.map (·.components)).getD []
+  let s := (System.FilePath.mk source).components
+  if s.take pkg.length == pkg then (System.mkFilePath (s.drop pkg.length)).toString
+  else (System.mkFilePath (pkg.map (fun _ => "..") ++ s)).toString
+
+/-- A path relative to this package as the root-relative source the index stores. -/
+public def Repo.fromHere (r : Repo) (path : String) : String :=
+  match r.pkg with | some p => (p / path).toString | none => path
+
+/-- `Repo.here` of the current directory, for the queries that hand sources to path-facing callers. -/
+public def localizer : IO (String → String) := return (← locate).here
+
+/-- Run `act` holding the exclusive lock beside the repository's database: `index` and every command
+    that refreshes the index write one file, so two writers take turns.  An open handle holds it, so
+    it is released when `act` returns or the process dies. -/
+public def withIndexLock (r : Repo) (act : IO α) : IO α := do
+  IO.FS.createDirAll (r.root / ".lake/build")
+  let h ← IO.FS.Handle.mk (r.root / ".lake/build/refactor-index.lock") .append
+  h.lock
+  try act finally h.unlock
+
 /-- 0x1D between the two record groups a `syntax-rows` child prints — its syntax nodes, then its
     declaration statements.  One stream and one fork: a second run would re-elaborate the file. -/
 public def groupSep : String := "\x1d"
